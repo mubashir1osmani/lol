@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: litellm-release-discord-bot
+    runtime: python
+    buildCommand: python3 --version
+    startCommand: python3 bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
