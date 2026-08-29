@@ -17,11 +17,7 @@ This Python bot checks [BerriAI/litellm releases](https://github.com/BerriAI/lit
 
 Requires Python 3.10 or newer.
 
-```sh
-cp .env.example .env
-```
-
-Edit `.env` with the bot token and channel ID, then run:
+Create a `.env` file containing `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID`, then run:
 
 ```sh
 python3 bot.py
