@@ -2,10 +2,18 @@ services:
   - type: worker
     name: litellm-release-discord-bot
     runtime: python
-    buildCommand: python3 --version
+    buildCommand: pip install -r requirements.txt
     startCommand: python3 bot.py
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
       - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: SUPPORT_USER_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: MENTION_ROLE_ID
         sync: false
