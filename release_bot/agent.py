@@ -1,4 +1,4 @@
-"""Claude-powered writing for the bot: release digests, feed blurbs, greetings."""
+"""Claude-powered writing for the bot: feed blurbs and thread greetings."""
 
 import logging
 from typing import Any
@@ -14,19 +14,6 @@ SYSTEM_PROMPT = (
 
 # Models where the server-side refusal fallback is worth enabling.
 FALLBACK_MODELS = ("claude-opus-5", "claude-fable-5")
-
-
-def release_prompt(release: dict[str, Any], repository: str) -> str:
-    notes = (release.get("body") or "").strip()[:20_000]
-    return (
-        f"A new release of {repository} just shipped: "
-        f"{release.get('name') or release['tag_name']} ({release['tag_name']}).\n\n"
-        "Write a Discord digest of these release notes for the community: a "
-        "1-2 sentence TL;DR, then up to 6 bullet points covering the changes "
-        "that matter most to users (new providers, breaking changes, fixes). "
-        "Keep it under 250 words.\n\n"
-        f"Release notes:\n{notes or '(no notes were provided)'}"
-    )
 
 
 def feed_prompt(entry: dict[str, str], label: str) -> str:

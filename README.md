@@ -2,13 +2,13 @@
 
 An AI-agent Discord bot for the LiteLLM community. It:
 
-- **Posts GitHub releases** from [BerriAI/litellm](https://github.com/BerriAI/litellm/releases) as Discord embeds, with a Claude-written digest of the release notes.
+- **Posts GitHub releases** from [BerriAI/litellm](https://github.com/BerriAI/litellm/releases) as Discord embeds: the ghcr.io image tag plus the "What's Changed" section of the release notes.
 - **Shares new blog posts** from [docs.litellm.ai/blog](https://docs.litellm.ai/blog) (via its RSS feed), with a Claude-written blurb.
 - **Shares social media updates** from any RSS/Atom feeds you configure.
 - **Adds you to new support threads** the moment they're created, and (optionally) posts a Claude-written first reply acknowledging the question.
 - **Pings a role (or @everyone)** on announcements so updates reach the right people.
 
-Claude is optional: without an LLM key, the bot posts raw release notes and feed summaries instead of AI-written digests, and skips thread greetings. If a Claude request ever fails, the bot falls back to the raw content rather than dropping the update. LLM calls go through a LiteLLM proxy when `LITELLM_PROXY_BASE_URL` is set, or straight to Anthropic otherwise.
+Claude is optional and only used for feed blurbs and thread greetings: without an LLM key, the bot posts raw feed summaries and skips greetings. If a Claude request ever fails, the bot falls back to the raw content rather than dropping the update. LLM calls go through a LiteLLM proxy when `LITELLM_PROXY_BASE_URL` is set, or straight to Anthropic otherwise.
 
 ## Set up Discord
 
@@ -33,7 +33,7 @@ Create a `.env` file. Only the first two variables are required.
 | `DISCORD_BOT_TOKEN` | yes | Bot token from the developer portal. |
 | `DISCORD_CHANNEL_ID` | yes | Channel for release announcements (and updates, unless overridden). |
 | `LITELLM_PROXY_BASE_URL` | no | LiteLLM proxy URL for LLM calls (e.g. `https://proxy.example.com`). |
-| `LITELLM_PROXY_API_KEY` | no | API key for the proxy. Enables the Claude agent (digests, blurbs, thread greetings). |
+| `LITELLM_PROXY_API_KEY` | no | API key for the proxy. Enables the Claude agent (feed blurbs, thread greetings). |
 | `ANTHROPIC_API_KEY` | no | Alternative to the proxy key: call Anthropic directly. |
 | `CLAUDE_MODEL` | no | Model name to request. Default: `claude-sonnet-4-6`. |
 | `DISCORD_GUILD_ID` | for threads | Your server ID; needed to watch for new threads. |

@@ -103,9 +103,21 @@ def _truncate(text: str | None, limit: int) -> str:
     return f"{text[: limit - 20].rstrip()}\n\n…[read more]"
 
 
-def release_message(
-    release: dict[str, Any], repository: str, digest: str | None = None
-) -> dict[str, Any]:
+def _whats_changed(body: str) -> str:
+    """Return the "What's Changed" section of the release notes, dropping the
+    cosign/signature preamble; falls back to the full body if absent."""
+    for line in body.splitlines():
+        if line.strip().lstrip("#").strip().lower() == "what's changed":
+            return body[body.index(line) :].strip()
+    return body.strip()
+
+
+def release_notes(release: dict[str, Any], repository: str) -> str:
+    image = f"ghcr.io/{repository.lower()}:{release['tag_name']}"
+    return f"**Docker image**: `{image}`\n\n{_whats_changed(release.get('body') or '')}"
+
+
+def release_message(release: dict[str, Any], repository: str) -> dict[str, Any]:
     tag = release["tag_name"]
     author = release.get("author") or {}
     author_data = {
@@ -121,9 +133,7 @@ def release_message(
             {
                 "title": (release.get("name") or tag)[:256],
                 "url": release["html_url"],
-                "description": _truncate(
-                    (digest or release.get("body") or "").strip(), 3_800
-                ),
+                "description": _truncate(release_notes(release, repository), 3_800),
                 "color": 0xF0A500 if release.get("prerelease") else 0x2DA44E,
                 "author": author_data,
                 "fields": [
@@ -174,9 +184,8 @@ def post_release(
     token: str,
     release: dict[str, Any],
     repository: str,
-    digest: str | None = None,
 ) -> None:
-    post_message(channel_id, token, release_message(release, repository, digest))
+    post_message(channel_id, token, release_message(release, repository))
 
 
 def fetch_active_threads(guild_id: str, token: str) -> list[dict[str, Any]]:

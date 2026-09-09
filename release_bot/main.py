@@ -63,11 +63,10 @@ def main() -> None:
             apply_mention(message, config.mention_role_id, config.mention_everyone),
         )
 
-    def post_release_with_digest(
+    def post_release(
         channel_id: str, token: str, release: dict[str, Any], repository: str
     ) -> None:
-        digest = claude.try_complete(ai, claude.release_prompt(release, repository))
-        announce(channel_id, token, release_message(release, repository, digest))
+        announce(channel_id, token, release_message(release, repository))
 
     def write_blurb(entry: dict[str, str], label: str) -> str | None:
         return claude.try_complete(ai, claude.feed_prompt(entry, label))
@@ -88,9 +87,7 @@ def main() -> None:
             )
 
     def check_releases() -> None:
-        poll_once(
-            config, fetch_releases, post_release_with_digest, load_state, save_state
-        )
+        poll_once(config, fetch_releases, post_release, load_state, save_state)
 
     def check_feeds() -> None:
         poll_feeds_once(config, fetch_feed, announce, write_blurb=write_blurb)

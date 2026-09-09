@@ -5,8 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 from release_bot import api
-from release_bot.agent import feed_prompt, release_prompt, try_complete
-from release_bot.api import apply_mention, release_message
+from release_bot.agent import feed_prompt, try_complete
+from release_bot.api import apply_mention, release_message, release_notes
 from release_bot.config import Config, get_config
 from release_bot.feeds import feed_message, parse_feed, poll_feeds_once
 from release_bot.poller import poll_once
@@ -107,12 +107,6 @@ class MentionTests(unittest.TestCase):
 
 class AgentTests(unittest.TestCase):
     def test_prompts_include_source_material(self) -> None:
-        prompt = release_prompt(
-            {"tag_name": "v1.0.0", "name": "Big one", "body": "Added GPT-6"},
-            "BerriAI/litellm",
-        )
-        self.assertIn("v1.0.0", prompt)
-        self.assertIn("Added GPT-6", prompt)
         blurb = feed_prompt(
             {"title": "Post", "link": "https://x", "summary": "Details"}, "blog"
         )
@@ -128,17 +122,27 @@ class AgentTests(unittest.TestCase):
 
         self.assertIsNone(try_complete(Exploding(), "anything"))
 
-    def test_release_message_prefers_digest(self) -> None:
-        message = release_message(
-            {
-                "tag_name": "v1.2.3",
-                "body": "raw notes",
-                "html_url": "https://github.com/BerriAI/litellm/releases/tag/v1.2.3",
-            },
-            "BerriAI/litellm",
-            digest="Claude's summary",
+    def test_release_notes_keep_image_and_whats_changed(self) -> None:
+        body = (
+            "## Verify Docker Image Signature\n"
+            "cosign boilerplate here\n\n"
+            "---\n"
+            "## What's Changed\n"
+            "* fix(proxy): a bug by @someone in https://github.com/x/1\n"
         )
-        self.assertEqual(message["embeds"][0]["description"], "Claude's summary")
+        notes = release_notes(
+            {"tag_name": "v1.2.3", "body": body}, "BerriAI/litellm"
+        )
+        self.assertIn("`ghcr.io/berriai/litellm:v1.2.3`", notes)
+        self.assertIn("## What's Changed", notes)
+        self.assertIn("fix(proxy)", notes)
+        self.assertNotIn("cosign", notes)
+
+    def test_release_notes_fall_back_to_full_body(self) -> None:
+        notes = release_notes(
+            {"tag_name": "v9", "body": "just some notes"}, "BerriAI/litellm"
+        )
+        self.assertIn("just some notes", notes)
 
 
 RSS_SAMPLE = """<?xml version="1.0" encoding="utf-8"?>
