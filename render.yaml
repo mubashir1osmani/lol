@@ -4,6 +4,12 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python3 bot.py
+    # Keeps .data/ (posted releases, seen feed entries, joined threads)
+    # across deploys so restarts never re-post old announcements.
+    disk:
+      name: bot-state
+      mountPath: /opt/render/project/src/.data
+      sizeGB: 1
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
@@ -13,7 +19,9 @@ services:
         sync: false
       - key: SUPPORT_USER_ID
         sync: false
-      - key: ANTHROPIC_API_KEY
+      - key: LITELLM_PROXY_BASE_URL
+        sync: false
+      - key: LITELLM_PROXY_API_KEY
         sync: false
       - key: MENTION_ROLE_ID
         sync: false

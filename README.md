@@ -8,7 +8,7 @@ An AI-agent Discord bot for the LiteLLM community. It:
 - **Adds you to new support threads** the moment they're created, and (optionally) posts a Claude-written first reply acknowledging the question.
 - **Pings a role (or @everyone)** on announcements so updates reach the right people.
 
-Claude is optional: without `ANTHROPIC_API_KEY`, the bot posts raw release notes and feed summaries instead of AI-written digests, and skips thread greetings. If a Claude request ever fails, the bot falls back to the raw content rather than dropping the update.
+Claude is optional: without an LLM key, the bot posts raw release notes and feed summaries instead of AI-written digests, and skips thread greetings. If a Claude request ever fails, the bot falls back to the raw content rather than dropping the update. LLM calls go through a LiteLLM proxy when `LITELLM_PROXY_BASE_URL` is set, or straight to Anthropic otherwise.
 
 ## Set up Discord
 
@@ -32,8 +32,10 @@ Create a `.env` file. Only the first two variables are required.
 | --- | --- | --- |
 | `DISCORD_BOT_TOKEN` | yes | Bot token from the developer portal. |
 | `DISCORD_CHANNEL_ID` | yes | Channel for release announcements (and updates, unless overridden). |
-| `ANTHROPIC_API_KEY` | no | Enables the Claude agent (digests, blurbs, thread greetings). |
-| `CLAUDE_MODEL` | no | Claude model to use. Default: `claude-sonnet-4-6`. |
+| `LITELLM_PROXY_BASE_URL` | no | LiteLLM proxy URL for LLM calls (e.g. `https://proxy.example.com`). |
+| `LITELLM_PROXY_API_KEY` | no | API key for the proxy. Enables the Claude agent (digests, blurbs, thread greetings). |
+| `ANTHROPIC_API_KEY` | no | Alternative to the proxy key: call Anthropic directly. |
+| `CLAUDE_MODEL` | no | Model name to request. Default: `claude-sonnet-4-6`. |
 | `DISCORD_GUILD_ID` | for threads | Your server ID; needed to watch for new threads. |
 | `SUPPORT_USER_ID` | for threads | User to add to every new thread (you). |
 | `SUPPORT_CHANNEL_IDS` | no | Comma-separated channel IDs; only threads under these parents count. Default: all threads. |
@@ -65,7 +67,7 @@ On its first run it posts the latest release, then seeds state files under `.dat
 
 ### Render
 
-The included `render.yaml` runs the bot as a background worker. Create a new Blueprint from this repository and fill in the environment variables when Render asks. Render background workers may require a paid instance. Note: Render's free/ephemeral disks lose `.data/` on redeploys — the bot re-seeds silently, but add a persistent disk if you never want a re-post.
+The included `render.yaml` runs the bot as a background worker with a 1 GB persistent disk mounted at `.data/`, so state survives redeploys and nothing gets re-posted. Create a new Blueprint from this repository and fill in the environment variables when Render asks. Render background workers may require a paid instance.
 
 ## Test
 

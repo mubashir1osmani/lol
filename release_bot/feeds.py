@@ -5,9 +5,9 @@ import logging
 import re
 from collections.abc import Callable
 from typing import Any
-from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
+from .api import TransientAPIError, conditional_get
 from .config import Config
 from .state import load_ids, save_ids
 
@@ -79,9 +79,8 @@ def parse_feed(document: str) -> list[FeedEntry]:
 
 
 def fetch_feed(url: str) -> list[FeedEntry]:
-    request = Request(url, headers={"User-Agent": "litellm-release-discord-bot"})
-    with urlopen(request, timeout=15) as response:
-        return parse_feed(response.read().decode("utf-8", errors="replace"))
+    body = conditional_get(url, {"User-Agent": "litellm-release-discord-bot"})
+    return parse_feed(body.decode("utf-8", errors="replace"))
 
 
 def feed_message(
@@ -127,6 +126,9 @@ def poll_feeds_once(
     for label, url in config.feeds:
         try:
             entries = fetch(url)
+        except TransientAPIError as error:
+            logging.warning("Skipping %s feed this cycle: %s", label, error)
+            continue
         except Exception:
             logging.exception("Could not fetch %s feed %s", label, url)
             continue

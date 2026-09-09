@@ -2,7 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from release_bot import api
 from release_bot.agent import feed_prompt, release_prompt, try_complete
 from release_bot.api import apply_mention, release_message
 from release_bot.config import Config, get_config
@@ -296,6 +298,52 @@ class StateTests(unittest.TestCase):
             self.assertEqual(load_ids(state_file, "feed-c"), (False, []))
             data = json.loads(Path(state_file).read_text())
             self.assertEqual(set(data), {"feed-a", "feed-b"})
+
+
+class ConditionalGetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        api._conditional_cache.clear()
+
+    def test_304_returns_cached_body(self) -> None:
+        responses = iter(
+            [
+                (200, {"ETag": '"abc"'}, b"fresh body"),
+                (304, {}, b""),
+            ]
+        )
+        sent_headers: list[dict] = []
+
+        def fake_http(request, attempts=2):
+            sent_headers.append(dict(request.headers))
+            return next(responses)
+
+        with mock.patch.object(api, "_http", fake_http):
+            first = api.conditional_get("https://example.com/feed", {})
+            second = api.conditional_get("https://example.com/feed", {})
+        self.assertEqual(first, b"fresh body")
+        self.assertEqual(second, b"fresh body")
+        self.assertEqual(sent_headers[1].get("If-none-match"), '"abc"')
+
+
+class LlmConfigTests(unittest.TestCase):
+    def base_env(self) -> dict[str, str]:
+        return {"DISCORD_BOT_TOKEN": "token", "DISCORD_CHANNEL_ID": "123"}
+
+    def test_litellm_proxy_settings(self) -> None:
+        config = get_config(
+            self.base_env()
+            | {
+                "LITELLM_PROXY_BASE_URL": "https://proxy.example.com",
+                "LITELLM_PROXY_API_KEY": "sk-proxy",
+            }
+        )
+        self.assertEqual(config.llm_base_url, "https://proxy.example.com")
+        self.assertEqual(config.anthropic_api_key, "sk-proxy")
+
+    def test_anthropic_key_still_works_without_proxy(self) -> None:
+        config = get_config(self.base_env() | {"ANTHROPIC_API_KEY": "sk-ant"})
+        self.assertIsNone(config.llm_base_url)
+        self.assertEqual(config.anthropic_api_key, "sk-ant")
 
 
 class NewConfigTests(unittest.TestCase):

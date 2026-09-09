@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -7,19 +8,67 @@ from urllib.request import Request, urlopen
 GITHUB_API = "https://api.github.com"
 DISCORD_API = "https://discord.com/api/v10"
 
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+class TransientAPIError(RuntimeError):
+    """A temporary upstream failure (5xx/429/network). Already retried once;
+    the caller can log it quietly and try again on the next poll."""
+
+
+def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
+    """Perform the request, retrying transient failures once after a short
+    pause. Returns (status, headers, body); a 304 is returned, not raised."""
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=15) as response:
+                return response.status, response.headers, response.read()
+        except HTTPError as error:
+            if error.code == 304:
+                return 304, error.headers, b""
+            retryable = error.code in _RETRYABLE_STATUS
+            if retryable and attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+                continue
+            details = error.read(500).decode("utf-8", errors="replace")
+            message = f"{request.host} returned {error.code}: {details}"
+            raise (TransientAPIError if retryable else RuntimeError)(
+                message
+            ) from error
+        except OSError as error:
+            if attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+                continue
+            raise TransientAPIError(
+                f"Could not reach {request.host}: {error}"
+            ) from error
+    raise AssertionError("unreachable")
+
 
 def _request_json(request: Request) -> Any:
-    try:
-        with urlopen(request, timeout=15) as response:
-            if response.status == 204:
-                return None
-            return json.load(response)
-    except HTTPError as error:
-        details = error.read(500).decode("utf-8", errors="replace")
-        service = "Discord" if "discord.com" in request.full_url else "GitHub"
-        raise RuntimeError(
-            f"{service} API returned {error.code}: {details}"
-        ) from error
+    status, _headers, body = _http(request)
+    if status == 204 or not body:
+        return None
+    return json.loads(body.decode("utf-8", errors="replace"))
+
+
+_conditional_cache: dict[str, tuple[str, bytes]] = {}
+
+
+def conditional_get(url: str, headers: dict[str, str]) -> bytes:
+    """GET with If-None-Match so an unchanged resource costs a header-only 304
+    (which GitHub also excludes from the rate limit). Returns the previously
+    cached body on 304. The cache lives in memory; a restart refetches once."""
+    cached = _conditional_cache.get(url)
+    if cached:
+        headers = {**headers, "If-None-Match": cached[0]}
+    status, response_headers, body = _http(Request(url, headers=headers))
+    if status == 304 and cached:
+        return cached[1]
+    etag = response_headers.get("ETag")
+    if etag:
+        _conditional_cache[url] = (etag, body)
+    return body
 
 
 def _discord_headers(token: str) -> dict[str, str]:
@@ -37,10 +86,10 @@ def fetch_releases(repository: str, token: str | None) -> list[dict[str, Any]]:
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    request = Request(
-        f"{GITHUB_API}/repos/{repository}/releases?per_page=100", headers=headers
+    body = conditional_get(
+        f"{GITHUB_API}/repos/{repository}/releases?per_page=10", headers
     )
-    releases = _request_json(request)
+    releases = json.loads(body.decode("utf-8", errors="replace"))
     if not isinstance(releases, list):
         raise RuntimeError("GitHub returned an unexpected response")
     return releases

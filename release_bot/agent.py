@@ -52,16 +52,26 @@ def thread_prompt(thread_name: str, first_message: str) -> str:
 
 
 class ClaudeAgent:
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-6") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-sonnet-4-6",
+        base_url: str | None = None,
+    ) -> None:
         # Imported here so the bot still runs without the SDK when no
-        # ANTHROPIC_API_KEY is configured.
+        # LLM API key is configured.
         import anthropic
 
-        self._client = anthropic.Anthropic(api_key=api_key)
+        # base_url points at a LiteLLM proxy (or any Anthropic-compatible
+        # /v1/messages endpoint); None talks to Anthropic directly.
+        self._client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
         self.model = model
+        self._direct = base_url is None
 
-    def complete(self, prompt: str, max_tokens: int = 1_500) -> str:
-        if self.model in FALLBACK_MODELS:
+    def complete(self, prompt: str, max_tokens: int = 600) -> str:
+        # The server-side fallback beta only exists on Anthropic's own API;
+        # a proxy may reject the unknown parameter, so skip it there.
+        if self._direct and self.model in FALLBACK_MODELS:
             response = self._client.beta.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,

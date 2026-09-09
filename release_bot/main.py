@@ -6,6 +6,7 @@ from typing import Any
 
 from . import agent as claude
 from .api import (
+    TransientAPIError,
     add_thread_member,
     apply_mention,
     fetch_active_threads,
@@ -25,10 +26,12 @@ def build_agent(config: Config) -> "claude.ClaudeAgent | None":
     if not config.anthropic_api_key:
         return None
     try:
-        return claude.ClaudeAgent(config.anthropic_api_key, config.claude_model)
+        return claude.ClaudeAgent(
+            config.anthropic_api_key, config.claude_model, config.llm_base_url
+        )
     except ImportError:
         logging.warning(
-            "ANTHROPIC_API_KEY is set but the anthropic package is not "
+            "An LLM API key is set but the anthropic package is not "
             "installed (pip install anthropic); running without Claude"
         )
         return None
@@ -129,6 +132,10 @@ def main() -> None:
                 continue
             try:
                 task()
+            except TransientAPIError as error:
+                # Already retried once inside the request; the next poll will
+                # try again, so a one-line warning beats a full traceback.
+                logging.warning("%s check hit a transient error: %s", name, error)
             except Exception:
                 logging.exception("%s check failed", name)
             next_run[name] = time.monotonic() + interval

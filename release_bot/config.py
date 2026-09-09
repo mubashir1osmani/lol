@@ -90,6 +90,7 @@ class Config:
     social_feed_urls: tuple[str, ...] = ()
     feed_poll_interval_seconds: float = 1800
     anthropic_api_key: str | None = None
+    llm_base_url: str | None = None
     claude_model: str = "claude-sonnet-4-6"
     agent_replies_in_threads: bool = True
     mention_role_id: str | None = None
@@ -153,7 +154,10 @@ def get_config(env: dict[str, str] | None = None) -> Config:
             "FEED_POLL_INTERVAL_MINUTES", 30, values
         )
         * 60,
-        anthropic_api_key=values.get("ANTHROPIC_API_KEY", "").strip() or None,
+        anthropic_api_key=values.get("LITELLM_PROXY_API_KEY", "").strip()
+        or values.get("ANTHROPIC_API_KEY", "").strip()
+        or None,
+        llm_base_url=values.get("LITELLM_PROXY_BASE_URL", "").strip() or None,
         claude_model=values.get("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
         or "claude-sonnet-4-6",
         agent_replies_in_threads=_boolean("AGENT_REPLIES_IN_THREADS", True, values),
