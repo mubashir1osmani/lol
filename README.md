@@ -5,10 +5,10 @@ An AI-agent Discord bot for the LiteLLM community. It:
 - **Posts GitHub releases** from [BerriAI/litellm](https://github.com/BerriAI/litellm/releases) as Discord embeds: the ghcr.io image tag plus the "What's Changed" section of the release notes.
 - **Shares new blog posts** from [docs.litellm.ai/blog](https://docs.litellm.ai/blog) (via its RSS feed), with a Claude-written blurb.
 - **Shares social media updates** from any RSS/Atom feeds you configure.
-- **Adds you to new support threads** the moment they're created, and (optionally) posts a Claude-written first reply acknowledging the question.
+- **Adds you to new support threads** the moment they're created and tags you so you get pinged.
 - **Pings a role (or @everyone)** on announcements so updates reach the right people.
 
-Claude is optional and only used for feed blurbs and thread greetings: without an LLM key, the bot posts raw feed summaries and skips greetings. If a Claude request ever fails, the bot falls back to the raw content rather than dropping the update. LLM calls go through a LiteLLM proxy when `LITELLM_PROXY_BASE_URL` is set, or straight to Anthropic otherwise.
+Claude is optional and only used for feed blurbs: without an LLM key, the bot posts raw feed summaries instead. If a Claude request ever fails, the bot falls back to the raw content rather than dropping the update. LLM calls go through a LiteLLM proxy when `LITELLM_PROXY_BASE_URL` is set, or straight to Anthropic otherwise.
 
 ## Set up Discord
 
@@ -19,7 +19,6 @@ Claude is optional and only used for feed blurbs and thread greetings: without a
    - Send Messages
    - Send Messages in Threads
    - Embed Links
-   - Read Message History (for thread greetings)
    - Mention Everyone (only if you use `MENTION_EVERYONE` or a non-mentionable role)
 4. Open the generated URL and add the bot to your server.
 5. In Discord, enable **User Settings > Advanced > Developer Mode**. Right-click the destination channel and choose **Copy Channel ID**. The same right-click menu gives you server, role, and user IDs.
@@ -33,13 +32,13 @@ Create a `.env` file. Only the first two variables are required.
 | `DISCORD_BOT_TOKEN` | yes | Bot token from the developer portal. |
 | `DISCORD_CHANNEL_ID` | yes | Channel for release announcements (and updates, unless overridden). |
 | `LITELLM_PROXY_BASE_URL` | no | LiteLLM proxy URL for LLM calls (e.g. `https://proxy.example.com`). |
-| `LITELLM_PROXY_API_KEY` | no | API key for the proxy. Enables the Claude agent (feed blurbs, thread greetings). |
+| `LITELLM_PROXY_API_KEY` | no | API key for the proxy. Enables the Claude agent (feed blurbs). |
 | `ANTHROPIC_API_KEY` | no | Alternative to the proxy key: call Anthropic directly. |
 | `CLAUDE_MODEL` | no | Model name to request. Default: `claude-sonnet-4-6`. |
 | `DISCORD_GUILD_ID` | for threads | Your server ID; needed to watch for new threads. |
 | `SUPPORT_USER_ID` | for threads | User to add to every new thread (you). |
 | `SUPPORT_CHANNEL_IDS` | no | Comma-separated channel IDs; only threads under these parents count. Default: all threads. |
-| `AGENT_REPLIES_IN_THREADS` | no | Set `false` to add you silently without a Claude greeting. Default: `true`. |
+| `TAG_SUPPORT_USER` | no | Set `false` to add you to threads silently, without the ping. Default: `true`. |
 | `UPDATES_CHANNEL_ID` | no | Separate channel for blog/social posts. Default: `DISCORD_CHANNEL_ID`. |
 | `BLOG_FEED_URL` | no | Default: `https://docs.litellm.ai/blog/rss.xml`. Set empty to disable. |
 | `SOCIAL_FEED_URLS` | no | Comma-separated RSS/Atom feeds for social updates (e.g. an X/Twitter RSS bridge). |

@@ -92,7 +92,7 @@ class Config:
     anthropic_api_key: str | None = None
     llm_base_url: str | None = None
     claude_model: str = "claude-sonnet-4-6"
-    agent_replies_in_threads: bool = True
+    tag_support_user: bool = True
     mention_role_id: str | None = None
     mention_everyone: bool = False
 
@@ -160,7 +160,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         llm_base_url=values.get("LITELLM_PROXY_BASE_URL", "").strip() or None,
         claude_model=values.get("CLAUDE_MODEL", "claude-sonnet-4-6").strip()
         or "claude-sonnet-4-6",
-        agent_replies_in_threads=_boolean("AGENT_REPLIES_IN_THREADS", True, values),
+        tag_support_user=_boolean("TAG_SUPPORT_USER", True, values),
         mention_role_id=mention_role_id,
         mention_everyone=_boolean("MENTION_EVERYONE", False, values),
     )

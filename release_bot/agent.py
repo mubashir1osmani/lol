@@ -1,4 +1,4 @@
-"""Claude-powered writing for the bot: feed blurbs and thread greetings."""
+"""Claude-powered writing for the bot: blog/social feed blurbs."""
 
 import logging
 from typing import Any
@@ -24,17 +24,6 @@ def feed_prompt(entry: dict[str, str], label: str) -> str:
         "Write a 2-3 sentence Discord blurb telling the community what the "
         "post covers and why they might care.\n\n"
         f"Post summary:\n{entry.get('summary') or '(no summary available)'}"
-    )
-
-
-def thread_prompt(thread_name: str, first_message: str) -> str:
-    return (
-        f"A member just opened a support thread titled \"{thread_name}\".\n\n"
-        f"Their message:\n{first_message[:4_000] or '(no message yet)'}\n\n"
-        "Write a brief first reply: acknowledge their question, share a "
-        "pointer to relevant LiteLLM docs ONLY if you are certain one exists "
-        "(https://docs.litellm.ai), and let them know the team has been "
-        "notified and will follow up. 2-4 sentences."
     )
 
 

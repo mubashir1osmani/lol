@@ -10,7 +10,6 @@ from .api import (
     add_thread_member,
     apply_mention,
     fetch_active_threads,
-    fetch_first_message,
     fetch_releases,
     post_message,
     release_message,
@@ -71,20 +70,17 @@ def main() -> None:
     def write_blurb(entry: dict[str, str], label: str) -> str | None:
         return claude.try_complete(ai, claude.feed_prompt(entry, label))
 
-    def greet_thread(thread: dict[str, Any]) -> None:
-        if ai is None or not config.agent_replies_in_threads:
+    def tag_support_user(thread: dict[str, Any]) -> None:
+        if not config.tag_support_user:
             return
-        thread_id = str(thread["id"])
-        first_message = fetch_first_message(thread_id, config.discord_token)
-        reply = claude.try_complete(
-            ai, claude.thread_prompt(thread.get("name", ""), first_message)
+        post_message(
+            str(thread["id"]),
+            config.discord_token,
+            {
+                "content": f"<@{config.support_user_id}>",
+                "allowed_mentions": {"users": [config.support_user_id]},
+            },
         )
-        if reply:
-            post_message(
-                thread_id,
-                config.discord_token,
-                {"content": reply[:2_000], "allowed_mentions": {"parse": []}},
-            )
 
     def check_releases() -> None:
         poll_once(config, fetch_releases, post_release, load_state, save_state)
@@ -94,7 +90,7 @@ def main() -> None:
 
     def check_threads() -> None:
         poll_threads_once(
-            config, fetch_active_threads, add_thread_member, greet=greet_thread
+            config, fetch_active_threads, add_thread_member, greet=tag_support_user
         )
 
     tasks = [("releases", check_releases, config.poll_interval_seconds)]

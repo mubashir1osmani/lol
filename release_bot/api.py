@@ -200,22 +200,6 @@ def fetch_active_threads(guild_id: str, token: str) -> list[dict[str, Any]]:
     return threads
 
 
-def fetch_first_message(thread_id: str, token: str) -> str:
-    """Best-effort read of a thread's opening message (needs the Read Message
-    History permission); returns an empty string when unavailable."""
-    request = Request(
-        f"{DISCORD_API}/channels/{thread_id}/messages?limit=1&after=0",
-        headers=_discord_headers(token),
-    )
-    try:
-        messages = _request_json(request)
-    except Exception:
-        return ""
-    if isinstance(messages, list) and messages:
-        return str(messages[0].get("content") or "")
-    return ""
-
-
 def add_thread_member(thread_id: str, user_id: str, token: str) -> None:
     request = Request(
         f"{DISCORD_API}/channels/{thread_id}/thread-members/{user_id}",
