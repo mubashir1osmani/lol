@@ -40,7 +40,9 @@ the Blueprint. Match the existing service name and keep its state disk.
 
 The deployed bot does not need GitHub credentials to read public LiteLLM PRs.
 **Prefer no `GITHUB_TOKEN` at all.** Anonymous GitHub API rate limits make
-backfills slower; the poller rotates pending work to avoid starving later PRs.
+lookups slower. The bot checkpoints verified PRs and resumes after rate limits.
+Search discovers weekly merged PR candidates without checking every historical
+Discord link; selected PRs are independently verified through the PR API.
 
 If a token becomes necessary, use a dedicated, expiring fine-grained token
 with only the minimum public-repository read access. No repository write,
@@ -82,11 +84,15 @@ deployment gate remains necessary even with all of these controls enabled.
 
 - Standard library only. The Render build compiles Python syntax without
   installing packages or running repository tests with production secrets.
-- Only HTTPS GitHub pull-request GETs and the necessary Discord channel/message
+- Only HTTPS GitHub pull-request/search GETs, official `docs.litellm.ai/release_notes`
+  GETs (without credentials), and the necessary Discord channel/message
   requests are allowed by the HTTP client. Redirects and environment-proxy
   routing are disabled; API response bodies are bounded and not logged on errors.
 - The bot never checks out a contributor's branch, downloads PR files, executes
   message content, or writes to GitHub. Mention allowlists never permit mass pings.
+- Public mentions use confirmed `GITHUB_DISCORD_MAP` entries only. A Discord
+  message author or a similar display name is not proof of GitHub account ownership.
+  Unconfirmed PR-sharer candidates appear only in the local/private preview report.
 - State is JSON, not executable serialization, and is written using exclusive
   temporary files with owner-only permissions and atomic replacement.
 - Local secret files are ignored by Git. Ignore rules do not protect files

@@ -9,12 +9,15 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .config import is_discord_id
+from .schedule import iso, parse_time
+from .releases import RELEASE_INDEX, parse_release_index, parse_new_contributors, release_url
 
 
 GITHUB_API = "https://api.github.com"
 DISCORD_API = "https://discord.com/api/v10"
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_last_search_request = 0.0
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -36,9 +39,12 @@ def _validate_request(request: Request) -> None:
     ):
         raise ValueError("Only approved HTTPS API requests are allowed")
     if url.netloc == "api.github.com":
-        allowed = method == "GET" and re.fullmatch(
+        allowed = method == "GET" and (re.fullmatch(
             r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*", url.path
-        )
+        ) or url.path == "/search/issues")
+    elif url.netloc == "docs.litellm.ai":
+        allowed = (method == "GET" and not url.query and not request.has_header("Authorization")
+                   and (request.full_url == RELEASE_INDEX or release_url(request.full_url)))
     elif url.netloc == "discord.com":
         allowed = (
             method == "GET" and re.fullmatch(r"/api/v10/channels/[1-9][0-9]*(?:/messages)?", url.path)
@@ -180,6 +186,68 @@ def fetch_pull_request(repository: str, number: int, token: str | None) -> dict[
     ):
         raise RuntimeError("GitHub returned an unexpected pull-request response")
     return pull
+
+
+def fetch_release_entries() -> dict:
+    return parse_release_index(conditional_get(RELEASE_INDEX, {}).decode("utf-8"))
+
+
+def fetch_release_prs(url: str, repository: str) -> list[int]:
+    if release_url(url) != url:
+        raise ValueError("Only official LiteLLM release-note URLs are allowed")
+    return parse_new_contributors(conditional_get(url, {}).decode("utf-8"), repository)
+
+
+def fetch_merged_numbers(repository: str, start, end, token: str | None) -> set[int]:
+    """Search is discovery only; each selected PR is verified through /pulls/N.
+
+    Split large windows to avoid GitHub search's 1,000-result truncation.
+    Search ranges are inclusive; exact [start,end) checks happen on PR data.
+    """
+    global _last_search_request
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "litellm-contributor-discord-bot"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    found = set()
+    page, total = 1, None
+    while True:
+        params = urlencode({"q": f"repo:{repository} is:pr is:merged merged:{iso(start)}..{iso(end)}",
+                            "per_page": 100, "page": page})
+        # Search has a separate 10/min anonymous (30/min authenticated) budget.
+        # Pace across recursive windows too, or >1,000 results can hit the same
+        # rate limit on every restart before ever completing discovery.
+        delay = (2.1 if token else 6.1) - (time.monotonic() - _last_search_request)
+        if delay > 0:
+            time.sleep(delay)
+        _last_search_request = time.monotonic()
+        payload = _request_json(Request(f"{GITHUB_API}/search/issues?{params}", headers=headers))
+        if (not isinstance(payload, dict) or payload.get("incomplete_results") is not False
+                or not isinstance(payload.get("total_count"), int)
+                or not isinstance(payload.get("items"), list)):
+            raise TransientAPIError("GitHub search is incomplete; roundup deferred")
+        if total is None:
+            total = payload["total_count"]
+        if payload["total_count"] > 1000:
+            if (end - start).total_seconds() < 4:
+                raise RuntimeError("Too many merged PRs in a one-second search window")
+            midpoint = parse_time(iso(start + (end - start) / 2))
+            return (fetch_merged_numbers(repository, start, midpoint, token)
+                    | fetch_merged_numbers(repository, midpoint, end, token))
+        items = payload["items"]
+        for item in items:
+            number = item.get("number")
+            if (not isinstance(number, int) or number <= 0
+                    or (item.get("pull_request") or {}).get("url")
+                    != f"{GITHUB_API}/repos/{repository}/pulls/{number}"):
+                raise RuntimeError("Unexpected GitHub search result")
+            found.add(number)
+        if page * 100 >= max(total, payload["total_count"]):
+            if len(found) < max(total, payload["total_count"]):
+                raise TransientAPIError("GitHub search changed during pagination; retrying later")
+            return found
+        if not items:
+            raise TransientAPIError("GitHub search ended before all results were read")
+        page += 1
 
 
 def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
