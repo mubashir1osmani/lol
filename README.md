@@ -147,6 +147,8 @@ never silently reset. Keep the contributor state when redeploying.
    Discord message link, and exits. It does not scan GitHub, run the worker, or
    read/write contributor state. Do not change the worker's Start Command to
    this one-shot command, or Render may restart it and send repeated tests.
+   Both `moderator-only` (the current server's channel name) and
+   `moderators-only` are accepted; the explicit channel ID is still required.
 4. When ready for real announcements, change `ANNOUNCEMENTS_ENABLED` to `true`
    in Render and in `render.yaml` so future Blueprint syncs keep it enabled,
    then redeploy. The first active poll includes historical merged PRs.
