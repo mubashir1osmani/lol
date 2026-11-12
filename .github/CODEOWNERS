@@ -1,0 +1,4 @@
+# The owner reviews deployment, workflow, and application changes.
+# Add a second trusted reviewer before enabling mandatory approvals: GitHub
+# does not allow authors to approve their own pull requests.
+* @mubashir1osmani

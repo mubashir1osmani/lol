@@ -328,10 +328,11 @@ class APITests(unittest.TestCase):
         self.assertNotIn("If-none-match", fetch.call_args_list[3].args[0].headers)
 
     def test_rate_limit_defers_to_next_poll_without_immediate_retry(self):
-        error = HTTPError("https://api.github.com", 403, "rate limit", {"X-RateLimit-Remaining": "0"}, io.BytesIO(b"rate limit"))
-        with mock.patch.object(api, "urlopen", side_effect=error) as request:
+        url = "https://api.github.com/repos/BerriAI/litellm/pulls/1"
+        error = HTTPError(url, 403, "rate limit", {"X-RateLimit-Remaining": "0"}, io.BytesIO(b"rate limit"))
+        with mock.patch.object(api, "_open_request", side_effect=error) as request:
             with self.assertRaises(api.TransientAPIError):
-                api._http(Request("https://api.github.com"))
+                api._http(Request(url))
         request.assert_called_once()
 
     def test_discord_short_rate_limit_waits_then_resumes(self):
@@ -340,8 +341,8 @@ class APITests(unittest.TestCase):
         response.__enter__.return_value = response
         response.status, response.headers = 200, {}
         response.read.return_value = b"[]"
-        with mock.patch.object(api, "urlopen", side_effect=[error, response]), mock.patch.object(api.time, "sleep") as sleep:
-            self.assertEqual(api._http(Request("https://discord.com")), (200, {}, b"[]"))
+        with mock.patch.object(api, "_open_request", side_effect=[error, response]), mock.patch.object(api.time, "sleep") as sleep:
+            self.assertEqual(api._http(Request("https://discord.com/api/v10/channels/123/messages")), (200, {}, b"[]"))
         sleep.assert_called_once_with(0.75)
 
 

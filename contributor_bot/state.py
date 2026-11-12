@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from .config import Config
@@ -38,12 +39,21 @@ def load_state(config: Config) -> dict[str, Any]:
 def save_state(path: str, state: dict[str, Any]) -> None:
     """Atomically retain all PRs and contributor IDs; never truncate dedupe history."""
     state_path = Path(path)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = state_path.with_name(f"{state_path.name}.tmp")
-    with temporary_path.open("w", encoding="utf-8") as handle:
-        temporary_path.chmod(0o600)
-        json.dump(state, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary_path, state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Random, exclusively created 0600 temporary files cannot be pre-planted
+    # as symlinks to overwrite application code or other files.
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=state_path.parent,
+            prefix=f".{state_path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(state, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, state_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)

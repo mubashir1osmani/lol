@@ -1,11 +1,12 @@
 import json
 import math
+import re
 import time
 from collections.abc import Iterator
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .config import is_discord_id
 
@@ -13,6 +14,41 @@ from .config import is_discord_id
 GITHUB_API = "https://api.github.com"
 DISCORD_API = "https://discord.com/api/v10"
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        # Never forward bot/API credentials to a redirect destination.
+        raise RuntimeError("API redirects are disabled")
+
+
+# Do not let HTTP(S)_PROXY environment variables reroute credentialed requests.
+_open_request = build_opener(ProxyHandler({}), _NoRedirects()).open
+
+
+def _validate_request(request: Request) -> None:
+    """Defense in depth, not a sandbox against malicious replacement code."""
+    url = urlsplit(request.full_url)
+    method = request.get_method()
+    if url.scheme != "https" or url.fragment or any(
+        segment in {".", ".."} for segment in url.path.split("/")
+    ):
+        raise ValueError("Only approved HTTPS API requests are allowed")
+    if url.netloc == "api.github.com":
+        allowed = method == "GET" and re.fullmatch(
+            r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*", url.path
+        )
+    elif url.netloc == "discord.com":
+        allowed = (
+            method == "GET" and re.fullmatch(r"/api/v10/channels/[1-9][0-9]*(?:/messages)?", url.path)
+        ) or (
+            method == "POST" and re.fullmatch(r"/api/v10/channels/[1-9][0-9]*/messages", url.path)
+        )
+    else:
+        allowed = False
+    if not allowed:
+        raise ValueError("Request destination or operation is not allowed")
 
 
 class TransientAPIError(RuntimeError):
@@ -20,10 +56,14 @@ class TransientAPIError(RuntimeError):
 
 
 def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
+    _validate_request(request)
     for attempt in range(attempts):
         try:
-            with urlopen(request, timeout=15) as response:
-                return response.status, response.headers, response.read()
+            with _open_request(request, timeout=15) as response:
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise RuntimeError("API response exceeds the size limit")
+                return response.status, response.headers, body
         except HTTPError as error:
             if error.code == 304:
                 error.close()
@@ -48,7 +88,9 @@ def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
                 time.sleep(delay)
                 continue
             raise (TransientAPIError if retryable else RuntimeError)(
-                f"{request.host} returned {error.code}: {details}"
+                # Do not log upstream bodies, which can echo credentials or
+                # other untrusted content. Status and host identify failures.
+                f"{request.host} returned HTTP {error.code}"
             ) from error
         except OSError as error:
             if attempt + 1 < attempts:
@@ -151,6 +193,15 @@ def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
 
 
 def post_message(channel_id: str, token: str, message: dict[str, Any]) -> dict[str, Any]:
+    mentions = message.get("allowed_mentions") or {}
+    users = mentions.get("users", [])
+    if (
+        not isinstance(users, list)
+        or len(users) > 100
+        or any(not is_discord_id(user_id) for user_id in users)
+    ):
+        raise ValueError("Only explicit Discord user IDs may be mentioned")
+    message = {**message, "allowed_mentions": {"parse": [], "users": users}}
     response = _request_json(Request(
         f"{DISCORD_API}/channels/{channel_id}/messages",
         data=json.dumps(message).encode("utf-8"),

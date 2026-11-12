@@ -66,7 +66,7 @@ ANNOUNCEMENTS_CHANNEL_ID=234567890123456789
 | `OSS_CONTRIBUTIONS_CHANNEL_ID` | yes | Source #oss-contributions text-channel ID. |
 | `ANNOUNCEMENTS_CHANNEL_ID` | yes | Destination #announcements channel ID. |
 | `ANNOUNCEMENTS_ENABLED` | no | `false` keeps the worker idle without scanning or changing state. Default without the variable: `true`; the Render blueprint and `.env.example` explicitly set `false` for initial testing. |
-| `GITHUB_TOKEN` | recommended | GitHub token for API rate limits. No write access needed for the public LiteLLM repository. |
+| `GITHUB_TOKEN` | no | Prefer leaving unset. If necessary for rate limits, use a dedicated fine-grained public-read-only token, never a personal write-capable PAT. |
 | `GITHUB_REPOSITORY` | no | Default: `BerriAI/litellm`. |
 | `POLL_INTERVAL_MINUTES` | no | Check cadence. Default: `5`. |
 | `STATE_FILE` | no | Default: `.data/contributors.json`. Must live on persistent storage. |
@@ -113,9 +113,9 @@ downtime. Deleting the state intentionally causes a full historical reannounceme
 
 ### Render / upgrading the old bot
 
-The included `render.yaml` runs a background worker with a 1 GB persistent disk
-at `.data/`. Its existing service name is retained so a Blueprint update targets
-the old worker rather than creating a second bot. Set the new source and
+The included `render.yaml` describes the existing `litellm-discord` background
+worker with a 1 GB persistent disk at `.data/`. Automatic deployments and
+preview environments are disabled. Set the new source and
 destination channel variables and redeploy that worker; no separate worker is
 needed. The bot does not run until those new variables are configured.
 
@@ -128,9 +128,10 @@ never silently reset. Keep the contributor state when redeploying.
 
 ### First deployment: test in #moderators-only
 
-1. Deploy the current code as a Render **Background Worker** using the included
-   Blueprint. Fill in the bot token, source/destination channel IDs, and GitHub
-   token. Keep `ANNOUNCEMENTS_ENABLED=false`; the worker will log that it is
+1. Deploy a reviewed commit as a Render **Background Worker**. Use the existing
+   worker rather than creating another one. Fill in the bot token and the
+   source/destination channel IDs. Leave GitHub credentials unset. Keep
+   `ANNOUNCEMENTS_ENABLED=false`; the worker will log that it is
    paused and will not post historical thank-yous to #announcements.
 2. Grant the bot **View Channel** and **Send Messages** in #moderators-only.
    Copy that channel's ID from Discord's Developer Mode menu.
@@ -152,6 +153,12 @@ never silently reset. Keep the contributor state when redeploying.
 
 The normal Start Command remains `python3 bot.py`. Changes must be committed
 and pushed to Render's connected branch before Render can deploy them.
+The Build Command is `python3 -I -m compileall -q bot.py contributor_bot`; no
+dependency installation is needed. Keep Auto-Deploy and PR Previews **Off**.
+If using a Blueprint, disable its **Auto Sync** separately, so edits to
+`render.yaml` cannot silently change the deployment controls. Deploy reviewed
+commits manually. See [SECURITY.md](SECURITY.md) for credentials, network
+isolation, repository protections, and the limits of these controls.
 
 ## Test
 

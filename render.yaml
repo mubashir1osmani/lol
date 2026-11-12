@@ -1,9 +1,15 @@
+previews:
+  generation: 'off'
+
 services:
   - type: worker
-    # Preserve the existing service identity when upgrading the old worker.
-    name: litellm-release-discord-bot
+    # Matches the existing worker. Never create a second bot during a sync.
+    name: litellm-discord
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    branch: main
+    autoDeployTrigger: 'off'
+    # No package installs or build scripts from PyPI: this bot is stdlib-only.
+    buildCommand: python3 -I -m compileall -q bot.py contributor_bot
     startCommand: python3 bot.py
     # Keeps contributor IDs, PR history, and pending announcements on redeploy.
     disk:
@@ -17,8 +23,7 @@ services:
         sync: false
       - key: ANNOUNCEMENTS_CHANNEL_ID
         sync: false
-      - key: GITHUB_TOKEN
-        sync: false
+      # No GitHub or Render credentials: public PRs can be read anonymously.
       - key: POLL_INTERVAL_MINUTES
         value: "5"
       # Keep the first deployment quiet until the moderators-only test is done.

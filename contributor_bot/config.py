@@ -46,11 +46,11 @@ def _channel_id(name: str, env: dict[str, str]) -> str:
 
 @dataclass(frozen=True)
 class Config:
-    discord_token: str
+    discord_token: str = field(repr=False)
     contributions_channel_id: str
     announcements_channel_id: str
     github_repository: str = "BerriAI/litellm"
-    github_token: str | None = None
+    github_token: str | None = field(default=None, repr=False)
     poll_interval_seconds: float = 300
     state_file: str = ".data/contributors.json"
     contributor_attribution: str = "message_author"
