@@ -1,11 +1,11 @@
 services:
   - type: worker
+    # Preserve the existing service identity when upgrading the old worker.
     name: litellm-release-discord-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python3 bot.py
-    # Keeps .data/ (posted releases, seen feed entries, joined threads)
-    # across deploys so restarts never re-post old announcements.
+    # Keeps contributor IDs, PR history, and pending announcements on redeploy.
     disk:
       name: bot-state
       mountPath: /opt/render/project/src/.data
@@ -13,15 +13,14 @@ services:
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
-      - key: DISCORD_CHANNEL_ID
+      - key: OSS_CONTRIBUTIONS_CHANNEL_ID
         sync: false
-      - key: DISCORD_GUILD_ID
+      - key: ANNOUNCEMENTS_CHANNEL_ID
         sync: false
-      - key: SUPPORT_USER_ID
+      - key: GITHUB_TOKEN
         sync: false
-      - key: LITELLM_PROXY_BASE_URL
-        sync: false
-      - key: LITELLM_PROXY_API_KEY
-        sync: false
-      - key: MENTION_ROLE_ID
-        sync: false
+      - key: POLL_INTERVAL_MINUTES
+        value: "5"
+      # Keep the first deployment quiet until the moderators-only test is done.
+      - key: ANNOUNCEMENTS_ENABLED
+        value: "false"
