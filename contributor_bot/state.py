@@ -11,12 +11,15 @@ def load_state(config: Config) -> dict[str, Any]:
     path = Path(config.state_file)
     if not path.exists():
         return {
-            "version": 1,
+            "version": 2,
             "scope": config.scope,
             "last_message_id": None,
             "pull_requests": {},
             "contributor_ids": [],
             "outbox": [],
+            "weekly": None,
+            "releases": {},
+            "roundups": [],
         }
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -24,7 +27,7 @@ def load_state(config: Config) -> dict[str, Any]:
         raise RuntimeError(f"Could not read state file {path}: {error}") from error
     if (
         not isinstance(state, dict)
-        or state.get("version") != 1
+        or state.get("version") not in {1, 2}
         or not isinstance(state.get("pull_requests"), dict)
         or not isinstance(state.get("contributor_ids"), list)
         or not isinstance(state.get("outbox"), list)
@@ -33,6 +36,21 @@ def load_state(config: Config) -> dict[str, Any]:
         raise RuntimeError(f"Invalid contributor state in {path}; refusing to reset announcement history")
     if state.get("scope") != config.scope:
         raise RuntimeError("State belongs to different channels/repository; use a different STATE_FILE")
+    if state["version"] == 1:
+        if state["outbox"]:
+            raise RuntimeError("Legacy all-time outbox needs manual review before weekly migration")
+        state.update(version=2, weekly=None, releases={}, roundups=[])
+    if (not isinstance(state.get("releases"), dict)
+            or not isinstance(state.get("roundups"), list)
+            or "weekly" not in state):
+        raise RuntimeError("Invalid weekly state; refusing to reset history")
+    window = state["weekly"]
+    if window is not None:
+        if (not isinstance(window, dict) or not all(key in window for key in
+                ("start", "end", "time", "timezone", "merge_numbers", "prepared"))):
+            raise RuntimeError("Invalid weekly window")
+        if (window["timezone"], window["time"]) != (config.roundup_timezone, config.roundup_time):
+            raise RuntimeError("Schedule changed; review the saved weekly boundaries before changing schedule")
     return state
 
 

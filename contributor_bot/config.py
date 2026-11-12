@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -53,9 +54,10 @@ class Config:
     github_token: str | None = field(default=None, repr=False)
     poll_interval_seconds: float = 300
     state_file: str = ".data/contributors.json"
-    contributor_attribution: str = "message_author"
     github_discord_map: dict[str, str] = field(default_factory=dict)
     announcements_enabled: bool = True
+    roundup_timezone: str = "America/Toronto"
+    roundup_time: str = "09:00"
 
     @property
     def scope(self) -> dict[str, str]:
@@ -84,9 +86,6 @@ def get_config(env: dict[str, str] | None = None) -> Config:
     if not math.isfinite(interval) or interval <= 0:
         raise ValueError("POLL_INTERVAL_MINUTES must be a positive number")
 
-    attribution = values.get("CONTRIBUTOR_ATTRIBUTION", "message_author").strip()
-    if attribution not in {"message_author", "github_mapping"}:
-        raise ValueError("CONTRIBUTOR_ATTRIBUTION must be message_author or github_mapping")
     try:
         mapping = json.loads(values.get("GITHUB_DISCORD_MAP", "{}").strip() or "{}")
     except json.JSONDecodeError as error:
@@ -97,8 +96,14 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         for login, discord_id in mapping.items()
     ):
         raise ValueError("GITHUB_DISCORD_MAP must map GitHub usernames to Discord ID strings")
-    if attribution == "github_mapping" and not mapping:
-        raise ValueError("github_mapping attribution requires GITHUB_DISCORD_MAP")
+    timezone = values.get("ROUNDUP_TIMEZONE", "America/Toronto").strip()
+    try:
+        ZoneInfo(timezone)
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError("ROUNDUP_TIMEZONE must be an installed IANA timezone") from error
+    roundup_time = values.get("ROUNDUP_TIME", "09:00").strip()
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", roundup_time):
+        raise ValueError("ROUNDUP_TIME must be HH:MM (24-hour time)")
 
     enabled = values.get("ANNOUNCEMENTS_ENABLED", "true").strip().lower()
     if enabled not in {"true", "false"}:
@@ -112,7 +117,8 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         github_token=values.get("GITHUB_TOKEN", "").strip() or None,
         poll_interval_seconds=interval,
         state_file=values.get("STATE_FILE", "").strip() or ".data/contributors.json",
-        contributor_attribution=attribution,
         github_discord_map={login.lower(): user_id for login, user_id in mapping.items()},
         announcements_enabled=enabled == "true",
+        roundup_timezone=timezone,
+        roundup_time=roundup_time,
     )

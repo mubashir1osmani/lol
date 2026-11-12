@@ -24,6 +24,9 @@ class NetworkBoundaryTests(unittest.TestCase):
             "https://api.github.com/repos/../litellm/pulls/1",
             "https://discord.com/api/v10/users/@me",
             "https://api.render.com/v1/services",
+            "https://docs.litellm.ai/admin",
+            "https://docs.litellm.ai/release_notes/a/b?token=secret",
+            "https://docs.litellm.ai:444/release_notes/a/b",
         ]
         with mock.patch.object(api, "_open_request") as request:
             for url in urls:
@@ -37,11 +40,19 @@ class NetworkBoundaryTests(unittest.TestCase):
             ("https://api.github.com/repos/BerriAI/litellm/pulls/1/merge", "PUT"),
             ("https://discord.com/api/v10/channels/123", "DELETE"),
             ("https://discord.com/api/v10/guilds/123/roles", "POST"),
+            ("https://api.github.com/search/issues", "POST"),
+            ("https://docs.litellm.ai/release_notes", "POST"),
         ]:
             with self.subTest(url=url, method=method), mock.patch.object(api, "_open_request") as request:
                 with self.assertRaises(ValueError):
                     api._http(Request(url, method=method))
                 request.assert_not_called()
+
+    def test_docs_requests_cannot_carry_credentials(self):
+        with mock.patch.object(api, '_open_request') as request:
+            with self.assertRaises(ValueError):
+                api._http(Request('https://docs.litellm.ai/release_notes', headers={'Authorization': 'Bearer secret'}))
+        request.assert_not_called()
 
     def test_redirects_never_return_a_credentialed_followup_request(self):
         request = Request(

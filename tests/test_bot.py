@@ -10,7 +10,7 @@ from urllib.request import Request
 
 from contributor_bot import api
 from contributor_bot.config import Config, get_config
-from contributor_bot.poller import extract_pr_numbers, poll_once
+from contributor_bot.poller import extract_pr_numbers
 from contributor_bot.state import load_state, save_state
 
 
@@ -63,8 +63,7 @@ class ConfigTests(unittest.TestCase):
         for mapping in ('[]', '{"octocat":123}', '{"octocat":"@everyone"}', 'oops'):
             with self.subTest(mapping=mapping), self.assertRaisesRegex(ValueError, "GITHUB_DISCORD_MAP"):
                 get_config(self.env | {"GITHUB_DISCORD_MAP": mapping})
-        with self.assertRaisesRegex(ValueError, "requires"):
-            get_config(self.env | {"CONTRIBUTOR_ATTRIBUTION": "github_mapping"})
+        self.assertEqual(get_config(self.env).github_discord_map, {})
 
 
 class ExtractionTests(unittest.TestCase):
@@ -87,184 +86,6 @@ class ExtractionTests(unittest.TestCase):
             "https://github.com/BerriAI/litellm/pull/7oops",
         ]))
         self.assertEqual(extract_pr_numbers(data, "BerriAI/litellm"), [])
-
-
-class PollerTests(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.config = Config("token", "123", "456", state_file=str(Path(directory.name) / "state.json"))
-        self.messages = mock.Mock(return_value=[])
-        self.github = mock.Mock(side_effect=lambda _repo, number, _token: pull(number))
-        self.post = mock.Mock()
-
-    def poll(self):
-        poll_once(self.config, self.messages, self.github, self.post)
-
-    def test_first_run_thanks_all_merged_contributors_once_not_closed_prs(self):
-        self.messages.return_value = [message(13, "222", (3,)), message(12, "111", (2,)), message(11)]
-        self.github.side_effect = lambda _repo, n, _token: pull(n, merged=n != 3, state="closed")
-        self.poll()
-        self.post.assert_called_once()
-        channel, token, payload = self.post.call_args.args
-        self.assertEqual((channel, token), ("456", "token"))
-        self.assertEqual(payload["allowed_mentions"], {"parse": [], "users": ["111"]})
-        self.assertEqual(payload["content"].count("<@111>"), 1)
-        self.assertIn("2 PRs", payload["content"])
-        self.assertNotIn("<@222>", payload["content"])
-        state = load_state(self.config)
-        self.assertEqual(state["contributor_ids"], ["111"])
-        self.assertEqual(state["last_message_id"], "13")
-        self.assertFalse(state["pull_requests"]["3"]["announced"])
-
-    def test_restarts_do_not_recheck_or_reannounce_merged_prs(self):
-        self.messages.return_value = [message(10)]
-        self.poll()
-        self.messages.return_value = []
-        self.poll()
-        self.post.assert_called_once()
-        self.github.assert_called_once_with("BerriAI/litellm", 1, None)
-        self.messages.assert_called_with("123", "token", "10")
-
-    def test_old_unmerged_pr_is_rechecked_without_new_messages(self):
-        self.messages.return_value = [message(10)]
-        self.github.side_effect = [pull(merged=False), pull(merged=True)]
-        self.poll()
-        self.post.assert_not_called()
-        self.messages.return_value = []
-        self.poll()
-        self.post.assert_called_once()
-        self.assertEqual(load_state(self.config)["contributor_ids"], ["111"])
-
-    def test_reposts_credit_earliest_human_not_bot_or_webhook(self):
-        self.messages.return_value = [
-            message(15, "333"), message(14, "222"), message(13, "111"),
-            message(12, author={"id": "999", "bot": True}),
-            message(11, "888", webhook_id="12"),
-        ]
-        self.poll()
-        self.assertEqual(self.post.call_args.args[2]["allowed_mentions"]["users"], ["111"])
-        self.github.assert_called_once()
-        self.messages.return_value = [message(16, "555")]
-        self.poll()
-        self.post.assert_called_once()
-
-    def test_same_contributor_can_be_thanked_for_a_new_pr(self):
-        self.messages.return_value = [message(10)]
-        self.poll()
-        self.messages.return_value = [message(11, numbers=(2,))]
-        self.poll()
-        self.assertEqual(self.post.call_count, 2)
-        self.assertEqual(load_state(self.config)["contributor_ids"], ["111"])
-
-    def test_mapping_credits_actual_github_author_not_sharer(self):
-        self.config = replace(self.config, github_discord_map={"octocat": "789"})
-        self.messages.return_value = [message(10)]
-        self.github.side_effect = None
-        self.github.return_value = pull(login="OctoCat")
-        self.poll()
-        self.assertEqual(self.post.call_args.args[2]["allowed_mentions"]["users"], ["789"])
-
-    def test_mapping_only_mode_holds_unmapped_prs_until_mapping_added(self):
-        self.config = replace(self.config, contributor_attribution="github_mapping", github_discord_map={"someone": "999"})
-        self.messages.return_value = [message(10)]
-        with self.assertLogs(level="WARNING"):
-            self.poll()
-        self.post.assert_not_called()
-        self.config = replace(self.config, github_discord_map={"octocat": "789"})
-        self.messages.return_value = []
-        self.poll()
-        self.post.assert_called_once()
-        self.github.assert_called_once()
-
-    def test_failed_github_lookup_does_not_lose_discovered_pr(self):
-        self.messages.return_value = [message(10)]
-        self.github.side_effect = [api.TransientAPIError("rate limit"), pull()]
-        with self.assertLogs(level="WARNING"):
-            self.poll()
-        self.post.assert_not_called()
-        self.messages.return_value = []
-        self.poll()
-        self.post.assert_called_once()
-
-    def test_one_missing_pr_does_not_block_other_contributors(self):
-        self.messages.return_value = [message(10, numbers=(1, 2))]
-        self.github.side_effect = [RuntimeError("404"), pull(2)]
-        with self.assertLogs(level="ERROR"):
-            self.poll()
-        self.post.assert_called_once()
-        self.assertFalse(load_state(self.config)["pull_requests"]["1"]["announced"])
-
-    def test_rate_limited_backfill_does_not_starve_later_prs(self):
-        self.messages.return_value = [message(10, numbers=(1, 2, 3))]
-        self.github.side_effect = [pull(1, merged=False), api.TransientAPIError("rate limit")]
-        with self.assertLogs(level="WARNING"):
-            self.poll()
-        self.messages.return_value = []
-        self.github.reset_mock()
-        self.github.side_effect = [pull(2), pull(3), pull(1, merged=False)]
-        self.poll()
-        self.assertEqual([call.args[1] for call in self.github.call_args_list], [2, 3, 1])
-        self.assertIn("2 PRs", self.post.call_args.args[2]["content"])
-
-    def test_history_failure_does_not_advance_checkpoint(self):
-        self.messages.return_value = [message(10)]
-        self.poll()
-        def failing_history(*_args):
-            yield message(12, numbers=(2,))
-            raise api.TransientAPIError("history interrupted")
-        self.messages.side_effect = failing_history
-        with self.assertRaises(api.TransientAPIError):
-            self.poll()
-        self.assertEqual(load_state(self.config)["last_message_id"], "10")
-        self.post.assert_called_once()
-
-    def test_failed_send_preserves_outbox_and_retries_same_nonce(self):
-        self.messages.return_value = [message(10)]
-        self.post.side_effect = [api.TransientAPIError("timeout"), None]
-        with self.assertRaises(api.TransientAPIError):
-            self.poll()
-        state = load_state(self.config)
-        self.assertEqual(state["contributor_ids"], [])
-        self.assertFalse(state["pull_requests"]["1"]["announced"])
-        self.assertEqual(len(state["outbox"]), 1)
-        payload = self.post.call_args.args[2]
-        self.messages.return_value = []
-        self.poll()
-        self.assertEqual(self.post.call_args.args[2], payload)
-        self.assertTrue(payload["enforce_nonce"])
-        self.assertLessEqual(len(payload["nonce"]), 25)
-        self.assertEqual(load_state(self.config)["outbox"], [])
-        self.assertEqual(load_state(self.config)["contributor_ids"], ["111"])
-
-    def test_large_batches_are_bounded_and_resume_after_partial_failure(self):
-        user_ids = [str(100000000000000000 + n) for n in range(1, 151)]
-        self.messages.return_value = [message(n, user_id, (n,)) for n, user_id in enumerate(user_ids, 1)]
-        self.post.side_effect = [None, api.TransientAPIError("failed second batch")]
-        with self.assertRaises(api.TransientAPIError):
-            self.poll()
-        first_payload = self.post.call_args_list[0].args[2]
-        retry_payload = self.post.call_args_list[1].args[2]
-        self.assertEqual(load_state(self.config)["contributor_ids"], first_payload["allowed_mentions"]["users"])
-        self.messages.return_value = []
-        self.post.reset_mock(side_effect=True)
-        self.poll()
-        self.assertEqual(self.post.call_args_list[0].args[2], retry_payload)
-        all_payloads = [first_payload] + [call.args[2] for call in self.post.call_args_list]
-        mentioned = []
-        for payload in all_payloads:
-            self.assertLessEqual(len(payload["content"].encode("utf-16-le")) // 2, 2000)
-            self.assertLessEqual(len(payload["allowed_mentions"]["users"]), 100)
-            self.assertEqual(payload["allowed_mentions"]["parse"], [])
-            mentioned.extend(payload["allowed_mentions"]["users"])
-        self.assertEqual(mentioned, user_ids)
-        self.assertEqual(load_state(self.config)["contributor_ids"], user_ids)
-
-    def test_empty_channel_does_not_post(self):
-        self.poll()
-        self.post.assert_not_called()
-        self.github.assert_not_called()
-        self.assertEqual(load_state(self.config)["contributor_ids"], [])
 
 
 class APITests(unittest.TestCase):

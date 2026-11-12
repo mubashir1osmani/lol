@@ -29,3 +29,7 @@ services:
       # Keep the first deployment quiet until the moderators-only test is done.
       - key: ANNOUNCEMENTS_ENABLED
         value: "false"
+      - key: ROUNDUP_TIMEZONE
+        value: America/Toronto
+      - key: ROUNDUP_TIME
+        value: "09:00"

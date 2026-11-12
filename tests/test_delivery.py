@@ -71,6 +71,20 @@ class DeliveryTestTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "receipt"):
                     api.post_message("789", "token", {"content": "test"})
 
+    def test_real_preview_sends_only_to_moderators_with_mentions_clamped(self):
+        report = {'start': '2026-11-06T14:00:00Z', 'end': '2026-11-12T14:00:00Z',
+                  'contributors': [{'github_login': 'octocat', 'discord_id': None,
+                                    'candidates': [{'discord_id': '123'}]}],
+                  'messages': [{'content': 'Thank you <@123>', 'allowed_mentions': {'users': ['123']}}]}
+        config = Config('token', '123', '456')
+        with mock.patch.object(bot_main, 'moderator_channel', return_value=self.channel), mock.patch.object(bot_main, 'preview_roundup', return_value=report), mock.patch.object(bot_main, 'save_state') as save, mock.patch.object(bot_main, 'post_message', return_value=self.receipt) as post, mock.patch('builtins.print'):
+            bot_main.run_preview(config, '789')
+        for call in post.call_args_list:
+            self.assertEqual(call.args[0], '789')
+            self.assertEqual(call.args[2]['allowed_mentions'], {'parse': [], 'users': []})
+        self.assertIn('NOT confirmed', post.call_args_list[-1].args[2]['content'])
+        self.assertTrue(save.call_args.args[0].endswith('.preview-report.json'))
+
 
 if __name__ == "__main__":
     unittest.main()
