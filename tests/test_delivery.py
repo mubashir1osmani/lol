@@ -24,6 +24,11 @@ class DeliveryTestTests(unittest.TestCase):
         self.assertTrue(payload["enforce_nonce"])
         self.assertEqual(url, "https://discord.com/channels/111/789/999")
 
+    def test_actual_singular_channel_name_is_accepted(self):
+        with mock.patch.object(bot_main, "fetch_channel", return_value=self.channel | {"name": "moderator-only"}), mock.patch.object(bot_main, "post_message", return_value=self.receipt) as post:
+            self.assertEqual(bot_main.send_test_message("789", "token"), "https://discord.com/channels/111/789/999")
+        post.assert_called_once()
+
     def test_other_destinations_are_rejected_before_sending(self):
         for override in ({"name": "announcements"}, {"type": 15}, {"guild_id": None}):
             with self.subTest(override=override), mock.patch.object(bot_main, "fetch_channel", return_value=self.channel | override), mock.patch.object(bot_main, "post_message") as post:

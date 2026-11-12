@@ -24,11 +24,11 @@ def send_test_message(channel_id: str, token: str) -> str:
         raise ValueError("Missing required environment variable: DISCORD_BOT_TOKEN")
     channel = fetch_channel(channel_id, token)
     if (
-        channel.get("name") != "moderators-only"
+        channel.get("name") not in {"moderator-only", "moderators-only"}
         or channel.get("type") != 0
         or not is_discord_id(channel.get("guild_id"))
     ):
-        raise ValueError("The test destination must be the #moderators-only text channel")
+        raise ValueError("The test destination must be the #moderator-only or #moderators-only text channel")
     receipt = post_message(channel_id, token, {
         "content": (
             "🧪 **LiteLLM contributor bot test**\n\n"
