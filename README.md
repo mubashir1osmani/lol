@@ -89,7 +89,8 @@ Use the existing **litellm-discord Background Worker**, one instance:
 
 Requires Python 3.11+ with system timezone data (included in Render's Linux
 runtime). No package install is needed. The bot's only credential needs to be its
-Discord token. See [SECURITY.md](SECURITY.md) for the existing deployment boundaries.
+Discord token. Keep deployment credentials and unrelated environment secrets out
+of the worker; keep manual deployments, repository protections and network isolation enabled.
 
 Grant the bot View Channel / Read Message History in #oss-contributions and
 View Channel / Send Messages in #announcements and #moderator-only. Enable
