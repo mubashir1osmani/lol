@@ -188,20 +188,28 @@ def start_contributor_roles(config):
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
         commands.extend(MERGED_SLASH_COMMANDS)
-    if features and commands:
+    if features and commands and config.discord_application_id and config.discord_guild_id:
         try:
             register_guild_commands(
-                config.discord_application_id or "",
-                config.discord_guild_id or "",
+                config.discord_application_id,
+                config.discord_guild_id,
                 config.discord_token,
                 commands,
             )
-            logging.info("Registered slash commands in guild %s", config.discord_guild_id)
+            logging.info(
+                "Registered slash commands in guild %s: %s",
+                config.discord_guild_id,
+                ", ".join(command["name"] for command in commands),
+            )
         except Exception:
             logging.exception(
                 "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
                 "that the bot invite includes applications.commands, and that the bot is in the server."
             )
+    elif features and commands:
+        logging.warning(
+            "Skipping REST slash-command registration: DISCORD_APPLICATION_ID or DISCORD_GUILD_ID is unset"
+        )
     if features and not ed25519_public_key_ok(config.discord_public_key or ""):
         logging.error(
             "DISCORD_PUBLIC_KEY is not a valid Ed25519 point. "

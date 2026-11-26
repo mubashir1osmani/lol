@@ -125,10 +125,14 @@ class NetworkBoundaryTests(unittest.TestCase):
                 data=b"{}", method="PATCH",
             ))
             api._http(Request(
+                "https://discord.com/api/v10/webhooks/123/" + ("a" * 20),
+                data=b"{}", method="POST",
+            ))
+            api._http(Request(
                 "https://discord.com/api/v10/channels/321/messages/654/reactions/t%3A999/@me",
                 data=b"", method="PUT",
             ))
-        self.assertEqual(request.call_count, len(urls) + 6)
+        self.assertEqual(request.call_count, len(urls) + 7)
 
     def test_pr_review_reads_are_allowed_and_graphql_mutations_are_not(self):
         response = mock.MagicMock()
