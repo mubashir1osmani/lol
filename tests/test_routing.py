@@ -29,6 +29,46 @@ def _jev(noul, route, score=0.2, model="jev-1.14.0", tokens=180):
     return transport
 
 
+class RouterCallTests(unittest.TestCase):
+    def test_answer_uses_one_autorouter_completion(self):
+        import sys
+        import types
+        from types import SimpleNamespace
+        captured = {}
+
+        class Router:
+            def __init__(self, model_list, num_retries=0):
+                captured["model_list"] = model_list
+
+            async def acompletion(self, **kwargs):
+                captured["call"] = kwargs
+                message = SimpleNamespace(content="use the openai key in config.yaml")
+                return SimpleNamespace(model="anthropic/claude-haiku-4-5", choices=[SimpleNamespace(message=message)])
+
+        fake = types.ModuleType("litellm")
+        fake.Router = Router
+        fake.completion_cost = lambda **_kwargs: 0.0012
+        config = Config("token", "123", "456", review_model="anthropic/claude-sonnet-4-5")
+        with mock.patch.dict(sys.modules, {"litellm": fake}):
+            from contributor_bot.routing import complete_auto
+            text = complete_auto(
+                config,
+                [{"role": "user", "content": "how do I add openai?"}],
+                session_id="998877",
+                tier="SIMPLE",
+            )
+        self.assertEqual(text, "use the openai key in config.yaml")
+        self.assertEqual(captured["call"]["model"], "auto")
+        self.assertEqual(captured["call"]["metadata"]["session_id"], "998877")
+        self.assertEqual(captured["call"]["metadata"]["decision_tier"], "SIMPLE")
+        names = [entry["model_name"] for entry in captured["model_list"]]
+        self.assertEqual(names, ["fast", "capable", "auto"])
+        auto = captured["model_list"][2]["litellm_params"]
+        self.assertEqual(auto["model"], "auto_router/complexity_router")
+        self.assertEqual(auto["complexity_router_default_model"], "capable")
+        self.assertEqual(auto["complexity_router_config"]["classifier_type"], "custom")
+
+
 class DecisionTests(unittest.TestCase):
     def tearDown(self):
         reset_decision_cache()

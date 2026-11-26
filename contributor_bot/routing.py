@@ -260,6 +260,27 @@ def build_router(config):
     )
 
 
+def capable_model(config) -> str:
+    """The model the COMPLEX and REASONING tiers name. Reviews use this directly."""
+    return config.review_model or "anthropic/claude-sonnet-4-5"
+
+
+def complete_auto(config, messages: list, *, session_id: str, tier: str) -> str:
+    """One Autorouter completion. The classifier reads ``tier`` and does not call Jev."""
+    import asyncio
+    router = build_router(config)
+    metadata = {"session_id": str(session_id), "decision_tier": tier}
+
+    async def call():
+        return await router.acompletion(model="auto", messages=messages, metadata=metadata)
+
+    response = asyncio.run(call())
+    selected = getattr(response, "model", "") or tier
+    log_completion_cost(response, str(selected))
+    choice = response.choices[0].message
+    return getattr(choice, "content", "") or ""
+
+
 def log_completion_cost(response, selected: str) -> float:
     try:
         import litellm

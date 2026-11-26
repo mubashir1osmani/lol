@@ -996,15 +996,20 @@ def _blocking(value: str) -> list:
     return parsed if isinstance(parsed, list) else []
 
 
+def _capable_model(config) -> str:
+    from .routing import capable_model
+    return capable_model(config)
+
+
 def _run_sdk_session(ctx: ReviewContext, prompt: str, config) -> AgentResult:
-    """One Agents SDK run. LiteLLM picks the provider from REVIEW_MODEL."""
+    """One Agents SDK run. The model is the Autorouter's capable tier."""
     sdk = _load_sdk()
     _configure_tracing(sdk, config)
     agent = sdk.Agent(
         name="litellm-review",
         instructions=SYSTEM_PROMPT,
         tools=_sdk_tools(sdk),
-        model=sdk.LitellmModel(model=config.review_model),
+        model=sdk.LitellmModel(model=_capable_model(config)),
         model_settings=sdk.ModelSettings(temperature=0.2, max_tokens=MODEL_OUTPUT_TOKENS),
     )
     turns = step_cap(config.review_max_steps)
@@ -1063,6 +1068,18 @@ def _stamp(result: AgentResult, ctx: ReviewContext) -> AgentResult:
     result.output_tokens = ctx.output_tokens
     result.tool_calls = ctx.tool_calls
     result.step_seconds = list(ctx.step_seconds)
+    model = _capable_model(ctx.config)
+    cost = 0.0
+    try:
+        import litellm
+        cost = float(litellm.completion_cost(
+            model=model,
+            prompt_tokens=ctx.input_tokens,
+            completion_tokens=ctx.output_tokens,
+        ))
+    except Exception:
+        cost = 0.0
+    logging.info("Review model=%s cost_usd=%.6f", model, cost)
     return result
 
 

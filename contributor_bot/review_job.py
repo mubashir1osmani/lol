@@ -515,18 +515,19 @@ def _answer_if_decided(config: Config, channel_id: str, message: dict) -> None:
         return
     acknowledge_message(config, channel_id, message.get("id"))
     from .questions import answer_question
-    model = config.fast_model if decision.tier in {"SIMPLE", "MEDIUM"} else (config.review_model or config.fast_model)
-    answer_question(config, channel_id, message.get("content") or "", complete=_routed_complete(config, model))
+    answer_question(
+        config, channel_id, message.get("content") or "",
+        complete=_routed_complete(config, decision.tier, session_id=channel_id),
+    )
 
 
-def _routed_complete(config, model):
+def _routed_complete(config, tier, *, session_id):
     def complete(system, body):
-        from .review_llm import complete_litellm
-        logging.info("Autorouter reply model=%s tier selected for a server answer", model)
-        return complete_litellm(model, [
+        from .routing import complete_auto
+        return complete_auto(config, [
             {"role": "system", "content": system},
             {"role": "user", "content": body},
-        ])
+        ], session_id=session_id, tier=tier)
     return complete
 
 
