@@ -11,10 +11,8 @@ from unittest import mock
 
 from contributor_bot.ack import (
     EYES,
-    FALLBACK_T,
-    FALLBACK_Y,
-    T_EMOJI_NAMES,
-    Y_EMOJI_NAMES,
+    FALLBACK_TY,
+    TY_EMOJI_NAMES,
     acknowledge_message,
     apply_reactions,
     bind_ack_reactions,
@@ -50,34 +48,61 @@ class AckResolutionTests(unittest.TestCase):
         reset_ack_cache()
 
     def test_default_names_and_fallbacks(self):
-        self.assertEqual(T_EMOJI_NAMES, ("t", "letter_t", "litellm_t", "regional_indicator_t"))
-        self.assertEqual(Y_EMOJI_NAMES, ("y", "letter_y", "litellm_y", "regional_indicator_y"))
+        self.assertEqual(TY_EMOJI_NAMES, ("ty", "litellm_ty", "thankyou", "thank_you"))
+        self.assertEqual(FALLBACK_TY, "🙏")
         api, line = resolve_ack_reactions(None, [])
-        self.assertEqual(api, (EYES, FALLBACK_T, FALLBACK_Y))
-        self.assertIn("no guild emoji named t, letter_t, litellm_t, regional_indicator_t", line)
-        guild = [("Letter_T", "111111111111111111"), ("y", "222222222222222222")]
-        api, line = resolve_ack_reactions(None, guild)
-        self.assertEqual(api, (EYES, "Letter_T:111111111111111111", "y:222222222222222222"))
-        self.assertIn("Letter_T:111111111111111111 (letter_t)", line)
-        custom, _line = resolve_ack_reactions(("👀", "<:wave:333333333333333333>", "y"), guild)
-        self.assertEqual(custom, (EYES, "wave:333333333333333333", "y:222222222222222222"))
+        self.assertEqual(api, (EYES, FALLBACK_TY))
+        self.assertIn("fallback; no guild emoji named ty, litellm_ty, thankyou, thank_you", line)
+        with self.assertLogs(level="INFO") as fallback_logs:
+            bound = bind_ack_reactions(_config(ack_reactions=None), [])
+        self.assertEqual(bound, (EYES, FALLBACK_TY))
+        self.assertIn("🙏 (fallback;", "\n".join(fallback_logs.output))
+        reset_ack_cache()
+
+        guild_ty = [SimpleNamespace(name="TY", id=111111111111111111)]
+        api, line = resolve_ack_reactions(None, guild_ty)
+        self.assertEqual(api, (EYES, "TY:111111111111111111"))
+        self.assertIn("TY:111111111111111111 (ty)", line)
+
+        guild_variant = [("LiteLLM_ty", "222222222222222222")]
+        api, line = resolve_ack_reactions(None, guild_variant)
+        self.assertEqual(api, (EYES, "LiteLLM_ty:222222222222222222"))
+        self.assertIn("LiteLLM_ty:222222222222222222 (litellm_ty)", line)
+
+        guild_thankyou = [("ThankYou", "333333333333333333")]
+        api, line = resolve_ack_reactions(None, guild_thankyou)
+        self.assertEqual(api, (EYES, "ThankYou:333333333333333333"))
+        self.assertIn("ThankYou:333333333333333333 (thankyou)", line)
+
+    def test_ack_reactions_env_resolves_bare_ty_name(self):
+        guild = [SimpleNamespace(name="ty", id=444444444444444444)]
+        parsed = parse_ack_reactions("👀,ty")
+        self.assertEqual(parsed, ("👀", "ty"))
+        api, line = resolve_ack_reactions(parsed, guild)
+        self.assertEqual(api, (EYES, "ty:444444444444444444"))
+        self.assertIn("ty:444444444444444444 (ty)", line)
+        bound = bind_ack_reactions(_config(ack_reactions=parsed), guild)
+        self.assertEqual(bound, (EYES, "ty:444444444444444444"))
+
+        custom, _line = resolve_ack_reactions(("👀", "<:wave:333333333333333333>", "TY"), guild)
+        self.assertEqual(custom, (EYES, "wave:333333333333333333", "ty:444444444444444444"))
 
     def test_explicit_list_rejects_a_broken_entry_and_logs_once(self):
         with self.assertRaises(ValueError):
-            parse_ack_reactions("👀,,y")
+            parse_ack_reactions("👀,,ty")
         with self.assertRaises(ValueError):
             parse_ack_reactions("<:not-an-emoji>")
         config = _config(ack_reactions=None)
         with self.assertLogs(level="INFO") as logs:
-            bind_ack_reactions(config, [("t", "111111111111111111"), ("y", "222222222222222222")])
-            bind_ack_reactions(config, [("t", "111111111111111111"), ("y", "222222222222222222")])
+            bind_ack_reactions(config, [("ty", "111111111111111111")])
+            bind_ack_reactions(config, [("ty", "111111111111111111")])
         joined = "\n".join(logs.output)
         self.assertEqual(joined.count("Ack reactions:"), 1)
-        self.assertIn("t:111111111111111111", joined)
+        self.assertIn("ty:111111111111111111", joined)
 
     def test_a_forbidden_reaction_does_not_stop_the_next_one(self):
         reset_ack_cache()
-        bind_ack_reactions(_config(), [("t", "111111111111111111"), ("y", "222222222222222222")])
+        bind_ack_reactions(_config(), [("ty", "111111111111111111")])
         seen = []
 
         def react(channel_id, message_id, emoji, token):
@@ -87,7 +112,7 @@ class AckResolutionTests(unittest.TestCase):
 
         with mock.patch("contributor_bot.ack.add_reaction", side_effect=react):
             apply_reactions(_config(), "321", "654")
-        self.assertEqual(seen, [EYES, "t:111111111111111111", "y:222222222222222222"])
+        self.assertEqual(seen, [EYES, "ty:111111111111111111"])
 
 
 class DiscordAckFlowTests(unittest.TestCase):
@@ -98,7 +123,7 @@ class DiscordAckFlowTests(unittest.TestCase):
         self.store = Store(str(Path(self.directory.name) / "roles.db"))
         self.addCleanup(self.store.close)
         self.config = _config(review_classify=False)
-        bind_ack_reactions(self.config, [("t", "111111111111111111"), ("y", "222222222222222222")])
+        bind_ack_reactions(self.config, [("ty", "111111111111111111")])
 
     def tearDown(self):
         reset_ack_cache()
@@ -158,7 +183,7 @@ class DiscordAckFlowTests(unittest.TestCase):
                 if thread.name == "pr-review":
                     thread.join(timeout=3)
         self.assertEqual([item[2] for item in discord.reactions], [
-            EYES, "t:111111111111111111", "y:222222222222222222",
+            EYES, "ty:111111111111111111",
         ])
         self.assertEqual(discord.reactions[0][0:2], ("321", "654"))
         self.assertEqual(discord.threads, [("321", "654", "pr 12 review")])
@@ -233,9 +258,9 @@ class DiscordAckFlowTests(unittest.TestCase):
         config = get_config(env)
         self.assertEqual(config.review_classifier_model, "anthropic/claude-haiku-4-5")
         self.assertIsNone(config.ack_reactions)
-        overridden = get_config(env | {"REVIEW_CLASSIFIER_MODEL": "openai/gpt-4o-mini", "ACK_REACTIONS": "👀,t,y"})
+        overridden = get_config(env | {"REVIEW_CLASSIFIER_MODEL": "openai/gpt-4o-mini", "ACK_REACTIONS": "👀,ty"})
         self.assertEqual(overridden.review_classifier_model, "openai/gpt-4o-mini")
-        self.assertEqual(overridden.ack_reactions, ("👀", "t", "y"))
+        self.assertEqual(overridden.ack_reactions, ("👀", "ty"))
 
 
 class AcknowledgeStartsBeforeTheAgentTests(unittest.TestCase):
