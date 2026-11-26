@@ -11,13 +11,18 @@ from unittest import mock
 from contributor_bot.config import Config, get_config
 from contributor_bot.gateway import PRESENCE_REVIEW, build_intents, start_gateway, stop_gateway
 from contributor_bot.review_agent import (
+    MODEL_OUTPUT_TOKENS,
+    STEP_SAFETY_CEILING,
     SYSTEM_PROMPT,
     Completion,
     ReviewContext,
     ToolCall,
+    _json,
+    complete_with_tools,
     completion_from_response,
     execute_tool,
     run_agent_loop,
+    step_cap,
     tool_ping_maintainer,
     tool_read_file,
     tool_search_code,
@@ -142,6 +147,41 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(timed.exhausted, "time")
         self.assertEqual(called, [])
 
+        unlimited = run_agent_loop(
+            [], model="m",
+            complete=lambda *args, **kwargs: Completion("finished the review", [], 50_000),
+            execute=lambda name, args: "{}",
+            max_steps=0, max_tokens=0, timeout_seconds=0, now=lambda: 10_000,
+        )
+        self.assertIsNone(unlimited.exhausted)
+        self.assertIn("finished", unlimited.text)
+        self.assertEqual(step_cap(0), STEP_SAFETY_CEILING)
+        self.assertEqual(step_cap(3), 3)
+        self.assertEqual(step_cap(80), STEP_SAFETY_CEILING)
+
+    def test_oversized_tool_output_stays_json_and_context_errors_retry(self):
+        payload = _json({"patch": "x" * 20_000})
+        parsed = json.loads(payload)
+        self.assertTrue(parsed["truncated"])
+        self.assertLess(len(payload), 9000)
+        messages = [{"role": "tool", "tool_call_id": "1", "content": "y" * 5000}]
+        calls = {"n": 0}
+
+        def flaky(model, messages, tools, timeout=1):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("prompt is too long for the context window")
+            self.assertLess(len(messages[0]["content"]), 5000)
+            return Completion("ok after trim", [], 10)
+
+        result = run_agent_loop(
+            messages, model="m", complete=flaky, execute=lambda name, args: "{}",
+            max_steps=2, max_tokens=0, timeout_seconds=0,
+        )
+        self.assertIsNone(result.exhausted)
+        self.assertIn("ok after trim", result.text)
+        self.assertEqual(calls["n"], 2)
+
     def test_blocking_bug_overrides_a_clean_gate(self):
         gate = assess_gate(
             bots=BOTS, head_sha=HEAD, draft=False, merged=False, state="open",
@@ -206,6 +246,8 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(self.store.claim_daily_run(day, 2))
         self.assertTrue(self.store.claim_daily_run(day, 2))
         self.assertFalse(self.store.claim_daily_run(day, 2))
+        self.assertTrue(self.store.claim_daily_run(day, 0))
+        self.assertTrue(self.store.claim_daily_run(day, 0))
 
 
 class ClassifyAndFollowupTests(unittest.TestCase):
@@ -291,10 +333,38 @@ class GatewayTests(unittest.TestCase):
         config = get_config(env)
         self.assertTrue(config.review_classify)
         self.assertFalse(config.review_watch_all_channels)
-        self.assertEqual(config.review_max_steps, 8)
-        self.assertEqual(config.review_usage_cap, 16000)
-        self.assertEqual(config.review_daily_run_budget, 40)
+        self.assertEqual(config.review_max_steps, 0)
+        self.assertEqual(config.review_usage_cap, 0)
+        self.assertEqual(config.review_timeout_seconds, 600)
+        self.assertEqual(config.review_daily_run_budget, 0)
+        for raw in ("", "0"):
+            capped = get_config(env | {
+                "REVIEW_AGENT_MAX_STEPS": raw,
+                "REVIEW_AGENT_MAX_TOKENS": raw,
+                "REVIEW_DAILY_RUN_BUDGET": raw,
+                "REVIEW_AGENT_TIMEOUT_SECONDS": "0" if raw == "0" else "",
+            })
+            self.assertEqual(capped.review_max_steps, 0)
+            self.assertEqual(capped.review_usage_cap, 0)
+            self.assertEqual(capped.review_daily_run_budget, 0)
+        explicit = get_config(env | {
+            "REVIEW_AGENT_MAX_STEPS": "4",
+            "REVIEW_AGENT_MAX_TOKENS": "5000",
+            "REVIEW_DAILY_RUN_BUDGET": "3",
+            "REVIEW_AGENT_TIMEOUT_SECONDS": "90",
+        })
+        self.assertEqual(explicit.review_max_steps, 4)
+        self.assertEqual(explicit.review_usage_cap, 5000)
+        self.assertEqual(explicit.review_daily_run_budget, 3)
+        self.assertEqual(explicit.review_timeout_seconds, 90)
+        self.assertEqual(get_config(env | {"REVIEW_AGENT_TIMEOUT_SECONDS": "0"}).review_timeout_seconds, 0)
         self.assertFalse(config.discord_members_intent)
+        fake = mock.Mock()
+        fake.completion.return_value = {"choices": [{"message": {"content": "hi"}}], "usage": {"total_tokens": 3}}
+        with mock.patch.dict("sys.modules", {"litellm": fake}):
+            complete_with_tools("anthropic/claude-sonnet-4-5", [{"role": "user", "content": "x"}], [], timeout=30)
+        self.assertEqual(fake.completion.call_args.kwargs["max_tokens"], MODEL_OUTPUT_TOKENS)
+        self.assertGreaterEqual(MODEL_OUTPUT_TOKENS, 4096)
         message = {"content": "please review https://github.com/BerriAI/litellm/pull/9", "author": {"bot": False}}
         asked, numbers = message_decision(replace(config, review_classify=False), message)
         self.assertEqual((asked, numbers), (True, [9]))

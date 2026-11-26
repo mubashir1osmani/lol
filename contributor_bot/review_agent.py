@@ -56,7 +56,24 @@ def redact(text: str) -> str:
     return _SECRET.sub("[redacted]", text or "")
 
 
-def _clip(text: str, limit: int = 6000) -> str:
+# Each tool result stays small enough to fit in the next model call. A huge diff
+# is cut here instead of failing the run or blowing the context window.
+TOOL_RESULT_CHARS = 8000
+# Anthropic counts max_tokens as the output budget and rejects a tiny value
+# mid tool-call. 8192 leaves room for a verdict without truncating the call.
+MODEL_OUTPUT_TOKENS = 8192
+# Unlimited steps still stop here so a tool loop cannot run forever.
+STEP_SAFETY_CEILING = 50
+
+
+def step_cap(configured: int) -> int:
+    """Positive settings stop early. 0 uses the safety ceiling."""
+    if configured <= 0:
+        return STEP_SAFETY_CEILING
+    return min(configured, STEP_SAFETY_CEILING)
+
+
+def _clip(text: str, limit: int = TOOL_RESULT_CHARS) -> str:
     cleaned = redact(text)
     if len(cleaned) <= limit:
         return cleaned
@@ -134,7 +151,7 @@ def complete_with_tools(model: str, messages: list, tools: list, *, timeout: flo
         tools=tools,
         tool_choice="auto",
         temperature=0.2,
-        max_tokens=700,
+        max_tokens=MODEL_OUTPUT_TOKENS,
         timeout=max(5, int(timeout)),
     )
     return completion_from_response(response)
@@ -218,8 +235,12 @@ def _safe_path(path: object) -> str:
     return path
 
 
-def _json(payload: dict) -> str:
-    return _clip(json.dumps(payload, ensure_ascii=False))
+def _json(payload: dict, limit: int = TOOL_RESULT_CHARS) -> str:
+    """JSON tool result. Oversized payloads stay valid JSON with a preview."""
+    text = redact(json.dumps(payload, ensure_ascii=False))
+    if len(text) <= limit:
+        return text
+    return json.dumps({"truncated": True, "preview": text[: limit - 80]}, ensure_ascii=False)
 
 
 def _snapshot(ctx: ReviewContext):
@@ -302,7 +323,8 @@ def tool_read_file(ctx: ReviewContext, args: dict) -> str:
         text = base64.b64decode(payload["content"], validate=False).decode("utf-8", errors="replace")
     except (ValueError, TypeError):
         return _json({"error": "could not decode that file"})
-    return _json({"path": path, "ref": ref_name, "truncated": len(text) > 20000, "text": text[:20000]})
+    shown = text[:6000]
+    return _json({"path": path, "ref": ref_name, "truncated": len(text) > len(shown), "text": shown})
 
 
 def tool_search_code(ctx: ReviewContext, args: dict) -> str:
@@ -558,6 +580,36 @@ def execute_tool(ctx: ReviewContext, name: str, arguments: dict) -> str:
         return _json({"error": "that tool failed. try another one or submit what you have."})
 
 
+def _is_context_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return any(phrase in text for phrase in (
+        "context length",
+        "context window",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "input is too long",
+        "request too large",
+    ))
+
+
+def shrink_tool_outputs(messages: list, limit: int) -> int:
+    """Shorten older tool results so the next call fits. Returns how many changed."""
+    changed = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        if not isinstance(content, str) or len(content) <= limit:
+            continue
+        message["content"] = json.dumps({
+            "truncated": True,
+            "preview": content[: max(limit - 80, 0)],
+        }, ensure_ascii=False)
+        changed += 1
+    return changed
+
+
 def run_agent_loop(
     messages: list,
     *,
@@ -569,22 +621,36 @@ def run_agent_loop(
     timeout_seconds: float,
     now=time.monotonic,
 ) -> AgentResult:
-    """Call the model until it stops requesting tools, or a budget runs out."""
+    """Call the model until it stops requesting tools, or a configured cap runs out.
+
+    ``max_steps``, ``max_tokens``, and ``timeout_seconds`` of 0 mean no cap.
+    Steps still stop at ``STEP_SAFETY_CEILING``.
+    """
     start = now()
     tokens = 0
-    deadline = start + timeout_seconds
-    for _step in range(max_steps):
-        if now() >= deadline:
+    steps = step_cap(max_steps)
+    for _step in range(steps):
+        if timeout_seconds > 0 and now() >= start + timeout_seconds:
             return AgentResult("ran out of budget (time) before i finished. try /recheck in a bit.", exhausted="time")
-        try:
-            completion = complete(model, messages, TOOLS, timeout=max(1.0, deadline - now()))
-        except Exception as error:
-            logging.warning("Review model call failed: %s", error)
-            if "not installed" in str(error):
-                raise
-            return AgentResult("the model call failed. try /recheck in a bit.", exhausted="error")
+        remaining = 180.0 if timeout_seconds <= 0 else max(5.0, start + timeout_seconds - now())
+        shrink_tool_outputs(messages, TOOL_RESULT_CHARS)
+        completion = None
+        for attempt in range(3):
+            try:
+                completion = complete(model, messages, TOOLS, timeout=remaining)
+                break
+            except Exception as error:
+                if "not installed" in str(error):
+                    raise
+                if _is_context_error(error) and shrink_tool_outputs(messages, 2000 // (attempt + 1)):
+                    logging.warning("Review context was too large; truncated tool output and retrying")
+                    continue
+                logging.warning("Review model call failed: %s", error)
+                return AgentResult("the model call failed. try /recheck in a bit.", exhausted="error")
+        if completion is None:
+            return AgentResult("the diff was too big to send after trimming. try /recheck in a bit.", exhausted="error")
         tokens += completion.total_tokens or max(1, len(completion.content or "") // 4)
-        if completion.tool_calls and tokens > max_tokens:
+        if max_tokens > 0 and completion.tool_calls and tokens > max_tokens:
             return AgentResult("ran out of budget (tokens) before i finished. try /recheck in a bit.", exhausted="tokens")
         if not completion.tool_calls:
             return AgentResult(redact(completion.content or "").strip() or "(no reply)")

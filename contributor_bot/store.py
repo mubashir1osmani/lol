@@ -495,9 +495,11 @@ class Store:
             self._conn.commit()
 
     def claim_daily_run(self, day: str, limit: int) -> bool:
-        """Reserve one agent run for a UTC day. False when the daily budget is spent."""
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or not isinstance(limit, int) or limit < 1:
+        """Reserve one agent run for a UTC day. ``limit`` 0 means unlimited."""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or not isinstance(limit, int) or limit < 0:
             raise ValueError("Invalid review budget")
+        if limit == 0:
+            return True
         with self._lock:
             self._conn.execute(
                 "INSERT INTO review_budget (day, runs) VALUES (?, 0) ON CONFLICT(day) DO NOTHING",

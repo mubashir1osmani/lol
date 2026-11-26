@@ -277,9 +277,15 @@ them. With `PR_REVIEW_ENABLED=true` an agent pre-reviews a pull request in a
 Discord thread. It stays off by default, and turning it on does not change who
 the Friday roundup thanks.
 
-The agent calls `litellm.completion` with tools and loops until it stops or it
-hits a step, token, or time cap. A capped run posts `ran out of budget` instead
-of pretending it finished. There is also a daily run budget.
+The agent calls `litellm.completion` with tools and loops until the model stops.
+`REVIEW_AGENT_MAX_TOKENS`, `REVIEW_AGENT_MAX_STEPS`, and `REVIEW_DAILY_RUN_BUDGET`
+are unlimited when unset, empty, or `0`. A positive number is a cap. Steps still
+stop at 50 so a tool loop cannot run forever, even when the step budget is
+unlimited or set higher. Each model call may use up to 8192 output tokens, which
+Anthropic needs in order to finish a tool call. Tool results are truncated per
+call, and a context-window error trims those results and retries instead of
+failing the run. `REVIEW_AGENT_TIMEOUT_SECONDS` defaults to 600. `0` means no
+wall-time cap. A run that does hit a cap you set posts `ran out of budget`.
 
 Tools are read-only on GitHub: pull request metadata, the file list, one file's
 diff, a full file at the pull request head or base, code search in this
@@ -344,8 +350,8 @@ has a thread when GitHub sends `pull_request` `synchronize` or
 `check_suite` `completed`. New GitHub events do not open threads by themselves.
 
 `REVIEW_COOLDOWN_SECONDS` (default 600) limits re-reviews. Follow-up answers use
-`REVIEW_FOLLOWUP_COOLDOWN_SECONDS` (default 45). `REVIEW_DAILY_RUN_BUDGET`
-(default 40) caps agent runs per UTC day.
+`REVIEW_FOLLOWUP_COOLDOWN_SECONDS` (default 45). Daily run limits stay off
+unless `REVIEW_DAILY_RUN_BUDGET` is a positive number.
 
 ### Setup
 
