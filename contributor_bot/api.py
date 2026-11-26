@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import re
 import time
@@ -30,6 +31,50 @@ class _NoRedirects(HTTPRedirectHandler):
 _open_request = build_opener(ProxyHandler({}), _NoRedirects()).open
 
 
+_OWNER_REPO = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+_SNOWFLAKE = r"[1-9][0-9]{0,19}"
+_PR_NUMBER = r"[1-9][0-9]*"
+# Interaction tokens are untrusted path segments. Keep them to one segment.
+_INTERACTION_TOKEN = r"[A-Za-z0-9._~=-]{10,256}"
+
+
+def _github_request_allowed(method: str, path: str) -> bool:
+    pull = rf"/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}"
+    if method == "GET" and (
+        re.fullmatch(pull, path)
+        or re.fullmatch(pull + r"/files", path)
+        or re.fullmatch(pull + r"/reviews", path)
+        or re.fullmatch(rf"/repos/{_OWNER_REPO}/pulls", path)
+        or path in {"/search/issues", "/user"}
+    ):
+        return True
+    # The only GitHub write: an optional invite comment on a merged pull request.
+    return method == "POST" and re.fullmatch(
+        rf"/repos/{_OWNER_REPO}/issues/{_PR_NUMBER}/comments", path
+    ) is not None
+
+
+def _discord_request_allowed(method: str, path: str) -> bool:
+    if method == "GET" and re.fullmatch(rf"/api/v10/channels/{_SNOWFLAKE}(?:/messages)?", path):
+        return True
+    if method == "POST" and re.fullmatch(rf"/api/v10/channels/{_SNOWFLAKE}/messages", path):
+        return True
+    # Add an existing role to a member. Creating roles, editing members, and
+    # removing roles stay blocked.
+    if method == "PUT" and re.fullmatch(
+        rf"/api/v10/guilds/{_SNOWFLAKE}/members/{_SNOWFLAKE}/roles/{_SNOWFLAKE}", path
+    ):
+        return True
+    if method == "PUT" and re.fullmatch(
+        rf"/api/v10/applications/{_SNOWFLAKE}/guilds/{_SNOWFLAKE}/commands", path
+    ):
+        return True
+    # Deferred slash-command replies. Only the original interaction response.
+    return method == "PATCH" and re.fullmatch(
+        rf"/api/v10/webhooks/{_SNOWFLAKE}/{_INTERACTION_TOKEN}/messages/@original", path
+    ) is not None
+
+
 def _validate_request(request: Request) -> None:
     """Defense in depth, not a sandbox against malicious replacement code."""
     url = urlsplit(request.full_url)
@@ -39,18 +84,15 @@ def _validate_request(request: Request) -> None:
     ):
         raise ValueError("Only approved HTTPS API requests are allowed")
     if url.netloc == "api.github.com":
-        allowed = method == "GET" and (re.fullmatch(
-            r"/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*", url.path
-        ) or url.path == "/search/issues")
+        allowed = _github_request_allowed(method, url.path)
+    elif url.netloc == "github.com":
+        # OAuth code exchange only. The browser, not this bot, opens the authorize page.
+        allowed = method == "POST" and url.path == "/login/oauth/access_token" and not url.query
     elif url.netloc == "docs.litellm.ai":
         allowed = (method == "GET" and not url.query and not request.has_header("Authorization")
                    and (request.full_url == RELEASE_INDEX or release_url(request.full_url)))
     elif url.netloc == "discord.com":
-        allowed = (
-            method == "GET" and re.fullmatch(r"/api/v10/channels/[1-9][0-9]*(?:/messages)?", url.path)
-        ) or (
-            method == "POST" and re.fullmatch(r"/api/v10/channels/[1-9][0-9]*/messages", url.path)
-        )
+        allowed = _discord_request_allowed(method, url.path)
     else:
         allowed = False
     if not allowed:
@@ -198,29 +240,265 @@ def fetch_release_prs(url: str, repository: str) -> list[int]:
     return parse_new_contributors(conditional_get(url, {}).decode("utf-8"), repository)
 
 
-def fetch_merged_numbers(repository: str, start, end, token: str | None) -> set[int]:
+def github_headers(token: str | None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "litellm-contributor-discord-bot",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def wait_for_github_budget(headers, *, now: float | None = None, sleep=time.sleep) -> None:
+    """Sleep when a GitHub response says the remaining budget is almost gone."""
+    raw = headers.get("X-RateLimit-Remaining") if headers is not None else None
+    if raw is None:
+        return
+    try:
+        remaining = int(raw)
+    except (TypeError, ValueError):
+        return
+    if remaining >= 5:
+        return
+    reset_raw = headers.get("X-RateLimit-Reset")
+    current = time.time() if now is None else now
+    try:
+        reset = float(reset_raw)
+    except (TypeError, ValueError):
+        reset = current + 2
+    delay = reset - current
+    if not math.isfinite(delay):
+        return
+    delay = min(max(delay, 0.0), 90.0) + 0.25
+    logging.info("GitHub rate limit has %s requests left; waiting %.1fs", remaining, delay)
+    sleep(delay)
+
+
+def github_get_json(url: str, token: str | None, *, pace: bool = False):
+    status, headers, body = _http(Request(url, headers=github_headers(token)))
+    if status != 200:
+        raise RuntimeError(f"GitHub returned HTTP {status}")
+    if pace:
+        wait_for_github_budget(headers)
+    return json.loads(body) if body else None
+
+
+def _clean_path(path: object) -> str:
+    if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path:
+        raise RuntimeError("GitHub returned an unexpected file path")
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise RuntimeError("GitHub returned an unexpected file path")
+    return path
+
+
+def fetch_pull_files(repository: str, number: int, token: str | None) -> list[str]:
+    """Changed paths for a pull request, paginated and rate-limit aware."""
+    files: list[str] = []
+    page = 1
+    while page <= 30:
+        payload = github_get_json(
+            f"{GITHUB_API}/repos/{repository}/pulls/{number}/files?per_page=100&page={page}",
+            token,
+            pace=True,
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError("GitHub returned an unexpected files response")
+        for item in payload:
+            if not isinstance(item, dict):
+                raise RuntimeError("GitHub returned an unexpected files response")
+            files.append(_clean_path(item.get("filename")))
+        if len(payload) < 100:
+            return files
+        page += 1
+    raise RuntimeError("Pull request file list is too large")
+
+
+def fetch_pull_reviews(repository: str, number: int, token: str | None) -> list[dict[str, Any]]:
+    reviews: list[dict[str, Any]] = []
+    page = 1
+    while page <= 10:
+        payload = github_get_json(
+            f"{GITHUB_API}/repos/{repository}/pulls/{number}/reviews?per_page=100&page={page}",
+            token,
+            pace=True,
+        )
+        if not isinstance(payload, list) or any(not isinstance(item, dict) for item in payload):
+            raise RuntimeError("GitHub returned an unexpected reviews response")
+        reviews.extend(payload)
+        if len(payload) < 100:
+            return reviews
+        page += 1
+    return reviews
+
+
+def fetch_open_pulls_for_author(repository: str, author: str, token: str | None) -> tuple[list[dict[str, Any]], int]:
+    """Open pull requests authored by ``author``. Returns ``(items, total_count)``."""
+    if not re.fullmatch(r"[A-Za-z0-9-]+", author):
+        raise ValueError("Unexpected GitHub login")
+    _pace_github_search(token)
+    params = urlencode({
+        "q": f"repo:{repository} is:pr is:open author:{author}",
+        "per_page": 20,
+        "page": 1,
+    })
+    payload = _request_json(Request(
+        f"{GITHUB_API}/search/issues?{params}",
+        headers=github_headers(token),
+    ))
+    if (not isinstance(payload, dict) or payload.get("incomplete_results") is not False
+            or not isinstance(payload.get("total_count"), int)
+            or not isinstance(payload.get("items"), list)):
+        raise TransientAPIError("GitHub search is incomplete")
+    items = []
+    for item in payload["items"]:
+        number = item.get("number") if isinstance(item, dict) else None
+        title = item.get("title") if isinstance(item, dict) else None
+        if not isinstance(number, int) or number <= 0 or not isinstance(title, str):
+            raise RuntimeError("Unexpected GitHub search result")
+        items.append({"number": number, "title": title})
+    return items, payload["total_count"]
+
+
+def exchange_github_oauth(client_id: str, client_secret: str, code: str, redirect_uri: str) -> str:
+    """Trade an OAuth code for a user access token. The token is not logged or stored."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{8,200}", code):
+        raise ValueError("Unexpected GitHub OAuth code")
+    payload = _request_json(Request(
+        "https://github.com/login/oauth/access_token",
+        data=json.dumps({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "litellm-contributor-discord-bot",
+        },
+    ))
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("GitHub OAuth token exchange was declined")
+    return token
+
+
+def fetch_github_user(access_token: str) -> dict[str, Any]:
+    """Identity for an OAuth access token. Callers must discard the token afterwards."""
+    user = github_get_json(f"{GITHUB_API}/user", access_token)
+    login = user.get("login") if isinstance(user, dict) else None
+    user_id = user.get("id") if isinstance(user, dict) else None
+    if (not isinstance(user, dict) or user.get("type") != "User"
+            or not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9-]+", login)
+            or not isinstance(user_id, int) or user_id <= 0):
+        raise RuntimeError("GitHub OAuth did not return a user account")
+    return {"login": login, "id": user_id}
+
+
+def add_member_role(guild_id: str, user_id: str, role_id: str, token: str) -> None:
+    status, _headers, _body = _http(Request(
+        f"{DISCORD_API}/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+        data=b"",
+        method="PUT",
+        headers=_discord_headers(token),
+    ))
+    if status != 204:
+        raise RuntimeError(f"discord.com returned HTTP {status}")
+
+
+def register_guild_commands(application_id: str, guild_id: str, token: str, commands: list[dict[str, Any]]) -> None:
+    response = _request_json(Request(
+        f"{DISCORD_API}/applications/{application_id}/guilds/{guild_id}/commands",
+        data=json.dumps(commands).encode("utf-8"),
+        method="PUT",
+        headers={**_discord_headers(token), "Content-Type": "application/json"},
+    ))
+    if not isinstance(response, list):
+        raise RuntimeError("Discord did not accept the slash command list")
+
+
+def edit_original_interaction(application_id: str, interaction_token: str, message: dict[str, Any]) -> None:
+    """Finish a deferred slash command. Uses the interaction token, not the bot token."""
+    if not is_discord_id(application_id) or not re.fullmatch(_INTERACTION_TOKEN, interaction_token):
+        raise ValueError("Unexpected interaction token")
+    mentions = message.get("allowed_mentions") or {}
+    users = mentions.get("users", [])
+    if not isinstance(users, list) or any(not is_discord_id(user_id) for user_id in users):
+        raise ValueError("Only explicit Discord user IDs may be mentioned")
+    message = {**message, "allowed_mentions": {"parse": [], "users": users}}
+    try:
+        _edit_original(application_id, interaction_token, message)
+    except RuntimeError as error:
+        if "HTTP 404" not in str(error):
+            raise
+        # Discord may not have recorded the deferred response yet.
+        time.sleep(0.4)
+        _edit_original(application_id, interaction_token, message)
+
+
+def _edit_original(application_id: str, interaction_token: str, message: dict[str, Any]) -> None:
+    response = _request_json(Request(
+        f"{DISCORD_API}/webhooks/{application_id}/{interaction_token}/messages/@original",
+        data=json.dumps(message).encode("utf-8"),
+        method="PATCH",
+        headers={"Content-Type": "application/json", "User-Agent": "litellm-contributor-discord-bot"},
+    ))
+    if not isinstance(response, dict) or not is_discord_id(response.get("id")):
+        raise RuntimeError("Discord did not return an interaction follow-up")
+
+
+def post_issue_comment(repository: str, number: int, token: str, body: str) -> dict[str, Any]:
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is required to comment on pull requests")
+    response = _request_json(Request(
+        f"{GITHUB_API}/repos/{repository}/issues/{number}/comments",
+        data=json.dumps({"body": body}).encode("utf-8"),
+        method="POST",
+        headers={**github_headers(token), "Content-Type": "application/json"},
+    ))
+    if not isinstance(response, dict) or not isinstance(response.get("id"), int):
+        raise RuntimeError("GitHub did not return a comment receipt")
+    return response
+
+
+def _pace_github_search(token: str | None) -> None:
+    global _last_search_request
+    delay = (2.1 if token else 6.1) - (time.monotonic() - _last_search_request)
+    if delay > 0:
+        time.sleep(delay)
+    _last_search_request = time.monotonic()
+
+
+def fetch_merged_numbers(repository: str, start, end, token: str | None, author: str | None = None) -> set[int]:
     """Search is discovery only; each selected PR is verified through /pulls/N.
 
     Split large windows to avoid GitHub search's 1,000-result truncation.
     Search ranges are inclusive; exact [start,end) checks happen on PR data.
+    ``author`` limits discovery to one GitHub login (used when somebody links).
     """
-    global _last_search_request
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "litellm-contributor-discord-bot"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if author is not None and not re.fullmatch(r"[A-Za-z0-9-]+", author):
+        raise ValueError("Unexpected GitHub login")
+    author_query = f" author:{author}" if author else ""
     found = set()
     page, total = 1, None
     while True:
-        params = urlencode({"q": f"repo:{repository} is:pr is:merged merged:{iso(start)}..{iso(end)}",
-                            "per_page": 100, "page": page})
+        params = urlencode({
+            "q": f"repo:{repository} is:pr is:merged{author_query} merged:{iso(start)}..{iso(end)}",
+            "per_page": 100,
+            "page": page,
+        })
         # Search has a separate 10/min anonymous (30/min authenticated) budget.
         # Pace across recursive windows too, or >1,000 results can hit the same
         # rate limit on every restart before ever completing discovery.
-        delay = (2.1 if token else 6.1) - (time.monotonic() - _last_search_request)
-        if delay > 0:
-            time.sleep(delay)
-        _last_search_request = time.monotonic()
-        payload = _request_json(Request(f"{GITHUB_API}/search/issues?{params}", headers=headers))
+        _pace_github_search(token)
+        payload = _request_json(Request(
+            f"{GITHUB_API}/search/issues?{params}",
+            headers=github_headers(token),
+        ))
         if (not isinstance(payload, dict) or payload.get("incomplete_results") is not False
                 or not isinstance(payload.get("total_count"), int)
                 or not isinstance(payload.get("items"), list)):
@@ -231,8 +509,8 @@ def fetch_merged_numbers(repository: str, start, end, token: str | None) -> set[
             if (end - start).total_seconds() < 4:
                 raise RuntimeError("Too many merged PRs in a one-second search window")
             midpoint = parse_time(iso(start + (end - start) / 2))
-            return (fetch_merged_numbers(repository, start, midpoint, token)
-                    | fetch_merged_numbers(repository, midpoint, end, token))
+            return (fetch_merged_numbers(repository, start, midpoint, token, author)
+                    | fetch_merged_numbers(repository, midpoint, end, token, author))
         items = payload["items"]
         for item in items:
             number = item.get("number")

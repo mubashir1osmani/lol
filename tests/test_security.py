@@ -42,6 +42,11 @@ class NetworkBoundaryTests(unittest.TestCase):
             ("https://discord.com/api/v10/guilds/123/roles", "POST"),
             ("https://api.github.com/search/issues", "POST"),
             ("https://docs.litellm.ai/release_notes", "POST"),
+            ("https://discord.com/api/v10/guilds/123/members/456/roles/789", "DELETE"),
+            ("https://api.github.com/repos/BerriAI/litellm/pulls/1/comments", "POST"),
+            ("https://github.com/login/oauth/access_token", "GET"),
+            ("https://api.github.com/user/emails", "GET"),
+            ("https://discord.com/api/v10/webhooks/123/" + ("a" * 20) + "/messages/999", "PATCH"),
         ]:
             with self.subTest(url=url, method=method), mock.patch.object(api, "_open_request") as request:
                 with self.assertRaises(ValueError):
@@ -81,6 +86,43 @@ class NetworkBoundaryTests(unittest.TestCase):
                 api._http(Request(url))
         self.assertEqual(str(raised.exception), "discord.com returned HTTP 403")
         self.assertNotIn("super-secret", str(raised.exception))
+
+    def test_contributor_role_endpoints_are_narrowly_allowed(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status, response.headers = 200, {}
+        response.read.return_value = b"{}"
+        urls = [
+            "https://api.github.com/repos/BerriAI/litellm/pulls/1/files?per_page=100",
+            "https://api.github.com/repos/BerriAI/litellm/pulls/1/reviews",
+            "https://api.github.com/repos/BerriAI/litellm/pulls?state=closed",
+            "https://api.github.com/user",
+        ]
+        with mock.patch.object(api, "_open_request", return_value=response) as request:
+            for url in urls:
+                with self.subTest(url=url):
+                    api._http(Request(url))
+            api._http(Request(
+                "https://api.github.com/repos/BerriAI/litellm/issues/7/comments",
+                data=b"{}", method="POST",
+            ))
+            api._http(Request(
+                "https://github.com/login/oauth/access_token",
+                data=b"{}", method="POST",
+            ))
+            api._http(Request(
+                "https://discord.com/api/v10/guilds/123/members/456/roles/789",
+                data=b"", method="PUT",
+            ))
+            api._http(Request(
+                "https://discord.com/api/v10/applications/123/guilds/456/commands",
+                data=b"[]", method="PUT",
+            ))
+            api._http(Request(
+                "https://discord.com/api/v10/webhooks/123/" + ("a" * 20) + "/messages/@original",
+                data=b"{}", method="PATCH",
+            ))
+        self.assertEqual(request.call_count, len(urls) + 5)
 
 
 class CredentialAndStateTests(unittest.TestCase):

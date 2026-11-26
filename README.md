@@ -86,6 +86,7 @@ Use the existing **litellm-discord Background Worker**, one instance:
 | `POLL_INTERVAL_MINUTES` | Default `5`; retry/collection interval, **not** posting frequency. The worker wakes at the Friday boundary. |
 | `GITHUB_TOKEN` | Prefer **unset**; only public GitHub reads are needed. Anonymous rate limits are resumable. |
 | `GITHUB_REPOSITORY` | Default `BerriAI/litellm`. Release-note links are restricted to that repository. |
+| `CONTRIBUTOR_ROLES_ENABLED` | `false` (default). Set `true` only after the contributor-role setup below. |
 
 Requires Python 3.11+ with system timezone data (included in Render's Linux
 runtime). No package install is needed. The bot's only credential needs to be its
@@ -95,8 +96,9 @@ of the worker; keep manual deployments, repository protections and network isola
 Grant the bot View Channel / Read Message History in #oss-contributions and
 View Channel / Send Messages in #announcements and #moderator-only. Enable
 Message Content Intent in the Discord Developer Portal. Preview reconciliation
-is not automatic identity verification. No Administrator, Manage Roles, Manage
-Webhooks, or Mention Everyone permission is needed. Threads, forum posts and
+is not automatic identity verification. The weekly roundup does not need
+Administrator, Manage Roles, Manage Webhooks, or Mention Everyone. Contributor
+roles, when enabled, do need Manage Roles; see below. Threads, forum posts and
 edits to old messages are not scanned; post new links in the source text channel.
 
 ## Preview before enabling
@@ -141,6 +143,104 @@ ordinary retries/restarts idempotent. Discord only deduplicates nonces for a few
 minutes: a crash after acceptance but before saving a receipt can still duplicate
 that batch after a long downtime. Run only one worker/`--once` writer per state
 file; previews use their own cache and can run alongside the worker.
+
+## Contributor roles
+
+The same process can grant Discord roles for merged pull requests on
+`BerriAI/litellm`. It stays off until `CONTRIBUTOR_ROLES_ENABLED=true`, so an
+existing weekly-roundup worker keeps its current behavior. Role state lives in
+SQLite (`ROLES_DB_PATH`, default `.data/contributor_roles.db` on the persistent
+disk), separate from the weekly JSON ledger. The SQL is isolated in
+`contributor_bot/store.py` if you later move it to Postgres.
+
+Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
+
+| Role | Earned when |
+| --- | --- |
+| Contributor | 1+ merged human PR |
+| OSS Champion | 10+ merged total, or 3+ in one UTC calendar month |
+| Agent Builder | a merged PR whose paths contain `mcp`, `agent`, or `a2a`, or whose labels include `agents` |
+| Provider Wizard | 3+ merged PRs that touch `litellm/llms/` |
+| Docs Hero | 3+ merged PRs that touch `docs/` |
+
+Bot authors are ignored. Roles are sticky: the bot adds them and does not remove
+them. A person keeps OSS Champion after the month they earned it. `/unlink-github`
+drops the account link and leaves roles already granted.
+
+### Discord setup
+
+1. Invite the bot with the `bot` and `applications.commands` scopes. For roles,
+   grant **Manage Roles**, plus View Channel and Send Messages in the
+   announcement channel (for example #shipped). The weekly roundup still needs
+   its existing channel permissions and the Message Content Intent.
+2. In the server role list, put the bot's role **above** every role it grants.
+   Discord rejects assignments otherwise; the log says so and the bot keeps running.
+3. Copy each role's snowflake into `ROLE_CONTRIBUTOR_ID`, `ROLE_OSS_CHAMPION_ID`,
+   `ROLE_AGENT_BUILDER_ID`, `ROLE_PROVIDER_WIZARD_ID`, and `ROLE_DOCS_HERO_ID`.
+   Optional `ROLE_*_NAME` overrides change the announcement text only.
+4. Set `DISCORD_GUILD_ID`, `DISCORD_APPLICATION_ID`, and `DISCORD_PUBLIC_KEY`
+   (the 64-character hex key from the application). Set
+   `ROLE_ANNOUNCEMENTS_CHANNEL_ID` to the channel that should receive posts like
+   `<@user> just became an oss champion 🎉`.
+5. Start the bot, then set the application's Interactions Endpoint URL to
+   `https://<public-host>/discord/interactions`. Discord sends a ping; the
+   endpoint must already be up. Slash commands are registered for that guild:
+   `/link-github`, `/unlink-github`, and `/my-prs`.
+
+`/link-github` replies with a GitHub OAuth link that expires in 10 minutes.
+`/my-prs` is ephemeral and shows the caller's open LiteLLM pull requests (with
+review status), the merged count this bot has recorded, and the roles those
+pull requests earn.
+
+### GitHub setup
+
+1. Create a GitHub OAuth app. Callback URL:
+   `https://<public-host>/github/oauth/callback`, the same value as
+   `GITHUB_OAUTH_REDIRECT_URI`. Homepage URL can be the Discord invite.
+   The app only requests the `read:user` scope. Put the client id and secret in
+   `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET`.
+2. On `BerriAI/litellm`, add a webhook for **Pull requests** only.
+   Payload URL `https://<public-host>/github/webhook`, content type
+   `application/json`, secret `GITHUB_WEBHOOK_SECRET`. The bot checks
+   `X-Hub-Signature-256` and ignores anything that is not a merged pull request
+   from a human on the configured repository.
+3. `GITHUB_TOKEN` should be a fine-grained token that can read pull requests
+   (and metadata) on `BerriAI/litellm`. It is used for changed-file lists,
+   historical backfill, and `/my-prs`. Anonymous access still works until the
+   rate limit; file paths are what the path-based roles need.
+4. The process listens on `HTTP_HOST`:`HTTP_PORT` (default `0.0.0.0` and `8080`,
+   or Render's `PORT` when `HTTP_PORT` is unset). GitHub and Discord need
+   public HTTPS. A Render **web service** with the same start command
+   (`python3 bot.py`) provides that. Leave the existing background worker as-is
+   until you are ready to receive webhooks; do not run two pollers on one state file.
+
+On each merged pull request the bot stores the number, author, `merged_at`,
+labels, and changed paths, then re-evaluates that author. If their Discord
+account is linked, new roles are assigned and announced. A linked author can
+also get a short `<@user> just shipped #1234 🎉` line
+(`MERGE_SHOUTOUTS_ENABLED`, default `true`). Linking an account evaluates roles
+immediately and catches up that person's older merged pull requests in the
+background.
+
+Backfill everyone else, rate-limit aware, after people have linked (or before;
+linking catches a person up either way):
+
+```sh
+python3 bot.py --backfill-merged-prs
+```
+
+`GITHUB_TOKEN` is required. `BACKFILL_SINCE` defaults to `2023-01-01T00:00:00Z`.
+Completed search windows are checkpointed, so a rerun skips work it finished.
+The command does not post a shoutout per historical pull request; it announces
+a role once when a linked account newly qualifies.
+
+### Optional invite comment
+
+`PR_COMMENT_INVITES_ENABLED` defaults to `false`. Set it to `true` and set
+`DISCORD_INVITE_URL` to let the bot comment once on a merged pull request whose
+author has not linked Discord, inviting them to run `/link-github`. The GitHub
+token then needs permission to write issue comments. Leave this off unless you
+want that comment on the repository.
 
 ## Checks
 
