@@ -70,12 +70,7 @@ class RoleRuleTests(unittest.TestCase):
         ]))
 
         docs = [pull(index + 1, january[index], files=(f"docs/page-{index}.md",)) for index in range(3)]
-        self.assertIn("docs_hero", earned_role_keys(docs))
-        self.assertNotIn("docs_hero", earned_role_keys([
-            pull(1, january[0], files=("Docs/readme.md",)),
-            pull(2, january[1], files=("documentation/readme.md",)),
-            pull(3, january[2], files=("docs",)),
-        ]))
+        self.assertEqual(earned_role_keys(docs), ["contributor", "oss_champion"])
         # One pull request can earn more than one path role, and still counts once.
         both = pull(1, january[0], files=("docs/x.md", "litellm/llms/openai.py"), labels=("agents",))
         self.assertEqual(
@@ -83,7 +78,7 @@ class RoleRuleTests(unittest.TestCase):
                 both, docs[1], docs[2], provider[1],
                 pull(5, january[0], files=("litellm/llms/cohere.py",)),
             ]),
-            ["contributor", "oss_champion", "agent_builder", "provider_wizard", "docs_hero"],
+            ["contributor", "oss_champion", "agent_builder", "provider_wizard"],
         )
 
 
@@ -98,10 +93,10 @@ class CopyTests(unittest.TestCase):
             "<@111> just shipped #42 and became a contributor and an agent builder 🎉",
         )
         self.assertEqual(announcement_text("111", [], 7), "<@111> just shipped #7 🎉")
-        self.assertIn("roles: contributor, docs hero", my_prs_text(
+        self.assertIn("roles: contributor, provider wizard", my_prs_text(
             "octocat",
             [{"number": 8, "title": "Fix @everyone\nnow", "review_status": "approved"}],
-            1, 3, ["Contributor", "Docs Hero"],
+            1, 3, ["Contributor", "Provider Wizard"],
         ))
         self.assertNotIn("@everyone", my_prs_text(
             "octocat", [{"number": 8, "title": "@everyone", "review_status": "approved"}], 1, 1, [],
@@ -139,7 +134,6 @@ def roles_env(directory, **extra):
         "ROLE_OSS_CHAMPION_ID": "1002",
         "ROLE_AGENT_BUILDER_ID": "1003",
         "ROLE_PROVIDER_WIZARD_ID": "1004",
-        "ROLE_DOCS_HERO_ID": "1005",
         "ROLE_ANNOUNCEMENTS_CHANNEL_ID": "789",
         "GITHUB_TOKEN": "github-secret",
         "ROLES_DB_PATH": str(Path(directory) / "roles.db"),
@@ -177,13 +171,13 @@ class RoleConfigTests(unittest.TestCase):
     def test_enabled_roles_require_their_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             env = roles_env(directory)
-            for key in ("GITHUB_WEBHOOK_SECRET", "ROLE_DOCS_HERO_ID", "DISCORD_PUBLIC_KEY", "GITHUB_OAUTH_REDIRECT_URI"):
+            for key in ("GITHUB_WEBHOOK_SECRET", "ROLE_PROVIDER_WIZARD_ID", "DISCORD_PUBLIC_KEY", "GITHUB_OAUTH_REDIRECT_URI"):
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                     broken = dict(env)
                     broken.pop(key)
                     get_config(broken)
             with self.assertRaisesRegex(ValueError, "distinct"):
-                get_config(env | {"ROLE_DOCS_HERO_ID": "1001"})
+                get_config(env | {"ROLE_PROVIDER_WIZARD_ID": "1001"})
             with self.assertRaisesRegex(ValueError, "DISCORD_INVITE_URL"):
                 get_config(env | {"PR_COMMENT_INVITES_ENABLED": "true"})
             invites = get_config(env | {
@@ -192,6 +186,20 @@ class RoleConfigTests(unittest.TestCase):
             })
             self.assertTrue(invites.pr_comment_invites_enabled)
             self.assertFalse(get_config(env | {"MERGE_SHOUTOUTS_ENABLED": "false"}).merge_shoutouts_enabled)
+
+    def test_legacy_docs_hero_env_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = roles_env(directory) | {
+                "ROLE_DOCS_HERO_ID": "not-a-snowflake",
+                "ROLE_DOCS_HERO_NAME": "Docs Hero\n@everyone",
+            }
+            config = get_config(env)
+        self.assertNotIn("docs_hero", config.role_ids)
+        self.assertNotIn("docs_hero", config.role_names)
+        self.assertEqual(
+            set(config.role_ids),
+            {"contributor", "oss_champion", "agent_builder", "provider_wizard"},
+        )
 
 
 class StoreTests(unittest.TestCase):

@@ -213,7 +213,7 @@ class InteractionTests(unittest.TestCase):
             repository="BerriAI/litellm", number=4, github_user_id=5, github_login="octocat",
             merged_at="2026-11-02T00:00:00+00:00", title="docs", labels=[], files=["docs/a.md", "docs/b.md", "docs/c.md"],
         )
-        # Three docs files on one PR do not earn Docs Hero; one merged PR earns Contributor.
+        # Docs-only files do not earn a path role. One merged PR earns Contributor.
         self.store.upsert_pull(
             repository="BerriAI/litellm", number=3, github_user_id=5, github_login="octocat",
             merged_at="2026-01-02T00:00:00+00:00", title="one", labels=[], files=["README.md"],

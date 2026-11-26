@@ -16,11 +16,9 @@ CONTRIBUTOR_MIN_MERGED = 1
 OSS_CHAMPION_MIN_MERGED = 10
 OSS_CHAMPION_MIN_IN_MONTH = 3
 PROVIDER_WIZARD_MIN_MERGED = 3
-DOCS_HERO_MIN_MERGED = 3
 
-# A pull request counts for these roles when any changed path is under the prefix.
+# A pull request counts for Provider Wizard when any changed path is under the prefix.
 PROVIDER_WIZARD_PREFIX = "litellm/llms/"
-DOCS_HERO_PREFIX = "docs/"
 
 # Agent Builder: any changed path containing one of these tokens (case-insensitive),
 # or a pull request label exactly named "agents".
@@ -32,7 +30,6 @@ ROLE_KEYS = (
     "oss_champion",
     "agent_builder",
     "provider_wizard",
-    "docs_hero",
 )
 
 DEFAULT_ROLE_NAMES = {
@@ -40,7 +37,6 @@ DEFAULT_ROLE_NAMES = {
     "oss_champion": "OSS Champion",
     "agent_builder": "Agent Builder",
     "provider_wizard": "Provider Wizard",
-    "docs_hero": "Docs Hero",
 }
 
 ROLE_ID_ENV = {
@@ -48,7 +44,6 @@ ROLE_ID_ENV = {
     "oss_champion": "ROLE_OSS_CHAMPION_ID",
     "agent_builder": "ROLE_AGENT_BUILDER_ID",
     "provider_wizard": "ROLE_PROVIDER_WIZARD_ID",
-    "docs_hero": "ROLE_DOCS_HERO_ID",
 }
 
 ROLE_NAME_ENV = {
@@ -56,7 +51,6 @@ ROLE_NAME_ENV = {
     "oss_champion": "ROLE_OSS_CHAMPION_NAME",
     "agent_builder": "ROLE_AGENT_BUILDER_NAME",
     "provider_wizard": "ROLE_PROVIDER_WIZARD_NAME",
-    "docs_hero": "ROLE_DOCS_HERO_NAME",
 }
 
 
@@ -116,19 +110,11 @@ def qualifies_provider_wizard(pulls: list[MergedPull]) -> bool:
     return matched >= PROVIDER_WIZARD_MIN_MERGED
 
 
-def qualifies_docs_hero(pulls: list[MergedPull]) -> bool:
-    matched = sum(
-        1 for pull in _human(pulls) if any(_under(path, DOCS_HERO_PREFIX) for path in pull.files)
-    )
-    return matched >= DOCS_HERO_MIN_MERGED
-
-
 RULES = (
     ("contributor", qualifies_contributor),
     ("oss_champion", qualifies_oss_champion),
     ("agent_builder", qualifies_agent_builder),
     ("provider_wizard", qualifies_provider_wizard),
-    ("docs_hero", qualifies_docs_hero),
 )
 
 

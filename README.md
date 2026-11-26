@@ -163,11 +163,11 @@ Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 | OSS Champion | 10+ merged total, or 3+ in one UTC calendar month |
 | Agent Builder | a merged PR whose paths contain `mcp`, `agent`, or `a2a`, or whose labels include `agents` |
 | Provider Wizard | 3+ merged PRs that touch `litellm/llms/` |
-| Docs Hero | 3+ merged PRs that touch `docs/` |
 
 Bot authors are ignored. Roles are sticky: the bot adds them and does not remove
-them. A person keeps OSS Champion after the month they earned it. `/unlink-github`
-drops the account link and leaves roles already granted.
+them. A person keeps OSS Champion after the month they earned it. Docs Hero is
+no longer granted; anyone who already has that Discord role keeps it.
+`/unlink-github` drops the account link and leaves roles already granted.
 
 ### Discord setup
 
@@ -178,7 +178,7 @@ drops the account link and leaves roles already granted.
 2. In the server role list, put the bot's role **above** every role it grants.
    Discord rejects assignments otherwise; the log says so and the bot keeps running.
 3. Copy each role's snowflake into `ROLE_CONTRIBUTOR_ID`, `ROLE_OSS_CHAMPION_ID`,
-   `ROLE_AGENT_BUILDER_ID`, `ROLE_PROVIDER_WIZARD_ID`, and `ROLE_DOCS_HERO_ID`.
+   `ROLE_AGENT_BUILDER_ID`, and `ROLE_PROVIDER_WIZARD_ID`.
    Optional `ROLE_*_NAME` overrides change the announcement text only.
 4. Set `DISCORD_GUILD_ID`, `DISCORD_APPLICATION_ID`, and `DISCORD_PUBLIC_KEY`
    (the 64-character hex key from the application). Set
