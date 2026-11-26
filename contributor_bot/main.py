@@ -15,6 +15,7 @@ from .api import (
 )
 from .backfill import backfill_merged_pulls
 from .config import get_config, is_discord_id, load_dotenv
+from .gateway import start_gateway, stop_gateway
 from .interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS
 from .poller import poll_once, preview_roundup
 from .review_job import poll_review_channels
@@ -140,6 +141,8 @@ def main(argv: list[str] | None = None) -> None:
                 store.close()
         return
     server = start_contributor_roles(config)
+    store = getattr(server, "store", None) if server is not None else None
+    gateway = start_gateway(config, store)
     stop_event = threading.Event()
 
     def stop(_signal_number: int, _frame: object) -> None:
@@ -149,8 +152,9 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     try:
-        _run_loop(config, stop_event, getattr(server, "store", None) if server is not None else None)
+        _run_loop(config, stop_event, store, gateway)
     finally:
+        stop_gateway(gateway)
         if server is not None:
             stop_http_server(server)
 
@@ -162,11 +166,13 @@ def run_backfill(config) -> None:
 
 
 def start_contributor_roles(config):
-    """Listen for webhooks and interactions when roles or PR pre-review are enabled.
+    """Listen for GitHub webhooks and, when configured, Discord HTTP interactions.
 
+    A Render web service sets PORT, so /health is served even while features are off.
     A failure here does not stop the Friday thank-you loop.
     """
-    if not config.contributor_roles_enabled and not config.pr_review_enabled:
+    features = config.contributor_roles_enabled or config.pr_review_enabled
+    if not features and not os.environ.get("PORT", "").strip():
         return None
     server = None
     try:
@@ -178,7 +184,7 @@ def start_contributor_roles(config):
         commands.extend(SLASH_COMMANDS)
     if config.pr_review_enabled:
         commands.extend(REVIEW_SLASH_COMMANDS)
-    if commands:
+    if features and commands:
         try:
             register_guild_commands(
                 config.discord_application_id or "",
@@ -192,19 +198,19 @@ def start_contributor_roles(config):
                 "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
                 "that the bot invite includes applications.commands, and that the bot is in the server."
             )
-    if not ed25519_public_key_ok(config.discord_public_key or ""):
+    if features and not ed25519_public_key_ok(config.discord_public_key or ""):
         logging.error(
             "DISCORD_PUBLIC_KEY is not a valid Ed25519 point. "
             "Discord interactions will be rejected until it is corrected."
         )
-    if not config.github_token:
+    if features and not config.github_token:
         logging.warning(
             "GITHUB_TOKEN is unset. Merge webhooks can still record pull requests, "
             "but file lists, backfill, /my-prs, and PR pre-review may hit anonymous GitHub rate limits."
         )
     if config.pr_review_enabled:
         logging.info(
-            "PR pre-review is on for %s using %s. The bot only posts in Discord.",
+            "PR review agent is on for %s using %s. It only posts in Discord.",
             ", ".join(config.review_channel_ids), config.review_model,
         )
     if config.contributor_roles_enabled and not config.role_announcements_channel_id:
@@ -212,7 +218,7 @@ def start_contributor_roles(config):
     return server
 
 
-def _run_loop(config, stop_event: threading.Event, store=None) -> None:
+def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
     reviews = bool(config.pr_review_enabled and store is not None)
     if not config.announcements_enabled and not reviews:
         logging.info(
@@ -243,7 +249,8 @@ def _run_loop(config, stop_event: threading.Event, store=None) -> None:
                 logging.warning("Contributor check deferred: %s", error)
             except Exception:
                 logging.exception("Contributor check failed")
-        if reviews:
+        gateway_live = gateway is not None and gateway.connected.is_set()
+        if reviews and not gateway_live:
             try:
                 poll_review_channels(config, store)
             except Exception:

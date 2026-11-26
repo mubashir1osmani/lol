@@ -48,6 +48,7 @@ class Snapshot:
     mergeable_state: str | None
     author_login: str
     author_id: int
+    base_sha: str = ""
     reviews: list = field(default_factory=list)
     comments: list = field(default_factory=list)
     threads: list | None = None
@@ -178,6 +179,8 @@ def gather_snapshot(repository: str, number: int, token: str | None) -> Snapshot
     author_id = user.get("id") if isinstance(user.get("id"), int) else 0
     head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
     sha = head.get("sha") if isinstance(head.get("sha"), str) else ""
+    base = pull.get("base") if isinstance(pull.get("base"), dict) else {}
+    base_sha = base.get("sha") if isinstance(base.get("sha"), str) else ""
     title = pull.get("title") if isinstance(pull.get("title"), str) else ""
     merged = pull.get("merged") is True
     state = pull.get("state") if pull.get("state") in {"open", "closed"} else "closed"
@@ -194,6 +197,7 @@ def gather_snapshot(repository: str, number: int, token: str | None) -> Snapshot
         mergeable_state=mergeable_state,
         author_login=login,
         author_id=author_id,
+        base_sha=base_sha if re.fullmatch(r"[0-9a-f]{40}", base_sha) else "",
     )
     if merged or state != "open":
         return snapshot

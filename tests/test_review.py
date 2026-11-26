@@ -15,6 +15,7 @@ from urllib.request import Request
 from contributor_bot import api, review_github
 from contributor_bot.config import Config, get_config
 from contributor_bot.interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
+from contributor_bot.review_agent import Completion, ToolCall
 from contributor_bot.review_github import Snapshot, gather_snapshot
 from contributor_bot.review_job import handle_channel_message, perform_review, poll_review_channels, schedule_webhook_recheck
 from contributor_bot.review_llm import chunk_diff, complete_litellm, parse_review_json, run_llm_review
@@ -125,6 +126,15 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(recheck_number("pull_request_review", {"action": "submitted", "pull_request": {"number": 9}}), 9)
         self.assertIsNone(recheck_number("pull_request_review", {"action": "dismissed", "pull_request": {"number": 9}}))
         self.assertIsNone(recheck_number("ping", {}))
+        self.assertEqual(recheck_number("check_run", {
+            "action": "completed",
+            "check_run": {"pull_requests": [{"number": 15}]},
+        }), 15)
+        self.assertEqual(recheck_number("check_suite", {
+            "action": "completed",
+            "check_suite": {"pull_requests": [{"number": 16}]},
+        }), 16)
+        self.assertIsNone(recheck_number("check_run", {"action": "created", "check_run": {"pull_requests": [{"number": 15}]}}))
 
 
 class BotFilterAndVerdictTests(unittest.TestCase):
@@ -376,23 +386,33 @@ class DiscordPostTests(unittest.TestCase):
 
     def test_review_posts_in_discord_and_does_not_write_to_github(self):
         self.store.link_account("111", "octocat", 5, "2026-11-01T00:00:00+00:00")
-        written = json.dumps({
+        verdict = {
             "summary": "adds a timeout around the proxy call",
             "risks": ["the timeout might cut a stream short"],
             "missing_tests": ["no test for a slow upstream"],
             "checklist": ["run the proxy tests"],
-        })
-        with mock.patch("contributor_bot.review_job.gather_snapshot", return_value=self._snapshot()) as gather, \
-                mock.patch("contributor_bot.review_llm.complete_litellm", return_value=written) as llm, \
+            "blocking": [],
+        }
+        calls = {"n": 0}
+
+        def fake_complete(model, messages, tools, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return Completion(None, [ToolCall("1", "submit_verdict", verdict)], 30)
+            return Completion("done", [], 5)
+
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._snapshot()) as gather, \
+                mock.patch("contributor_bot.review_agent.complete_with_tools", side_effect=fake_complete) as llm, \
+                mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]), \
                 mock.patch("contributor_bot.review_job.start_public_thread", return_value={"id": "900"}) as thread, \
-                mock.patch("contributor_bot.review_job.post_message", return_value={"id": "1", "channel_id": "900"}) as post, \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post, \
                 mock.patch("contributor_bot.api.post_issue_comment", side_effect=AssertionError("github write")) as comment, \
                 mock.patch("contributor_bot.api._http", side_effect=AssertionError("network")):
             result = perform_review(self.config, self.store, 12, channel_id="321", message_id="654", source="new")
         self.assertEqual(result["status"], "posted")
         self.assertEqual(result["thread_id"], "900")
         gather.assert_called_once()
-        llm.assert_called_once()
+        self.assertGreaterEqual(llm.call_count, 1)
         thread.assert_called_once()
         comment.assert_not_called()
         contents = [call.args[2]["content"] for call in post.call_args_list]
@@ -412,10 +432,17 @@ class DiscordPostTests(unittest.TestCase):
             reviews=[],
             check_runs=[{"name": "pytest", "status": "completed", "conclusion": "failure"}],
         )
-        with mock.patch("contributor_bot.review_job.gather_snapshot", return_value=snapshot), \
-                mock.patch("contributor_bot.review_llm.complete_litellm", return_value='{"summary": "draft", "risks": [], "missing_tests": [], "checklist": []}'), \
+        def fake_complete(model, messages, tools, timeout=0):
+            if not getattr(fake_complete, "done", False):
+                fake_complete.done = True
+                return Completion(None, [ToolCall("1", "submit_verdict", {"summary": "draft", "blocking": []})], 20)
+            return Completion("done", [], 5)
+
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=snapshot), \
+                mock.patch("contributor_bot.review_agent.complete_with_tools", side_effect=fake_complete), \
+                mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]), \
                 mock.patch("contributor_bot.review_job.start_public_thread", return_value={"id": "900"}), \
-                mock.patch("contributor_bot.review_job.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
             result = perform_review(self.config, self.store, 12, channel_id="321", message_id="654", source="new")
         self.assertEqual(result["status"], "posted")
         contents = [call.args[2]["content"] for call in post.call_args_list]
@@ -431,9 +458,11 @@ class DiscordPostTests(unittest.TestCase):
             thread_id="900", created_at=iso(now),
         )
         self.store.mark_review_done("BerriAI/litellm", 12, iso(now), HEAD)
-        with mock.patch("contributor_bot.review_job.gather_snapshot") as gather:
+        with mock.patch("contributor_bot.review_agent.run_review_session") as session, \
+                mock.patch("contributor_bot.review_job._post") as posted:
             result = perform_review(self.config, self.store, 12, source="recheck")
-        gather.assert_not_called()
+        session.assert_not_called()
+        posted.assert_called_once()
         self.assertEqual(result["status"], "cooldown")
         self.assertIn("<#900>", result["detail"])
 
@@ -476,7 +505,12 @@ class DiscordPostTests(unittest.TestCase):
             )
             schedule_webhook_recheck(turned_on, self.store, "pull_request", payload)
             schedule_webhook_recheck(turned_on, self.store, "pull_request", {"action": "closed", "pull_request": {"number": 12}, "repository": {"full_name": "BerriAI/litellm"}})
-        self.assertEqual(len(scheduled), 1)
+            schedule_webhook_recheck(turned_on, self.store, "check_run", {
+                "action": "completed",
+                "check_run": {"pull_requests": [{"number": 12}]},
+                "repository": {"full_name": "BerriAI/litellm"},
+            })
+        self.assertEqual(len(scheduled), 2)
 
     def test_channel_message_reuses_one_thread(self):
         self.store.save_review_thread(

@@ -136,7 +136,11 @@ class NetworkBoundaryTests(unittest.TestCase):
             f"https://api.github.com/repos/BerriAI/litellm/pulls/12/comments?per_page=100",
             f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/check-runs?per_page=100",
             f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/status",
+            "https://api.github.com/repos/BerriAI/litellm/contents/litellm/proxy/server.py?ref=" + sha,
+            "https://api.github.com/search/code?q=repo%3ABerriAI%2Flitellm+timeout",
+            "https://api.github.com/repos/BerriAI/litellm/check-runs/99/annotations",
             "https://discord.com/api/v10/channels/321/messages/654",
+            "https://discord.com/api/v10/guilds/333/channels",
         ]
         query = json.dumps({"query": "query ReviewThreads($n: Int!) { repository { pullRequest { id } } }"}).encode()
         mutation = json.dumps({"query": "mutation { addReaction(input: {subjectId: \"x\"}) { clientMutationId } }"}).encode()
@@ -149,9 +153,20 @@ class NetworkBoundaryTests(unittest.TestCase):
                 "https://discord.com/api/v10/channels/321/messages/654/threads",
                 data=b"{}", method="POST",
             ))
+            api._http(Request(
+                "https://discord.com/api/v10/channels/321/messages/654",
+                data=b"{}", method="PATCH",
+            ))
             with self.assertRaises(ValueError):
                 api._http(Request("https://api.github.com/graphql", data=mutation, method="POST"))
-        self.assertEqual(request.call_count, len(urls) + 2)
+        self.assertEqual(request.call_count, len(urls) + 3)
+        with mock.patch.object(api, "_open_request") as blocked:
+            with self.assertRaises(ValueError):
+                api._http(Request(
+                    "https://api.github.com/repos/BerriAI/litellm/contents/../secrets",
+                    method="GET",
+                ))
+            blocked.assert_not_called()
 
 
 class CredentialAndStateTests(unittest.TestCase):

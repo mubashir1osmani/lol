@@ -2,16 +2,15 @@ previews:
   generation: 'off'
 
 services:
-  - type: worker
-    # Matches the existing worker. Never create a second bot during a sync.
+  - type: web
+    # One process. Do not add a second bot during a sync.
     name: litellm-discord
     runtime: python
     branch: main
     autoDeployTrigger: 'off'
-    # No package installs: the Friday worker stays on the standard library.
-    # PR pre-review is off here. Enabling it needs litellm (requirements.txt)
-    # and a public HTTPS service. See the README.
-    buildCommand: python3 -I -m compileall -q bot.py contributor_bot
+    healthCheckPath: /health
+    # discord.py (gateway presence) and litellm (review agent, off until enabled).
+    buildCommand: pip install -r requirements.txt
     startCommand: python3 bot.py
     # Keeps contributor IDs, PR history, and pending announcements on redeploy.
     disk:

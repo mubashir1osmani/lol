@@ -59,7 +59,7 @@ class DeliveryTestTests(unittest.TestCase):
     def test_paused_worker_can_keep_serving_contributor_roles(self):
         config = replace(Config("token", "123", "456"), announcements_enabled=False, contributor_roles_enabled=True)
         server = object()
-        with mock.patch.object(bot_main, "load_dotenv"), mock.patch.object(bot_main, "get_config", return_value=config), mock.patch.object(bot_main.signal, "signal"), mock.patch.object(bot_main.threading, "Event"), mock.patch.object(bot_main, "poll_once") as poll, mock.patch.object(bot_main, "start_contributor_roles", return_value=server) as start, mock.patch.object(bot_main, "stop_http_server") as stop:
+        with mock.patch.object(bot_main, "load_dotenv"), mock.patch.object(bot_main, "get_config", return_value=config), mock.patch.object(bot_main.signal, "signal"), mock.patch.object(bot_main.threading, "Event"), mock.patch.object(bot_main, "poll_once") as poll, mock.patch.object(bot_main, "start_contributor_roles", return_value=server) as start, mock.patch.object(bot_main, "stop_http_server") as stop, mock.patch.object(bot_main, "start_gateway", return_value=None), mock.patch.object(bot_main, "stop_gateway"):
             bot_main.main([])
         start.assert_called_once_with(config)
         stop.assert_called_once_with(server)
@@ -111,7 +111,7 @@ class DeliveryTestTests(unittest.TestCase):
 
     def test_paused_worker_does_not_poll_or_post(self):
         config = replace(Config("token", "123", "456"), announcements_enabled=False)
-        with mock.patch.object(bot_main, "load_dotenv"), mock.patch.object(bot_main, "get_config", return_value=config), mock.patch.object(bot_main.signal, "signal"), mock.patch.object(bot_main.threading, "Event") as event, mock.patch.object(bot_main, "poll_once") as poll, mock.patch.object(bot_main, "post_message") as post:
+        with mock.patch.object(bot_main, "load_dotenv"), mock.patch.object(bot_main, "get_config", return_value=config), mock.patch.object(bot_main.signal, "signal"), mock.patch.object(bot_main.threading, "Event") as event, mock.patch.object(bot_main, "poll_once") as poll, mock.patch.object(bot_main, "post_message") as post, mock.patch.object(bot_main, "start_gateway", return_value=None), mock.patch.object(bot_main, "stop_gateway"):
             bot_main.main([])
         event.return_value.wait.assert_called_once_with()
         poll.assert_not_called()
