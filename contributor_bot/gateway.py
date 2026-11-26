@@ -14,6 +14,7 @@ import asyncio
 import logging
 import threading
 
+from .ack import bind_ack_reactions, emoji_index
 from .config import Config
 from .interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
 from .review_job import handle_channel_message, handle_thread_message
@@ -73,6 +74,8 @@ class Gateway:
                 "discord.py is not installed, so the bot stays offline and uses REST. "
                 "pip install -r requirements.txt to show it online."
             )
+            if config.pr_review_enabled:
+                bind_ack_reactions(config, [])
             return
         try:
             asyncio.run(self._serve(discord, config, store))
@@ -97,6 +100,10 @@ class Gateway:
             )
             self.connected.set()
             logging.info("Discord gateway connected as %s, watching %s", client.user, watching)
+            try:
+                bind_ack_reactions(config, _guild_emojis(client, config.discord_guild_id))
+            except Exception:
+                logging.exception("Could not resolve ack reactions")
             if self._commands_synced or self._stop.is_set():
                 return
             try:
@@ -394,7 +401,22 @@ def _interaction_payload(interaction) -> dict:
     }
     if place["parent_id"]:
         payload["channel"]["parent_id"] = place["parent_id"]
+    message = getattr(interaction, "message", None)
+    message_id = getattr(message, "id", None) if message is not None else None
+    if message_id:
+        payload["message"] = {"id": str(message_id)}
     return payload
+
+
+def _guild_emojis(client, guild_id: str | None):
+    """Custom emoji on the configured guild. Empty when the guild is not cached yet."""
+    guild = None
+    if guild_id and hasattr(client, "get_guild"):
+        try:
+            guild = client.get_guild(int(guild_id))
+        except (TypeError, ValueError):
+            guild = None
+    return emoji_index(getattr(guild, "emojis", ()) if guild is not None else ())
 
 
 async def _dispatch_command(discord, interaction, config: Config, store: Store | None) -> None:

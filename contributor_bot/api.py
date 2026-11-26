@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterator
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .config import is_discord_id
@@ -117,6 +117,11 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         return True
     if method == "PUT" and re.fullmatch(
         rf"/api/v10/applications/{_SNOWFLAKE}/guilds/{_SNOWFLAKE}/commands", path
+    ):
+        return True
+    # React to a message the bot is about to review. Not a reaction delete.
+    if method == "PUT" and re.fullmatch(
+        rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}/reactions/[^/]+/@me", path
     ):
         return True
     # Deferred slash-command replies. Only the original interaction response.
@@ -730,6 +735,22 @@ def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
     if not isinstance(channel, dict) or channel.get("id") != channel_id:
         raise RuntimeError("Discord returned an unexpected channel response")
     return channel
+
+
+def add_reaction(channel_id: str, message_id: str, emoji: str, token: str) -> None:
+    """PUT one reaction on a message. Callers log and swallow Discord errors."""
+    if not is_discord_id(channel_id) or not is_discord_id(message_id):
+        raise ValueError("Unexpected Discord message id")
+    if not isinstance(emoji, str) or not emoji or any(ch in emoji for ch in "/\\"):
+        raise ValueError("Unexpected reaction")
+    status, _headers, _body = _http(Request(
+        f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}/reactions/{quote(emoji, safe='')}/@me",
+        data=b"",
+        method="PUT",
+        headers=_discord_headers(token),
+    ))
+    if status not in {200, 204}:
+        raise RuntimeError(f"discord.com returned HTTP {status}")
 
 
 def post_message(

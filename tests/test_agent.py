@@ -587,7 +587,7 @@ class AgentsSdkTests(unittest.TestCase):
         self.assertEqual(calls["model"], "anthropic/claude-sonnet-4-5")
         self.assertEqual(calls["settings"]["max_tokens"], MODEL_OUTPUT_TOKENS)
         self.assertEqual(calls["max_turns"], 4)
-        self.assertIsNone(calls["hooks"])
+        self.assertIsNotNone(calls["hooks"])
         self.assertEqual(calls["tracing"], [True])
         self.assertIn("untrusted", calls["instructions"])
         self.assertGreaterEqual(calls["tool_count"], 8)
@@ -630,6 +630,37 @@ class AgentsSdkTests(unittest.TestCase):
 
         capped, _calls = self._run(replace(config, review_usage_cap=10, review_timeout_seconds=0), tokens)
         self.assertEqual(capped.exhausted, "tokens")
+
+        async def recounted_input(calls, hooks):
+            for _turn in range(4):
+                await hooks.on_llm_end(None, None, SimpleNamespace(
+                    usage=SimpleNamespace(input_tokens=600_000, output_tokens=80, total_tokens=600_080),
+                    output=[SimpleNamespace(type="function_call")],
+                ))
+            return SimpleNamespace(final_output="verdict posted")
+
+        wide, _calls = self._run(
+            replace(config, review_usage_cap=1_000_000, review_timeout_seconds=0, review_max_steps=0),
+            recounted_input,
+        )
+        self.assertIsNone(wide.exhausted)
+        self.assertIn("verdict posted", wide.text)
+        self.assertEqual(wide.output_tokens, 320)
+        self.assertGreater(wide.input_tokens, 1_000_000)
+
+        async def unlimited_output(calls, hooks):
+            await hooks.on_llm_end(None, None, SimpleNamespace(
+                usage=SimpleNamespace(input_tokens=2_000_000, output_tokens=50_000, total_tokens=2_050_000),
+                output=[SimpleNamespace(type="function_call")],
+            ))
+            return SimpleNamespace(final_output="still going")
+
+        open_cap, _calls = self._run(
+            replace(config, review_usage_cap=0, review_timeout_seconds=0),
+            unlimited_output,
+        )
+        self.assertIsNone(open_cap.exhausted)
+        self.assertIn("still going", open_cap.text)
 
         async def slow(calls, hooks):
             await asyncio.sleep(30)

@@ -101,6 +101,7 @@ class Config:
     review_followup_cooldown_seconds: int = 45
     review_classifier_model: str = ""
     review_agent_tracing: bool | None = None
+    ack_reactions: tuple[str, ...] | None = None
     discord_members_intent: bool = False
 
     @property
@@ -213,6 +214,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_followup_cooldown_seconds=45 if review_settings is None else review_settings["review_followup_cooldown_seconds"],
         review_classifier_model="" if review_settings is None else review_settings["review_classifier_model"],
         review_agent_tracing=None if review_settings is None else review_settings["review_agent_tracing"],
+        ack_reactions=None if review_settings is None else review_settings["ack_reactions"],
         discord_members_intent=members_intent,
     )
 
@@ -250,6 +252,11 @@ def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high
     if not low <= number <= high:
         raise ValueError(f"{name} must be between {low} and {high}")
     return number
+
+
+def _ack_reactions(values: dict[str, str]) -> tuple[str, ...] | None:
+    from .ack import parse_ack_reactions
+    return parse_ack_reactions(values.get("ACK_REACTIONS"))
 
 
 def _optional_flag(values: dict[str, str], name: str) -> bool | None:
@@ -368,8 +375,8 @@ def _review_settings(values: dict[str, str]) -> dict:
     if not 30 <= cooldown <= 86400:
         raise ValueError("REVIEW_COOLDOWN_SECONDS must be between 30 and 86400")
     webhook_recheck = _flag(values, "REVIEW_WEBHOOK_RECHECK", False)
-    classifier = values.get("REVIEW_CLASSIFIER_MODEL", "").strip()
-    if classifier and not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", classifier):
+    classifier = values.get("REVIEW_CLASSIFIER_MODEL", "").strip() or "anthropic/claude-haiku-4-5"
+    if not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", classifier):
         raise ValueError("REVIEW_CLASSIFIER_MODEL must be a LiteLLM model name")
     settings = {
         **app,
@@ -391,6 +398,7 @@ def _review_settings(values: dict[str, str]) -> dict:
         "review_followup_cooldown_seconds": _bounded_int(values, "REVIEW_FOLLOWUP_COOLDOWN_SECONDS", 45, 10, 3600),
         "review_classifier_model": classifier,
         "review_agent_tracing": _optional_flag(values, "REVIEW_AGENT_TRACING"),
+        "ack_reactions": _ack_reactions(values),
     }
     if webhook_recheck:
         settings["github_webhook_secret"] = _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8)

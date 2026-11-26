@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import datetime
 
+from .ack import acknowledge_message
 from .api import (
     edit_original_interaction,
     fetch_latest_message_id,
@@ -213,6 +214,7 @@ def _review_command(config: Config, store: Store, payload: dict) -> dict:
     )
     if not numbers:
         return _ephemeral("that isn't a berriai/litellm pull request url.")
+    acknowledge_message(config, channel_id, _source_message_id(payload))
     number = numbers[0]
     record = store.review_thread(config.github_repository, number)
     if record:
@@ -307,10 +309,19 @@ def recheck_followup_text(result: dict) -> str:
     return detail or "couldn't recheck. try again in a bit."
 
 
+def _source_message_id(payload: dict) -> str | None:
+    """A slash command can name a message. Most do not, and then there is nothing to react to."""
+    message = payload.get("message")
+    if isinstance(message, dict) and is_discord_id(message.get("id")):
+        return str(message["id"])
+    return None
+
+
 def _recheck_command(config: Config, store: Store, payload: dict) -> dict:
     record = review_record_for_command(config, store, payload)
     if not record:
         return _ephemeral("run /recheck inside a pr review thread.")
+    acknowledge_message(config, payload.get("channel_id"), _source_message_id(payload))
     remaining = cooldown_remaining(record, config.review_cooldown_seconds, datetime.now(UTC))
     if remaining:
         minutes = max(1, (remaining + 59) // 60)
@@ -421,7 +432,9 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
         return
     number = int(record["number"])
     text = message.get("content") or ""
+    message_id = message.get("id")
     if wants_recheck(text):
+        acknowledge_message(config, channel_id, message_id)
         perform_review(config, store, number, source="recheck")
         return
     remaining = cooldown_remaining(
@@ -434,8 +447,10 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
         return
     day = datetime.now(UTC).date().isoformat()
     if not store.claim_daily_run(day, config.review_daily_run_budget):
+        acknowledge_message(config, channel_id, message_id)
         _post(channel_id, config.discord_token, "ran out of budget for today. try again tomorrow.")
         return
+    acknowledge_message(config, channel_id, message_id)
     try:
         history = history_text(fetch_recent_messages(channel_id, config.discord_token, limit=15))
     except Exception:
@@ -452,8 +467,10 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
     asked, numbers = message_decision(config, message)
     message_id = str(message.get("id") or "")
     if asked and not numbers:
+        acknowledge_message(config, channel_id, message_id)
         _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
         return
+    planned = []
     for number in numbers:
         record = store.review_thread(config.github_repository, number)
         if record:
@@ -461,6 +478,12 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
             if remaining:
                 logging.info("Skipping #%s in channel %s; cooldown has %ss left", number, channel_id, remaining)
                 continue
+        planned.append((number, record))
+    if not planned:
+        return
+    acknowledge_message(config, channel_id, message_id)
+    for number, record in planned:
+        if record:
             _spawn(lambda number=number: perform_review(config, store, number, source="recheck"))
             continue
         _spawn(lambda number=number, message_id=message_id: perform_review(
