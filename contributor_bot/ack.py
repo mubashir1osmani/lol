@@ -14,12 +14,9 @@ from .api import add_reaction
 from .config import Config, is_discord_id
 
 EYES = "👀"
-FALLBACK_T = "🇹"
-FALLBACK_Y = "🇾"
-# First guild emoji with one of these names spells the "t" in "ty".
-T_EMOJI_NAMES = ("t", "letter_t", "litellm_t", "regional_indicator_t")
-# Same for "y".
-Y_EMOJI_NAMES = ("y", "letter_y", "litellm_y", "regional_indicator_y")
+FALLBACK_TY = "🙏"
+# First matching guild emoji is the single custom "ty" reaction.
+TY_EMOJI_NAMES = ("ty", "litellm_ty", "thankyou", "thank_you")
 
 _CUSTOM_MENTION = re.compile(r"^<(?:a)?:([\w]{1,32}):([1-9][0-9]{0,19})>$")
 _CUSTOM_PAIR = re.compile(r"^([\w]{1,32}):([1-9][0-9]{0,19})$")
@@ -98,7 +95,7 @@ def _named_or_fallback(names: tuple[str, ...], fallback: str, emojis: list[tuple
         if found:
             return found, f"{found} ({name})"
     tried = ", ".join(names)
-    return fallback, f"{fallback} (no guild emoji named {tried})"
+    return fallback, f"{fallback} (fallback; no guild emoji named {tried})"
 
 
 def resolve_ack_reactions(spec: tuple[str, ...] | None, emojis) -> tuple[tuple[str, ...], str]:
@@ -106,9 +103,8 @@ def resolve_ack_reactions(spec: tuple[str, ...] | None, emojis) -> tuple[tuple[s
     index = emoji_index(emojis)
     if spec is None:
         eyes = (EYES, EYES)
-        tee = _named_or_fallback(T_EMOJI_NAMES, FALLBACK_T, index)
-        why = _named_or_fallback(Y_EMOJI_NAMES, FALLBACK_Y, index)
-        chosen = (eyes, tee, why)
+        ty = _named_or_fallback(TY_EMOJI_NAMES, FALLBACK_TY, index)
+        chosen = (eyes, ty)
     else:
         chosen = tuple(_resolve_token(token, index) for token in spec)
     api = tuple(item[0] for item in chosen)

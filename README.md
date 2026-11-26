@@ -312,12 +312,13 @@ when a bot finding or a failing check names that file. Classifying channel
 messages uses `anthropic/claude-haiku-4-5` unless `REVIEW_CLASSIFIER_MODEL` is
 set. A non-command message is scored by TypeSafe Jev (`POST https://api.typesafe.ai/v1/systemone`, model `jev-latest`) before anyone is answered. `should_reply` is a noul; the bot stays silent below `DECISION_REPLY_THRESHOLD` (default 0.7) or when the route is `maintainer_only`. Simple questions then go to `REVIEW_FAST_MODEL` and pull-request or bug-report work goes to `REVIEW_MODEL`, through LiteLLM's Autorouter (`auto_router/complexity_router`) with a custom classifier that reuses that one Jev decision. Without `TYPESAFE_API_KEY` the same decision is a Haiku JSON call. Explicit review requests, `/recheck`, and `check again` skip the gate.
 
-As soon as a request is accepted, the bot reacts with 👀 and then "ty"
-before the agent runs. `ACK_REACTIONS` is a comma-separated list of unicode
-emoji, `<:name:id>`, `name:id`, or a guild emoji name. Unset, it uses 👀 plus
-the first guild emoji named `t`, `letter_t`, `litellm_t`, or
-`regional_indicator_t`, and the same list for `y`. If none of those names
-exist, it uses 🇹 and 🇾. The resolved list is logged once at startup. Slash
+As soon as a request is accepted, the bot reacts with 👀 and then the guild's
+custom `ty` emoji before the agent runs. `ACK_REACTIONS` is a comma-separated
+list of unicode emoji, `<:name:id>`, `name:id`, or a guild emoji name (for
+example `ACK_REACTIONS=👀,ty`). Unset, it uses 👀 plus the first guild emoji
+matching `ty`, `litellm_ty`, `thankyou`, or `thank_you` (case-insensitive). If
+none of those names exist, it falls back to 🙏 and logs the fallback. The
+resolved list is logged once at startup. Slash
 commands with no source message are not reacted to. Reactions are best-effort
 and need **Add Reactions** in addition to **Read Message History**.
 

@@ -196,7 +196,7 @@ def _discord_path(number: int) -> None:
     print("\n=== discord fake client ===")
     reset_ack_cache()
     config = _config(0)
-    bind_ack_reactions(config, [("t", "111111111111111111"), ("y", "222222222222222222")])
+    bind_ack_reactions(config, [("ty", "111111111111111111")])
     directory = tempfile.TemporaryDirectory()
     store = Store(str(Path(directory.name) / "roles.db"))
     discord = {"reactions": [], "posts": [], "threads": []}
