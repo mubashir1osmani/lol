@@ -94,12 +94,13 @@ class Config:
     review_require_ask: bool = False
     review_classify: bool = False
     review_watch_all_channels: bool = False
-    review_max_steps: int = 8
-    review_usage_cap: int = 16000
-    review_timeout_seconds: int = 120
-    review_daily_run_budget: int = 40
+    review_max_steps: int = 0
+    review_usage_cap: int = 0
+    review_timeout_seconds: int = 600
+    review_daily_run_budget: int = 0
     review_followup_cooldown_seconds: int = 45
     review_classifier_model: str = ""
+    review_agent_tracing: bool | None = None
     discord_members_intent: bool = False
 
     @property
@@ -205,14 +206,40 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_require_ask=False if review_settings is None else review_settings["review_require_ask"],
         review_classify=False if review_settings is None else review_settings["review_classify"],
         review_watch_all_channels=False if review_settings is None else review_settings["review_watch_all_channels"],
-        review_max_steps=8 if review_settings is None else review_settings["review_max_steps"],
-        review_usage_cap=16000 if review_settings is None else review_settings["review_usage_cap"],
-        review_timeout_seconds=120 if review_settings is None else review_settings["review_timeout_seconds"],
-        review_daily_run_budget=40 if review_settings is None else review_settings["review_daily_run_budget"],
+        review_max_steps=0 if review_settings is None else review_settings["review_max_steps"],
+        review_usage_cap=0 if review_settings is None else review_settings["review_usage_cap"],
+        review_timeout_seconds=600 if review_settings is None else review_settings["review_timeout_seconds"],
+        review_daily_run_budget=0 if review_settings is None else review_settings["review_daily_run_budget"],
         review_followup_cooldown_seconds=45 if review_settings is None else review_settings["review_followup_cooldown_seconds"],
         review_classifier_model="" if review_settings is None else review_settings["review_classifier_model"],
+        review_agent_tracing=None if review_settings is None else review_settings["review_agent_tracing"],
         discord_members_intent=members_intent,
     )
+
+
+def _optional_cap(values: dict[str, str], name: str) -> int:
+    """Unset, empty, or 0 means no cap. A positive integer is a limit."""
+    raw = values.get(name)
+    if raw is None or not str(raw).strip() or str(raw).strip() == "0":
+        return 0
+    text = str(raw).strip()
+    if not re.fullmatch(r"[0-9]+", text):
+        raise ValueError(f"{name} must be a non-negative integer")
+    return int(text)
+
+
+def _optional_timeout(values: dict[str, str], name: str, default: int) -> int:
+    """Unset or empty uses ``default``. 0 means no wall-time cap."""
+    raw = values.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    text = str(raw).strip()
+    if not re.fullmatch(r"[0-9]+", text):
+        raise ValueError(f"{name} must be a non-negative integer")
+    seconds = int(text)
+    if seconds > 7200:
+        raise ValueError(f"{name} must be between 0 and 7200")
+    return seconds
 
 
 def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high: int) -> int:
@@ -223,6 +250,17 @@ def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high
     if not low <= number <= high:
         raise ValueError(f"{name} must be between {low} and {high}")
     return number
+
+
+def _optional_flag(values: dict[str, str], name: str) -> bool | None:
+    """Unset or empty means the caller picks. true and false are explicit."""
+    raw = values.get(name)
+    if raw is None or not str(raw).strip():
+        return None
+    value = str(raw).strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true or false")
+    return value == "true"
 
 
 def _flag(values: dict[str, str], name: str, default: bool) -> bool:
@@ -346,12 +384,13 @@ def _review_settings(values: dict[str, str]) -> dict:
         "review_require_ask": _flag(values, "REVIEW_REQUIRE_ASK", False),
         "review_classify": _flag(values, "REVIEW_CLASSIFY_MESSAGES", True),
         "review_watch_all_channels": _flag(values, "REVIEW_WATCH_ALL_CHANNELS", False),
-        "review_max_steps": _bounded_int(values, "REVIEW_AGENT_MAX_STEPS", 8, 1, 20),
-        "review_usage_cap": _bounded_int(values, "REVIEW_AGENT_MAX_TOKENS", 16000, 1000, 100000),
-        "review_timeout_seconds": _bounded_int(values, "REVIEW_AGENT_TIMEOUT_SECONDS", 120, 15, 300),
-        "review_daily_run_budget": _bounded_int(values, "REVIEW_DAILY_RUN_BUDGET", 40, 1, 500),
+        "review_max_steps": _optional_cap(values, "REVIEW_AGENT_MAX_STEPS"),
+        "review_usage_cap": _optional_cap(values, "REVIEW_AGENT_MAX_TOKENS"),
+        "review_timeout_seconds": _optional_timeout(values, "REVIEW_AGENT_TIMEOUT_SECONDS", 600),
+        "review_daily_run_budget": _optional_cap(values, "REVIEW_DAILY_RUN_BUDGET"),
         "review_followup_cooldown_seconds": _bounded_int(values, "REVIEW_FOLLOWUP_COOLDOWN_SECONDS", 45, 10, 3600),
         "review_classifier_model": classifier,
+        "review_agent_tracing": _optional_flag(values, "REVIEW_AGENT_TRACING"),
     }
     if webhook_recheck:
         settings["github_webhook_secret"] = _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8)

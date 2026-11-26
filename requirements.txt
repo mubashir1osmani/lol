@@ -1,5 +1,8 @@
 # discord.py keeps the bot online (gateway) and receives messages and slash commands.
-# litellm is imported only when a PR review agent run or a message classification needs it.
-# CI allows these two packages and still rejects anything else.
+# The review agent uses the OpenAI Agents SDK with LiteLLM underneath, so
+# REVIEW_MODEL can be anthropic/claude-sonnet-4-5 with that provider's key.
+# litellm is also imported for message classification. CI allows these lines
+# and still rejects anything else.
 discord.py==2.7.1
 litellm==1.111.0
+openai-agents[litellm]==0.26.0
