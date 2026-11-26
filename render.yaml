@@ -29,6 +29,9 @@ services:
       # Keep the first deployment quiet until the moderators-only test is done.
       - key: ANNOUNCEMENTS_ENABLED
         value: "false"
+      # Contributor roles stay off on this worker. Turning them on needs a
+      # public HTTPS port for the GitHub webhook and Discord interactions.
+      # See the README before setting CONTRIBUTOR_ROLES_ENABLED.
       - key: ROUNDUP_TIMEZONE
         value: America/Toronto
       - key: ROUNDUP_TIME

@@ -11,10 +11,15 @@ from .api import (
     TransientAPIError,
     fetch_channel,
     post_message,
+    register_guild_commands,
 )
+from .backfill import backfill_merged_pulls
 from .config import get_config, is_discord_id, load_dotenv
+from .interactions import SLASH_COMMANDS
 from .poller import poll_once, preview_roundup
 from .schedule import UTC, parse_time
+from .server import start_http_server, stop_http_server
+from .signatures import ed25519_public_key_ok
 from .state import load_state, save_state
 
 
@@ -99,6 +104,11 @@ def main(argv: list[str] | None = None) -> None:
     mode.add_argument("--preview", action="store_true", help="Print this week's preview and candidate Discord IDs; never post")
     mode.add_argument("--preview-channel-id", metavar="ID", help="Send a no-ping weekly preview to #moderator-only")
     mode.add_argument("--once", action="store_true", help="Collect once; publish only if the Friday roundup is due and enabled")
+    mode.add_argument(
+        "--backfill-merged-prs",
+        action="store_true",
+        help="Scan historical merged PRs and grant contributor roles to linked Discord users",
+    )
     args = parser.parse_args(argv)
     load_dotenv()
     logging.basicConfig(
@@ -115,9 +125,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.preview or args.preview_channel_id:
         run_preview(config, args.preview_channel_id)
         return
+    if args.backfill_merged_prs:
+        run_backfill(config)
+        return
     if args.once:
         poll_once(config)
         return
+    server = start_contributor_roles(config)
     stop_event = threading.Event()
 
     def stop(_signal_number: int, _frame: object) -> None:
@@ -126,6 +140,60 @@ def main(argv: list[str] | None = None) -> None:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    try:
+        _run_loop(config, stop_event)
+    finally:
+        if server is not None:
+            stop_http_server(server)
+
+
+def run_backfill(config) -> None:
+    if not config.github_token:
+        raise SystemExit("GITHUB_TOKEN is required for --backfill-merged-prs")
+    backfill_merged_pulls(config)
+
+
+def start_contributor_roles(config):
+    """Listen for webhooks and interactions when contributor roles are enabled.
+
+    A failure here does not stop the Friday thank-you loop.
+    """
+    if not config.contributor_roles_enabled:
+        return None
+    server = None
+    try:
+        server = start_http_server(config)
+    except OSError as error:
+        logging.error("Contributor roles HTTP server failed to start: %s", error)
+    try:
+        register_guild_commands(
+            config.discord_application_id or "",
+            config.discord_guild_id or "",
+            config.discord_token,
+            SLASH_COMMANDS,
+        )
+        logging.info("Registered contributor slash commands in guild %s", config.discord_guild_id)
+    except Exception:
+        logging.exception(
+            "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
+            "that the bot invite includes applications.commands, and that the bot is in the server."
+        )
+    if not ed25519_public_key_ok(config.discord_public_key or ""):
+        logging.error(
+            "DISCORD_PUBLIC_KEY is not a valid Ed25519 point. "
+            "Discord interactions will be rejected until it is corrected."
+        )
+    if not config.github_token:
+        logging.warning(
+            "GITHUB_TOKEN is unset. Merge webhooks can still record pull requests, "
+            "but file lists, backfill, and /my-prs may hit anonymous GitHub rate limits."
+        )
+    if not config.role_announcements_channel_id:
+        logging.warning("ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; new roles will be granted without a #shipped post")
+    return server
+
+
+def _run_loop(config, stop_event: threading.Event) -> None:
     if not config.announcements_enabled:
         logging.info(
             "Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false). "

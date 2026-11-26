@@ -1,4 +1,10 @@
 from dataclasses import replace
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
 import unittest
 from unittest import mock
 
@@ -49,6 +55,59 @@ class DeliveryTestTests(unittest.TestCase):
                 with self.subTest(channel_id=channel_id), self.assertRaises(ValueError):
                     bot_main.send_test_message(channel_id, token)
         fetch.assert_not_called()
+
+    def test_paused_worker_can_keep_serving_contributor_roles(self):
+        config = replace(Config("token", "123", "456"), announcements_enabled=False, contributor_roles_enabled=True)
+        server = object()
+        with mock.patch.object(bot_main, "load_dotenv"), mock.patch.object(bot_main, "get_config", return_value=config), mock.patch.object(bot_main.signal, "signal"), mock.patch.object(bot_main.threading, "Event"), mock.patch.object(bot_main, "poll_once") as poll, mock.patch.object(bot_main, "start_contributor_roles", return_value=server) as start, mock.patch.object(bot_main, "stop_http_server") as stop:
+            bot_main.main([])
+        start.assert_called_once_with(config)
+        stop.assert_called_once_with(server)
+        poll.assert_not_called()
+
+    def test_paused_process_starts_and_stops(self):
+        env = os.environ.copy()
+        env.update({
+            "DISCORD_BOT_TOKEN": "token",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+            "ANNOUNCEMENTS_CHANNEL_ID": "456",
+            "ANNOUNCEMENTS_ENABLED": "false",
+            "CONTRIBUTOR_ROLES_ENABLED": "false",
+        })
+        root = Path(__file__).resolve().parents[1]
+        process = subprocess.Popen(
+            [sys.executable, "bot.py"],
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        output = []
+        try:
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                output.append(line)
+                if "Automatic announcements are paused" in line:
+                    break
+            else:
+                self.fail("".join(output) or "bot produced no output")
+            self.assertIsNone(process.poll())
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=5), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+
+    def test_backfill_requires_a_github_token(self):
+        with self.assertRaisesRegex(SystemExit, "GITHUB_TOKEN"):
+            bot_main.run_backfill(Config("token", "123", "456"))
 
     def test_paused_worker_does_not_poll_or_post(self):
         config = replace(Config("token", "123", "456"), announcements_enabled=False)

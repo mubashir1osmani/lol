@@ -1,10 +1,14 @@
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 import math
 import os
 from pathlib import Path
 import re
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .roles import DEFAULT_ROLE_NAMES, ROLE_ID_ENV, ROLE_KEYS, ROLE_NAME_ENV
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -58,6 +62,24 @@ class Config:
     announcements_enabled: bool = True
     roundup_timezone: str = "America/Toronto"
     roundup_time: str = "09:00"
+    contributor_roles_enabled: bool = False
+    discord_guild_id: str | None = None
+    discord_application_id: str | None = None
+    discord_public_key: str | None = field(default=None, repr=False)
+    github_oauth_client_id: str | None = None
+    github_oauth_client_secret: str | None = field(default=None, repr=False)
+    github_webhook_secret: str | None = field(default=None, repr=False)
+    github_oauth_redirect_uri: str | None = None
+    role_announcements_channel_id: str | None = None
+    discord_invite_url: str | None = None
+    pr_comment_invites_enabled: bool = False
+    merge_shoutouts_enabled: bool = True
+    http_host: str = "0.0.0.0"
+    http_port: int = 8080
+    roles_db_path: str = ".data/contributor_roles.db"
+    role_ids: dict[str, str] = field(default_factory=dict)
+    role_names: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_NAMES))
+    backfill_since: str = "2023-01-01T00:00:00+00:00"
 
     @property
     def scope(self) -> dict[str, str]:
@@ -109,6 +131,9 @@ def get_config(env: dict[str, str] | None = None) -> Config:
     if enabled not in {"true", "false"}:
         raise ValueError("ANNOUNCEMENTS_ENABLED must be true or false")
 
+    roles_enabled = _flag(values, "CONTRIBUTOR_ROLES_ENABLED", False)
+    role_settings = _role_settings(values) if roles_enabled else None
+
     return Config(
         discord_token=token,
         contributions_channel_id=source,
@@ -121,4 +146,134 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         announcements_enabled=enabled == "true",
         roundup_timezone=timezone,
         roundup_time=roundup_time,
+        contributor_roles_enabled=roles_enabled,
+        discord_guild_id=None if role_settings is None else role_settings["discord_guild_id"],
+        discord_application_id=None if role_settings is None else role_settings["discord_application_id"],
+        discord_public_key=None if role_settings is None else role_settings["discord_public_key"],
+        github_oauth_client_id=None if role_settings is None else role_settings["github_oauth_client_id"],
+        github_oauth_client_secret=None if role_settings is None else role_settings["github_oauth_client_secret"],
+        github_webhook_secret=None if role_settings is None else role_settings["github_webhook_secret"],
+        github_oauth_redirect_uri=None if role_settings is None else role_settings["github_oauth_redirect_uri"],
+        role_announcements_channel_id=None if role_settings is None else role_settings["role_announcements_channel_id"],
+        discord_invite_url=None if role_settings is None else role_settings["discord_invite_url"],
+        pr_comment_invites_enabled=False if role_settings is None else role_settings["pr_comment_invites_enabled"],
+        merge_shoutouts_enabled=True if role_settings is None else role_settings["merge_shoutouts_enabled"],
+        http_host="0.0.0.0" if role_settings is None else role_settings["http_host"],
+        http_port=8080 if role_settings is None else role_settings["http_port"],
+        roles_db_path=values.get("ROLES_DB_PATH", "").strip() or ".data/contributor_roles.db",
+        role_ids={} if role_settings is None else role_settings["role_ids"],
+        role_names=dict(DEFAULT_ROLE_NAMES) if role_settings is None else role_settings["role_names"],
+        backfill_since="2023-01-01T00:00:00+00:00" if role_settings is None else role_settings["backfill_since"],
     )
+
+
+def _flag(values: dict[str, str], name: str, default: bool) -> bool:
+    raw = values.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true or false")
+    return value == "true"
+
+
+def _https_url(name: str, value: str, *, localhost_http: bool = False) -> str:
+    parts = urlsplit(value)
+    local = localhost_http and parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1"}
+    remote = parts.scheme == "https" and bool(parts.hostname)
+    if (not local and not remote) or parts.username or parts.password or not parts.netloc:
+        detail = "an https URL" if not localhost_http else "an https URL (http://localhost is allowed)"
+        raise ValueError(f"{name} must be {detail}")
+    return value
+
+
+def _secret(name: str, values: dict[str, str], *, minimum: int = 8) -> str:
+    value = values.get(name, "").strip()
+    if len(value) < minimum or any(char.isspace() for char in value):
+        raise ValueError(f"{name} must be at least {minimum} characters with no whitespace")
+    return value
+
+
+def _iso_timestamp(name: str, value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _role_settings(values: dict[str, str]) -> dict:
+    guild_id = values.get("DISCORD_GUILD_ID", "").strip()
+    application_id = values.get("DISCORD_APPLICATION_ID", "").strip()
+    if not is_discord_id(guild_id):
+        raise ValueError("DISCORD_GUILD_ID must be a Discord guild ID")
+    if not is_discord_id(application_id):
+        raise ValueError("DISCORD_APPLICATION_ID must be a Discord application ID")
+    public_key = values.get("DISCORD_PUBLIC_KEY", "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", public_key):
+        raise ValueError("DISCORD_PUBLIC_KEY must be a 64-character hex Ed25519 public key")
+    port_text = values.get("HTTP_PORT", "").strip() or values.get("PORT", "").strip() or "8080"
+    try:
+        port = int(port_text)
+    except ValueError as error:
+        raise ValueError("HTTP_PORT must be a TCP port") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("HTTP_PORT must be a TCP port")
+    host = values.get("HTTP_HOST", "").strip() or "0.0.0.0"
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,253}", host):
+        raise ValueError("HTTP_HOST is not a valid bind address")
+    channel = values.get("ROLE_ANNOUNCEMENTS_CHANNEL_ID", "").strip()
+    if channel and not is_discord_id(channel):
+        raise ValueError("ROLE_ANNOUNCEMENTS_CHANNEL_ID must be a Discord channel ID")
+    invites = _flag(values, "PR_COMMENT_INVITES_ENABLED", False)
+    invite_url = values.get("DISCORD_INVITE_URL", "").strip()
+    if invites:
+        if not invite_url:
+            raise ValueError("DISCORD_INVITE_URL is required when PR_COMMENT_INVITES_ENABLED=true")
+        invite_url = _https_url("DISCORD_INVITE_URL", invite_url)
+    elif invite_url:
+        invite_url = _https_url("DISCORD_INVITE_URL", invite_url)
+    role_ids = {}
+    role_names = dict(DEFAULT_ROLE_NAMES)
+    for key in ROLE_KEYS:
+        role_id = values.get(ROLE_ID_ENV[key], "").strip()
+        if not is_discord_id(role_id):
+            raise ValueError(f"{ROLE_ID_ENV[key]} must be a Discord role ID")
+        role_ids[key] = role_id
+        custom = values.get(ROLE_NAME_ENV[key], "").strip()
+        if custom:
+            if len(custom) > 100 or any(char in custom for char in "\r\n@"):
+                raise ValueError(f"{ROLE_NAME_ENV[key]} must be a single-line role name")
+            role_names[key] = custom
+    if len(set(role_ids.values())) != len(role_ids):
+        raise ValueError("Contributor role IDs must be distinct")
+    db_path = values.get("ROLES_DB_PATH", "").strip() or ".data/contributor_roles.db"
+    if db_path == ":memory:" or "\x00" in db_path:
+        raise ValueError("ROLES_DB_PATH must be a file path")
+    return {
+        "discord_guild_id": guild_id,
+        "discord_application_id": application_id,
+        "discord_public_key": public_key,
+        "github_oauth_client_id": _secret("GITHUB_OAUTH_CLIENT_ID", values, minimum=8),
+        "github_oauth_client_secret": _secret("GITHUB_OAUTH_CLIENT_SECRET", values, minimum=8),
+        "github_webhook_secret": _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8),
+        "github_oauth_redirect_uri": _https_url(
+            "GITHUB_OAUTH_REDIRECT_URI",
+            values.get("GITHUB_OAUTH_REDIRECT_URI", "").strip(),
+            localhost_http=True,
+        ),
+        "role_announcements_channel_id": channel or None,
+        "discord_invite_url": invite_url or None,
+        "pr_comment_invites_enabled": invites,
+        "merge_shoutouts_enabled": _flag(values, "MERGE_SHOUTOUTS_ENABLED", True),
+        "http_host": host,
+        "http_port": port,
+        "role_ids": role_ids,
+        "role_names": role_names,
+        "backfill_since": _iso_timestamp(
+            "BACKFILL_SINCE",
+            values.get("BACKFILL_SINCE", "").strip() or "2023-01-01T00:00:00+00:00",
+        ),
+    }
