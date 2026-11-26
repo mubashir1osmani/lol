@@ -92,6 +92,22 @@ CREATE TABLE IF NOT EXISTS review_budget (
     day TEXT PRIMARY KEY,
     runs INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS review_triggers (
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    body TEXT NOT NULL,
+    posted_at TEXT NOT NULL,
+    PRIMARY KEY (repository, number, head_sha, body)
+);
+
+CREATE TABLE IF NOT EXISTS merged_weeks (
+    repository TEXT NOT NULL,
+    week_key TEXT NOT NULL,
+    posted_at TEXT NOT NULL,
+    PRIMARY KEY (repository, week_key)
+);
 """
 
 
@@ -508,6 +524,67 @@ class Store:
             cursor = self._conn.execute(
                 "UPDATE review_budget SET runs = runs + 1 WHERE day = ? AND runs < ?",
                 (day, limit),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def trigger_posted(self, repository: str, number: int, head_sha: str, body: str) -> bool:
+        self._review_key(repository, number)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM review_triggers
+                WHERE repository = ? AND number = ? AND head_sha = ? AND body = ?
+                """,
+                (repository, number, head_sha, body),
+            ).fetchone()
+        return row is not None
+
+    def triggers_since(self, repository: str, number: int, since: str) -> int:
+        self._review_key(repository, number)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM review_triggers
+                WHERE repository = ? AND number = ? AND posted_at >= ?
+                """,
+                (repository, number, since),
+            ).fetchone()
+        return int(row["n"])
+
+    def save_trigger(self, repository: str, number: int, head_sha: str, body: str, posted_at: str) -> None:
+        self._review_key(repository, number)
+        if not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
+            raise ValueError("Invalid head sha")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO review_triggers (repository, number, head_sha, body, posted_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(repository, number, head_sha, body) DO NOTHING
+                """,
+                (repository, number, head_sha, body, posted_at),
+            )
+            self._conn.commit()
+
+    def merged_week_posted(self, repository: str, week_key: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM merged_weeks WHERE repository = ? AND week_key = ?",
+                (repository, week_key),
+            ).fetchone()
+        return row is not None
+
+    def mark_merged_week(self, repository: str, week_key: str, posted_at: str) -> bool:
+        """Return False when this week was already recorded."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO merged_weeks (repository, week_key, posted_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(repository, week_key) DO NOTHING
+                """,
+                (repository, week_key, posted_at),
             )
             self._conn.commit()
             return cursor.rowcount == 1

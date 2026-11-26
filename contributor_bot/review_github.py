@@ -25,6 +25,8 @@ query ReviewThreads($owner: String!, $name: String!, $number: Int!, $cursor: Str
               author { login }
               body
               commit { oid }
+              line
+              originalLine
             }
           }
         }
@@ -217,5 +219,6 @@ def gather_snapshot(repository: str, number: int, token: str | None) -> Snapshot
     except Exception as error:
         logging.warning("Combined status for #%s is unavailable: %s", number, error)
         snapshot.combined_state = None
-    snapshot.diff = _diff(repository, number, token)
+    # The full unified diff is not shown to the model. File patches are read
+    # one path at a time, and only when a bot finding or a failing check names it.
     return snapshot

@@ -16,7 +16,7 @@ from .api import (
 from .backfill import backfill_merged_pulls
 from .config import get_config, is_discord_id, load_dotenv
 from .gateway import start_gateway, stop_gateway
-from .interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS
+from .interactions import MERGED_SLASH_COMMANDS, REVIEW_SLASH_COMMANDS, SLASH_COMMANDS
 from .poller import poll_once, preview_roundup
 from .review_job import poll_review_channels
 from .store import Store
@@ -171,7 +171,9 @@ def start_contributor_roles(config):
     A Render web service sets PORT, so /health is served even while features are off.
     A failure here does not stop the Friday thank-you loop.
     """
-    features = config.contributor_roles_enabled or config.pr_review_enabled
+    features = config.contributor_roles_enabled or config.pr_review_enabled or (
+        config.merged_weekly_enabled and bool(config.discord_guild_id)
+    )
     if not features and not os.environ.get("PORT", "").strip():
         return None
     server = None
@@ -184,6 +186,8 @@ def start_contributor_roles(config):
         commands.extend(SLASH_COMMANDS)
     if config.pr_review_enabled:
         commands.extend(REVIEW_SLASH_COMMANDS)
+    if config.merged_weekly_enabled and config.discord_guild_id:
+        commands.extend(MERGED_SLASH_COMMANDS)
     if features and commands:
         try:
             register_guild_commands(

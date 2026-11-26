@@ -291,18 +291,39 @@ The agent runs on the OpenAI Agents SDK (`openai-agents`) through
 classification stays a small `litellm.completion` call and does not need the
 Agents SDK. `REVIEW_AGENT_MAX_TOKENS`, `REVIEW_AGENT_MAX_STEPS`, and
 `REVIEW_DAILY_RUN_BUDGET` are unlimited when unset, empty, or `0`. A positive
-number is a cap. Steps still stop at 50 (`max_turns`) so a tool loop cannot
-run forever, even when the step budget is unlimited or set higher. Each model
-call may use up to 8192 output tokens, which Anthropic needs in order to
-finish a tool call. Tool results are truncated to valid JSON per call. If the
-provider still reports a context-window error, the run retries once with
-shorter tool results. `REVIEW_AGENT_TIMEOUT_SECONDS` defaults to 600. `0`
-means no wall-time cap. A run that does hit a cap you set posts `ran out of
-budget`. OpenAI tracing is off unless `OPENAI_API_KEY` is set or
+`REVIEW_AGENT_MAX_TOKENS` caps **output** tokens only. Each turn re-sends the
+prompt, so adding those input totals together used to stop a large pull
+request (including one with the cap set to `1000000`) before `submit_verdict`.
+Unset `REVIEW_AGENT_MAX_TOKENS` on Render if a review still says it ran out of
+budget. Steps still stop at 50 (`max_turns`) so a tool loop cannot run
+forever. Each model call may use up to 8192 output tokens, which Anthropic
+needs in order to finish a tool call. Tool results are truncated to valid JSON
+per call. If the provider still reports a context-window error, the run
+retries once with shorter tool results. `REVIEW_AGENT_TIMEOUT_SECONDS`
+defaults to 600. `0` means no wall-time cap. Discord handlers call
+`run_review_session` (the Agents SDK). The older in-process loop is not on
+that path. OpenAI tracing is off unless `OPENAI_API_KEY` is set or
 `REVIEW_AGENT_TRACING=true`. Set `REVIEW_AGENT_TRACING=false` to force it off
 even when that key is present.
 
-Tools are read-only on GitHub: pull request metadata, the file list, one file's
+The review starts with one `review_bundle` call (bots, unresolved threads, CI,
+file names). It does not download the full diff. A file patch is read only
+when a bot finding or a failing check names that file. Classifying channel
+messages uses `anthropic/claude-haiku-4-5` unless `REVIEW_CLASSIFIER_MODEL` is
+set. A non-command message is scored by TypeSafe Jev (`POST https://api.typesafe.ai/v1/systemone`, model `jev-latest`) before anyone is answered. `should_reply` is a noul; the bot stays silent below `DECISION_REPLY_THRESHOLD` (default 0.7) or when the route is `maintainer_only`. Simple questions then go to `REVIEW_FAST_MODEL` and pull-request or bug-report work goes to `REVIEW_MODEL`, through LiteLLM's Autorouter (`auto_router/complexity_router`) with a custom classifier that reuses that one Jev decision. Without `TYPESAFE_API_KEY` the same decision is a Haiku JSON call. Explicit review requests, `/recheck`, and `check again` skip the gate.
+
+As soon as a request is accepted, the bot reacts with 👀 and then "ty"
+before the agent runs. `ACK_REACTIONS` is a comma-separated list of unicode
+emoji, `<:name:id>`, `name:id`, or a guild emoji name. Unset, it uses 👀 plus
+the first guild emoji named `t`, `letter_t`, `litellm_t`, or
+`regional_indicator_t`, and the same list for `y`. If none of those names
+exist, it uses 🇹 and 🇾. The resolved list is logged once at startup. Slash
+commands with no source message are not reacted to. Reactions are best-effort
+and need **Add Reactions** in addition to **Read Message History**.
+
+`bugbot run` ([Bugbot](https://cursor.com/docs/bugbot)) and `@greptileai` ([Greptile](https://www.greptile.com/docs/code-review/developer-essentials)) are the only default trigger comments. Veria publishes no re-run comment, so it is not triggered. `GITHUB_ACTOR_TOKEN` posts them as that user, once per commit. `REVIEW_DRY_RUN=true` only logs them. On Mondays at 10:00 America/Toronto the bot posts community merges from the last seven days. Bots and `MAINTAINER_GITHUB_LOGINS` are left out. `/merged-this-week` previews that text.
+
+Tools are read-only on GitHub except those allowlisted trigger comments: pull request metadata, the file list, one file's
 diff, a full file at the pull request head or base, code search in this
 repository only, Bugbot/Greptile/Veria threads (including resolved state), CI
 check output and a few annotations, and the contributor's linked Discord
@@ -382,8 +403,10 @@ Set the provider key the model expects (`OPENAI_API_KEY`, and so on).
    `DISCORD_MEMBERS_INTENT=false`.
 2. Invite the bot with the `bot` and `applications.commands` scopes. In the
    review channels grant **View Channel**, **Read Message History**,
-   **Send Messages**, **Create Public Threads**, and **Send Messages in
-   Threads**.
+   **Send Messages**, **Add Reactions**, **Create Public Threads**, and **Send
+   Messages in Threads**. Add Reactions is what lets the bot put 👀 and ty on
+   the request before the review finishes. Read Message History is required
+   for that reaction and for thread history.
 3. Set `PR_REVIEW_ENABLED=true`, `REVIEW_MODEL`, and `REVIEW_CHANNEL_IDS`.
    Set `DISCORD_GUILD_ID` and `DISCORD_APPLICATION_ID`. `DISCORD_PUBLIC_KEY`
    is only required if you still set an Interactions Endpoint URL. Leave that

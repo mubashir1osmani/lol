@@ -518,6 +518,7 @@ class DiscordPostTests(unittest.TestCase):
         }
         with mock.patch("contributor_bot.review_job.fetch_latest_message_id", return_value="100") as latest, \
                 mock.patch("contributor_bot.review_job.fetch_channel_messages", return_value=[message]) as history, \
+                mock.patch("contributor_bot.review_job.acknowledge_message") as ack, \
                 mock.patch("contributor_bot.review_job._spawn", side_effect=lambda target: scheduled.append(target)):
             poll_review_channels(self.config, self.store)
             self.assertEqual(self.store.review_cursor("321"), "100")
@@ -526,6 +527,7 @@ class DiscordPostTests(unittest.TestCase):
             self.assertEqual(scheduled, [])
             poll_review_channels(self.config, self.store)
         self.assertEqual(len(scheduled), 1)
+        ack.assert_called_once_with(self.config, "321", "200")
         self.assertEqual(self.store.review_cursor("321"), "200")
 
     def test_webhook_recheck_only_updates_an_existing_thread(self):

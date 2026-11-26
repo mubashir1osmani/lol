@@ -42,6 +42,15 @@ SLASH_COMMANDS = [
 ]
 
 # Registered only when PR_REVIEW_ENABLED=true, so the role command list stays stable.
+MERGED_SLASH_COMMANDS = [
+    {
+        "name": "merged-this-week",
+        "description": "Preview community pull requests merged in the last 7 days",
+        "type": 1,
+        "dm_permission": False,
+    },
+]
+
 REVIEW_SLASH_COMMANDS = [
     {
         "name": "review-pr",
@@ -95,11 +104,24 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
         return _unlink(store, discord_id)
     if name == "my-prs":
         return _my_prs(config, store, discord_id, payload.get("token"))
+    if name == "merged-this-week":
+        return _merged_preview(config, store)
     if name in {"review-pr", "recheck"}:
         if not config.pr_review_enabled:
             return _ephemeral("pr pre-review is off on this bot.")
         return handle_review_command(config, store, payload)
     return _ephemeral("unknown command.")
+
+
+def _merged_preview(config: Config, store: Store) -> dict:
+    """Show the weekly summary without recording the week as posted."""
+    try:
+        from .weekly import build_weekly
+        text = build_weekly(config, store)
+    except Exception:
+        logging.exception("Could not build the weekly merge preview")
+        return _ephemeral("couldn't load this week's merges. try again in a minute.")
+    return _ephemeral(text[:1900])
 
 
 def _link(config: Config, store: Store, discord_id: str) -> dict:
