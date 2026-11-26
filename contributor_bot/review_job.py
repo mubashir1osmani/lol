@@ -11,6 +11,8 @@ import time
 from datetime import datetime
 
 from .ack import acknowledge_message
+from .routing import decide, explicit_review
+from .triggers import apply_triggers
 from .api import (
     edit_original_interaction,
     fetch_latest_message_id,
@@ -158,6 +160,8 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
             history = history_text(fetch_recent_messages(thread_id, config.discord_token, limit=15))
         except Exception:
             logging.warning("Could not read thread history for #%s", number)
+        if source != "watch" and (config.github_actor_token or config.review_dry_run):
+            apply_triggers(config, store, number, lambda text: _post(thread_id, config.discord_token, text))
         result = run_review_session(config, store, number, thread_id, mode="review", history=history)
     except Exception:
         logging.exception("Review agent failed for #%s", number)
@@ -464,6 +468,10 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
 
 
 def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
+    text = message.get("content") or ""
+    if not explicit_review(text, config.github_repository):
+        _answer_if_decided(config, channel_id, message)
+        return
     asked, numbers = message_decision(config, message)
     message_id = str(message.get("id") or "")
     if asked and not numbers:
@@ -489,6 +497,37 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
         _spawn(lambda number=number, message_id=message_id: perform_review(
             config, store, number, channel_id=channel_id, message_id=message_id, source="new",
         ))
+
+
+def _answer_if_decided(config: Config, channel_id: str, message: dict) -> None:
+    """Jev (or Haiku) decides. Silence leaves the message for a maintainer."""
+    if not config.answers_enabled:
+        return
+    author = message.get("author") or {}
+    if author.get("bot") or message.get("webhook_id"):
+        return
+    decision = decide(
+        config,
+        message.get("content") or "",
+        channel=str(message.get("channel_name") or channel_id),
+    )
+    if not decision.reply:
+        return
+    acknowledge_message(config, channel_id, message.get("id"))
+    from .questions import answer_question
+    model = config.fast_model if decision.tier in {"SIMPLE", "MEDIUM"} else (config.review_model or config.fast_model)
+    answer_question(config, channel_id, message.get("content") or "", complete=_routed_complete(config, model))
+
+
+def _routed_complete(config, model):
+    def complete(system, body):
+        from .review_llm import complete_litellm
+        logging.info("Autorouter reply model=%s tier selected for a server answer", model)
+        return complete_litellm(model, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": body},
+        ])
+    return complete
 
 
 def poll_review_channels(config: Config, store: Store) -> None:

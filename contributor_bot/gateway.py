@@ -16,7 +16,7 @@ import threading
 
 from .ack import bind_ack_reactions, emoji_index
 from .config import Config
-from .interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
+from .interactions import MERGED_SLASH_COMMANDS, REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
 from .review_job import handle_channel_message, handle_thread_message
 from .store import Store
 
@@ -126,7 +126,7 @@ class Gateway:
         async def on_message(message):
             if self._stop.is_set() or message.author.bot or message.guild is None:
                 return
-            if not config.pr_review_enabled or store is None:
+            if store is None:
                 return
             try:
                 payload = _message_payload(message)
@@ -134,13 +134,16 @@ class Gateway:
                 logging.exception("Could not read a Discord message")
                 return
             channel_id = payload["channel_id"]
-            if message_is_thread(message, store):
+            channel_name = getattr(message.channel, "name", "") or ""
+            payload["channel_name"] = channel_name
+            if config.pr_review_enabled and message_is_thread(message, store):
                 _start_worker(handle_thread_message, (config, store, payload), "review-followup")
-                return
-            if not config.review_watch_all_channels and channel_id not in config.review_channel_ids:
                 return
             channel_type = channel_type_value(getattr(message.channel, "type", None))
             if channel_type not in {0, 5}:
+                return
+            in_review_channel = config.review_watch_all_channels or channel_id in config.review_channel_ids
+            if not (config.pr_review_enabled and in_review_channel) and not config.answers_enabled:
                 return
             _start_worker(handle_channel_message, (config, store, channel_id, payload), "review-message")
 
@@ -157,9 +160,36 @@ class Gateway:
             await _dispatch_command(discord, interaction, config, store)
 
         self.loop = asyncio.get_running_loop()
+        _start_weekly_task(discord, client, config, store)
         if self._stop.is_set():
             return
         await client.start(config.discord_token)
+
+
+def _start_weekly_task(discord, client, config, store) -> None:
+    """Fire at the configured local time. The store stops a second post the same week."""
+    if store is None or not config.merged_weekly_enabled:
+        return
+    from datetime import time as clock
+    from zoneinfo import ZoneInfo
+    from discord.ext import tasks
+    from .weekly import post_weekly_if_due
+
+    hour, minute = (int(part) for part in config.merged_time.split(":", 1))
+    when = clock(hour, minute, tzinfo=ZoneInfo(config.merged_timezone))
+
+    @tasks.loop(time=when)
+    async def merged_weekly_post():
+        await asyncio.to_thread(post_weekly_if_due, config, store)
+
+    @merged_weekly_post.before_loop
+    async def wait_until_ready():
+        await client.wait_until_ready()
+
+    try:
+        merged_weekly_post.start()
+    except Exception:
+        logging.exception("Could not start the weekly merge summary")
 
 
 def _load_discord():
@@ -264,6 +294,8 @@ def commands_for_guild(config: Config) -> list[dict]:
         commands.extend(SLASH_COMMANDS)
     if config.pr_review_enabled:
         commands.extend(REVIEW_SLASH_COMMANDS)
+    if config.merged_weekly_enabled and config.discord_guild_id:
+        commands.extend(MERGED_SLASH_COMMANDS)
     return commands
 
 
@@ -484,6 +516,13 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
 
         described = app.describe(url=review_spec["options"][0]["description"])(review_pr)
         add(review_spec, described)
+    if config.merged_weekly_enabled and config.discord_guild_id:
+        spec = MERGED_SLASH_COMMANDS[0]
+
+        async def merged_this_week(interaction):
+            await _dispatch_command(discord, interaction, config, store)
+
+        add(spec, merged_this_week)
     return tree
 
 

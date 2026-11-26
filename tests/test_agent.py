@@ -506,7 +506,7 @@ class RecheckThreadTests(unittest.TestCase):
 
     def test_guild_sync_includes_recheck_and_skips_an_empty_tree(self):
         names = [command["name"] for command in commands_for_guild(self.config)]
-        self.assertEqual(names, ["review-pr", "recheck"])
+        self.assertEqual(names, ["review-pr", "recheck", "merged-this-week"])
         self.assertTrue(should_sync_guild_commands(self.config))
         self.assertEqual(commands_for_guild(Config("token", "123", "456")), [])
         self.assertFalse(should_sync_guild_commands(Config("token", "123", "456")))

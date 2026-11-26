@@ -253,10 +253,12 @@ def normalize_thread(raw: dict) -> dict | None:
             login = author.get("login") if isinstance(author, dict) else ""
         commit = comment.get("commit") if isinstance(comment.get("commit"), dict) else {}
         commit_id = comment.get("commit_id") or commit.get("oid") or ""
+        line = comment.get("line") if isinstance(comment.get("line"), int) else comment.get("originalLine")
         normalized.append({
             "login": login.lower() if isinstance(login, str) else "",
             "body": comment.get("body") if isinstance(comment.get("body"), str) else "",
             "commit_id": commit_id if isinstance(commit_id, str) else "",
+            "line": line if isinstance(line, int) and line > 0 else None,
         })
     if not normalized:
         return None
@@ -284,6 +286,7 @@ class Finding:
     bot: str
     path: str
     summary: str
+    line: int | None = None
 
 
 @dataclass(frozen=True)
@@ -345,7 +348,10 @@ def findings_from_threads(threads: list[dict], bots: tuple[str, ...]) -> list[Fi
         body = thread["comments"][0]["body"]
         if _STALE_MARKER in body:
             continue
-        found.append(Finding(opener, thread.get("path") or "", summarize_comment(body)))
+        first = thread["comments"][0]
+        found.append(Finding(
+            opener, thread.get("path") or "", summarize_comment(body), first.get("line"),
+        ))
     return found
 
 
@@ -446,8 +452,12 @@ def _bot_reasons(bot: BotGate) -> list[str]:
         reasons.append(f"{bot.login} has not re-reviewed the latest commit")
     shown = bot.findings[:MAX_FINDINGS_PER_BOT]
     for finding in shown:
-        where = f" on {finding.path}" if finding.path else ""
-        reasons.append(f"{bot.login}: unresolved{where} - {finding.summary}")
+        where = ""
+        if finding.path:
+            where = f" on {finding.path}"
+            if finding.line:
+                where += f":{finding.line}"
+        reasons.append(f"{bot.login}: unresolved{where} - {finding.summary}. fix: {finding.summary}")
     extra = len(bot.findings) - len(shown)
     if extra:
         reasons.append(f"{bot.login}: {extra} more unresolved comments")

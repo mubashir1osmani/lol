@@ -25,6 +25,8 @@ query ReviewThreads($owner: String!, $name: String!, $number: Int!, $cursor: Str
               author { login }
               body
               commit { oid }
+              line
+              originalLine
             }
           }
         }

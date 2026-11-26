@@ -102,6 +102,24 @@ class Config:
     review_classifier_model: str = ""
     review_agent_tracing: bool | None = None
     ack_reactions: tuple[str, ...] | None = None
+    github_actor_token: str | None = field(default=None, repr=False)
+    review_trigger_comments: tuple[tuple[str, str], ...] = ()
+    review_post_summary: bool = False
+    review_dry_run: bool = False
+    review_trigger_poll_seconds: int = 120
+    review_trigger_wait_seconds: int = 1200
+    review_trigger_hourly_limit: int = 4
+    merged_weekly_enabled: bool = True
+    oss_contributors_channel_id: str = ""
+    maintainer_logins: tuple[str, ...] = ()
+    merged_weekday: int = 0
+    merged_time: str = "10:00"
+    merged_timezone: str = "America/Toronto"
+    answers_enabled: bool = True
+    typesafe_api_key: str | None = field(default=None, repr=False)
+    review_decision_model: str = "jev-latest"
+    decision_reply_threshold: float = 0.7
+    fast_model: str = "anthropic/claude-haiku-4-5"
     discord_members_intent: bool = False
 
     @property
@@ -215,6 +233,24 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_classifier_model="" if review_settings is None else review_settings["review_classifier_model"],
         review_agent_tracing=None if review_settings is None else review_settings["review_agent_tracing"],
         ack_reactions=None if review_settings is None else review_settings["ack_reactions"],
+        github_actor_token=values.get("GITHUB_ACTOR_TOKEN", "").strip() or None,
+        review_trigger_comments=_trigger_comments(values),
+        review_post_summary=_flag(values, "REVIEW_POST_SUMMARY", False),
+        review_dry_run=_flag(values, "REVIEW_DRY_RUN", False),
+        review_trigger_poll_seconds=_bounded_int(values, "REVIEW_TRIGGER_POLL_SECONDS", 120, 30, 600),
+        review_trigger_wait_seconds=_bounded_int(values, "REVIEW_TRIGGER_WAIT_SECONDS", 1200, 0, 3600),
+        review_trigger_hourly_limit=_bounded_int(values, "REVIEW_TRIGGER_HOURLY_LIMIT", 4, 1, 20),
+        merged_weekly_enabled=_flag(values, "MERGED_WEEKLY_ENABLED", True),
+        oss_contributors_channel_id=_optional_channel(values, "OSS_CONTRIBUTORS_CHANNEL_ID") or source,
+        maintainer_logins=_logins(values, "MAINTAINER_GITHUB_LOGINS"),
+        merged_weekday=_weekday(values),
+        merged_time=_clock(values, "MERGED_POST_TIME", "10:00"),
+        merged_timezone=_timezone(values),
+        answers_enabled=_flag(values, "ANSWERS_ENABLED", True),
+        typesafe_api_key=values.get("TYPESAFE_API_KEY", "").strip() or None,
+        review_decision_model=values.get("REVIEW_DECISION_MODEL", "").strip() or "jev-latest",
+        decision_reply_threshold=_threshold(values),
+        fast_model=values.get("REVIEW_FAST_MODEL", "").strip() or "anthropic/claude-haiku-4-5",
         discord_members_intent=members_intent,
     )
 
@@ -252,6 +288,62 @@ def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high
     if not low <= number <= high:
         raise ValueError(f"{name} must be between {low} and {high}")
     return number
+
+
+def _optional_channel(values: dict[str, str], name: str) -> str:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return ""
+    if not is_discord_id(raw):
+        raise ValueError(f"{name} must be a Discord channel ID")
+    return raw
+
+
+def _logins(values: dict[str, str], name: str) -> tuple[str, ...]:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return ()
+    logins = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if any(not re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", login) for login in logins):
+        raise ValueError(f"{name} must be comma-separated GitHub logins")
+    return logins
+
+
+def _weekday(values: dict[str, str]) -> int:
+    from .weekly import parse_weekday
+    return parse_weekday(values.get("MERGED_POST_WEEKDAY", "monday"))
+
+
+def _clock(values: dict[str, str], name: str, default: str) -> str:
+    text = values.get(name, "").strip() or default
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text):
+        raise ValueError(f"{name} must be HH:MM")
+    return text
+
+
+def _timezone(values: dict[str, str]) -> str:
+    name = values.get("MERGED_POST_TIMEZONE", "").strip() or values.get("ROUNDUP_TIMEZONE", "").strip() or "America/Toronto"
+    try:
+        ZoneInfo(name)
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError("MERGED_POST_TIMEZONE must be an installed IANA timezone") from error
+    return name
+
+
+def _threshold(values: dict[str, str]) -> float:
+    raw = values.get("DECISION_REPLY_THRESHOLD", "").strip() or "0.7"
+    try:
+        number = float(raw)
+    except ValueError as error:
+        raise ValueError("DECISION_REPLY_THRESHOLD must be between 0 and 1") from error
+    if not 0 <= number <= 1:
+        raise ValueError("DECISION_REPLY_THRESHOLD must be between 0 and 1")
+    return number
+
+
+def _trigger_comments(values: dict[str, str]):
+    from .triggers import parse_trigger_comments
+    return parse_trigger_comments(values.get("REVIEW_TRIGGER_COMMENTS"))
 
 
 def _ack_reactions(values: dict[str, str]) -> tuple[str, ...] | None:

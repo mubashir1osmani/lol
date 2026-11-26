@@ -151,6 +151,9 @@ def _validate_request(request: Request) -> None:
                    and (request.full_url == RELEASE_INDEX or release_url(request.full_url)))
     elif url.netloc == "discord.com":
         allowed = _discord_request_allowed(method, url.path)
+    elif url.netloc == "api.typesafe.ai":
+        # Jev System One decisions only. No other TypeSafe route.
+        allowed = method == "POST" and url.path == "/v1/systemone" and not url.query
     else:
         allowed = False
     if not allowed:
