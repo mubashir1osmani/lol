@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS review_threads (
     thread_id TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
     last_reviewed_at TEXT,
+    last_followup_at TEXT,
     head_sha TEXT,
     PRIMARY KEY (repository, number)
 );
@@ -85,6 +86,11 @@ CREATE TABLE IF NOT EXISTS review_threads (
 CREATE TABLE IF NOT EXISTS review_cursors (
     channel_id TEXT PRIMARY KEY,
     last_message_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_budget (
+    day TEXT PRIMARY KEY,
+    runs INTEGER NOT NULL
 );
 """
 
@@ -109,6 +115,9 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(review_threads)")}
+            if columns and "last_followup_at" not in columns:
+                self._conn.execute("ALTER TABLE review_threads ADD COLUMN last_followup_at TEXT")
             self._conn.commit()
         if path != ":memory:":
             os.chmod(path, 0o600)
@@ -475,6 +484,31 @@ class Store:
                 (repository, number, channel_id, message_id, thread_id, created_at),
             )
             self._conn.commit()
+
+    def mark_followup(self, repository: str, number: int, followed_at: str) -> None:
+        self._review_key(repository, number)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE review_threads SET last_followup_at = ? WHERE repository = ? AND number = ?",
+                (followed_at, repository, number),
+            )
+            self._conn.commit()
+
+    def claim_daily_run(self, day: str, limit: int) -> bool:
+        """Reserve one agent run for a UTC day. False when the daily budget is spent."""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("Invalid review budget")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO review_budget (day, runs) VALUES (?, 0) ON CONFLICT(day) DO NOTHING",
+                (day,),
+            )
+            cursor = self._conn.execute(
+                "UPDATE review_budget SET runs = runs + 1 WHERE day = ? AND runs < ?",
+                (day, limit),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def mark_review_done(self, repository: str, number: int, reviewed_at: str, head_sha: str) -> None:
         self._review_key(repository, number)

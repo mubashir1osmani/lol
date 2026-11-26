@@ -92,6 +92,15 @@ class Config:
     review_cooldown_seconds: int = 600
     review_webhook_recheck: bool = False
     review_require_ask: bool = False
+    review_classify: bool = False
+    review_watch_all_channels: bool = False
+    review_max_steps: int = 8
+    review_usage_cap: int = 16000
+    review_timeout_seconds: int = 120
+    review_daily_run_budget: int = 40
+    review_followup_cooldown_seconds: int = 45
+    review_classifier_model: str = ""
+    discord_members_intent: bool = False
 
     @property
     def scope(self) -> dict[str, str]:
@@ -145,6 +154,8 @@ def get_config(env: dict[str, str] | None = None) -> Config:
 
     roles_enabled = _flag(values, "CONTRIBUTOR_ROLES_ENABLED", False)
     review_enabled = _flag(values, "PR_REVIEW_ENABLED", False)
+    members_intent = _flag(values, "DISCORD_MEMBERS_INTENT", roles_enabled)
+    bind_host, bind_port = _http_bind(values)
     role_settings = _role_settings(values) if roles_enabled else None
     review_settings = _review_settings(values) if review_enabled else None
     shared = role_settings or review_settings
@@ -178,8 +189,8 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         discord_invite_url=None if role_settings is None else role_settings["discord_invite_url"],
         pr_comment_invites_enabled=False if role_settings is None else role_settings["pr_comment_invites_enabled"],
         merge_shoutouts_enabled=True if role_settings is None else role_settings["merge_shoutouts_enabled"],
-        http_host="0.0.0.0" if shared is None else shared["http_host"],
-        http_port=8080 if shared is None else shared["http_port"],
+        http_host=bind_host,
+        http_port=bind_port,
         roles_db_path=values.get("ROLES_DB_PATH", "").strip() or ".data/contributor_roles.db",
         role_ids={} if role_settings is None else role_settings["role_ids"],
         role_names=dict(DEFAULT_ROLE_NAMES) if role_settings is None else role_settings["role_names"],
@@ -192,7 +203,26 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_cooldown_seconds=600 if review_settings is None else review_settings["review_cooldown_seconds"],
         review_webhook_recheck=False if review_settings is None else review_settings["review_webhook_recheck"],
         review_require_ask=False if review_settings is None else review_settings["review_require_ask"],
+        review_classify=False if review_settings is None else review_settings["review_classify"],
+        review_watch_all_channels=False if review_settings is None else review_settings["review_watch_all_channels"],
+        review_max_steps=8 if review_settings is None else review_settings["review_max_steps"],
+        review_usage_cap=16000 if review_settings is None else review_settings["review_usage_cap"],
+        review_timeout_seconds=120 if review_settings is None else review_settings["review_timeout_seconds"],
+        review_daily_run_budget=40 if review_settings is None else review_settings["review_daily_run_budget"],
+        review_followup_cooldown_seconds=45 if review_settings is None else review_settings["review_followup_cooldown_seconds"],
+        review_classifier_model="" if review_settings is None else review_settings["review_classifier_model"],
+        discord_members_intent=members_intent,
     )
+
+
+def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high: int) -> int:
+    raw = values.get(name, "").strip() or str(default)
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise ValueError(f"{name} must be an integer")
+    number = int(raw)
+    if not low <= number <= high:
+        raise ValueError(f"{name} must be between {low} and {high}")
+    return number
 
 
 def _flag(values: dict[str, str], name: str, default: bool) -> bool:
@@ -300,6 +330,9 @@ def _review_settings(values: dict[str, str]) -> dict:
     if not 30 <= cooldown <= 86400:
         raise ValueError("REVIEW_COOLDOWN_SECONDS must be between 30 and 86400")
     webhook_recheck = _flag(values, "REVIEW_WEBHOOK_RECHECK", False)
+    classifier = values.get("REVIEW_CLASSIFIER_MODEL", "").strip()
+    if classifier and not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", classifier):
+        raise ValueError("REVIEW_CLASSIFIER_MODEL must be a LiteLLM model name")
     settings = {
         **app,
         "http_host": host,
@@ -311,6 +344,14 @@ def _review_settings(values: dict[str, str]) -> dict:
         "review_cooldown_seconds": cooldown,
         "review_webhook_recheck": webhook_recheck,
         "review_require_ask": _flag(values, "REVIEW_REQUIRE_ASK", False),
+        "review_classify": _flag(values, "REVIEW_CLASSIFY_MESSAGES", True),
+        "review_watch_all_channels": _flag(values, "REVIEW_WATCH_ALL_CHANNELS", False),
+        "review_max_steps": _bounded_int(values, "REVIEW_AGENT_MAX_STEPS", 8, 1, 20),
+        "review_usage_cap": _bounded_int(values, "REVIEW_AGENT_MAX_TOKENS", 16000, 1000, 100000),
+        "review_timeout_seconds": _bounded_int(values, "REVIEW_AGENT_TIMEOUT_SECONDS", 120, 15, 300),
+        "review_daily_run_budget": _bounded_int(values, "REVIEW_DAILY_RUN_BUDGET", 40, 1, 500),
+        "review_followup_cooldown_seconds": _bounded_int(values, "REVIEW_FOLLOWUP_COOLDOWN_SECONDS", 45, 10, 3600),
+        "review_classifier_model": classifier,
     }
     if webhook_recheck:
         settings["github_webhook_secret"] = _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8)

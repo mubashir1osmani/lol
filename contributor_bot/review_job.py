@@ -10,25 +10,22 @@ import threading
 from datetime import datetime
 
 from .api import (
-    TransientAPIError,
     edit_original_interaction,
     fetch_latest_message_id,
     fetch_channel_messages,
+    fetch_recent_messages,
     post_message,
     start_public_thread,
 )
 from .config import Config, is_discord_id
-from .review_github import Snapshot, gather_snapshot
-from .review_llm import run_llm_review
+from .review_agent import history_text, run_review_session
+from .review_llm import complete_litellm
 from .reviews import (
-    assess_gate,
+    classify_review_request,
     cooldown_remaining,
-    render_status,
-    render_written,
-    review_chunks,
     recheck_number,
     should_review_message,
-    tag_line,
+    wants_recheck,
 )
 from .schedule import UTC, iso
 from .store import Store
@@ -59,10 +56,6 @@ def _unlock(repository: str, number: int) -> None:
         _inflight.discard((repository.lower(), number))
 
 
-def _pull_url(repository: str, number: int) -> str:
-    return f"https://github.com/{repository}/pull/{number}"
-
-
 def _post(channel_id: str, token: str, content: str, *, user_id: str | None = None, role_id: str | None = None) -> None:
     users = [user_id] if user_id else []
     post_message(
@@ -73,15 +66,15 @@ def _post(channel_id: str, token: str, content: str, *, user_id: str | None = No
     )
 
 
-def _ensure_thread(config: Config, store: Store, snapshot: Snapshot, channel_id: str, message_id: str) -> str:
+def _ensure_thread(config: Config, store: Store, number: int, channel_id: str, message_id: str) -> str:
     repository = config.github_repository
-    record = store.review_thread(repository, snapshot.number)
+    record = store.review_thread(repository, number)
     if record:
         return record["thread_id"]
     if not is_discord_id(channel_id) or not is_discord_id(message_id):
         raise ReviewError("couldn't tell which message to thread.")
     try:
-        thread = start_public_thread(channel_id, message_id, config.discord_token, f"pr {snapshot.number} review")
+        thread = start_public_thread(channel_id, message_id, config.discord_token, f"pr {number} review")
     except RuntimeError as error:
         if "HTTP 403" in str(error):
             logging.error(
@@ -90,32 +83,18 @@ def _ensure_thread(config: Config, store: Store, snapshot: Snapshot, channel_id:
                 channel_id, error,
             )
             raise ReviewError("couldn't open a thread. the bot needs create public threads and send messages in threads.") from error
-        logging.error("Could not open a review thread for #%s: %s", snapshot.number, error)
+        logging.error("Could not open a review thread for #%s: %s", number, error)
         raise ReviewError("couldn't open a thread on that message.") from error
     now = iso(datetime.now(UTC))
     store.save_review_thread(
         repository=repository,
-        number=snapshot.number,
+        number=number,
         channel_id=channel_id,
         message_id=message_id,
         thread_id=thread["id"],
         created_at=now,
     )
     return thread["id"]
-
-
-def _publish(config: Config, thread_id: str, chunks: list[str], user_id: str | None) -> None:
-    role_id = config.review_maintainer_role_id
-    ready = bool(chunks) and chunks[0].startswith("ready for maintainer")
-    for chunk in chunks:
-        is_tag = chunk.startswith("<@")
-        _post(
-            thread_id,
-            config.discord_token,
-            chunk,
-            user_id=user_id if is_tag else None,
-            role_id=role_id if is_tag and ready else None,
-        )
 
 
 def perform_review(
@@ -149,78 +128,47 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         if record:
             detail = f"checked recently. see <#{record['thread_id']}>. try again in {minutes}m."
         logging.info("PR review for #%s skipped (%s); cooldown %ss", number, source, remaining)
+        if source == "recheck" and record:
+            try:
+                _post(record["thread_id"], config.discord_token, detail)
+            except Exception:
+                logging.warning("Could not post the cooldown note for #%s", number)
         return {"status": "cooldown", "thread_id": record["thread_id"] if record else None, "detail": detail}
+    day = datetime.now(UTC).date().isoformat()
+    if not store.claim_daily_run(day, config.review_daily_run_budget):
+        detail = "ran out of budget for today. try again tomorrow."
+        if record:
+            try:
+                _post(record["thread_id"], config.discord_token, detail)
+            except Exception:
+                logging.exception("Could not post the daily budget note for #%s", number)
+        return {"status": "budget", "thread_id": record["thread_id"] if record else None, "detail": detail}
     logging.info("Reviewing #%s (%s)", number, source)
-    try:
-        snapshot = gather_snapshot(repository, number, config.github_token)
-    except TransientAPIError as error:
-        logging.warning("PR review for #%s deferred: %s", number, error)
-        return {"status": "error", "thread_id": record["thread_id"] if record else None, "detail": "couldn't reach github. try again in a minute."}
-    except RuntimeError as error:
-        logging.warning("PR review for #%s failed: %s", number, error)
-        if "HTTP 404" in str(error):
-            detail = "that pr isn't on github, or it's private."
-        else:
-            detail = "couldn't read that pr from github."
-        return {"status": "error", "thread_id": record["thread_id"] if record else None, "detail": detail}
     thread_channel = channel_id or (record["channel_id"] if record else None)
     thread_message = message_id or (record["message_id"] if record else None)
     try:
-        thread_id = _ensure_thread(config, store, snapshot, thread_channel or "", thread_message or "")
+        thread_id = _ensure_thread(config, store, number, thread_channel or "", thread_message or "")
     except ReviewError as error:
         return {"status": "error", "thread_id": None, "detail": str(error)}
-    written = ""
-    if snapshot.state == "open" and not snapshot.merged:
-        try:
-            written = render_written(run_llm_review(snapshot.diff, config.review_model))
-        except RuntimeError as error:
-            logging.warning("Written review for #%s failed: %s", number, error)
-            if "not installed" in str(error):
-                written = render_written(None, "litellm isn't installed on this bot, so this is the gate only")
-            else:
-                written = render_written(None, "the model call failed. the gate above is the part to trust")
-        except Exception:
-            logging.exception("Written review for #%s failed", number)
-            written = render_written(None, "the model call failed. the gate above is the part to trust")
-    gate = assess_gate(
-        bots=config.review_bot_logins,
-        head_sha=snapshot.head_sha,
-        draft=snapshot.draft,
-        merged=snapshot.merged,
-        state=snapshot.state,
-        mergeable=snapshot.mergeable,
-        mergeable_state=snapshot.mergeable_state,
-        reviews=snapshot.reviews,
-        comments=snapshot.comments,
-        threads=snapshot.threads,
-        check_runs=snapshot.check_runs,
-        combined_state=snapshot.combined_state,
-    )
-    status = render_status(
-        gate,
-        number=number,
-        title=snapshot.title,
-        url=_pull_url(repository, number),
-        head_sha=snapshot.head_sha,
-    )
-    chunks = review_chunks(status, written)
-    link = store.link_for_github_user(snapshot.author_id) if snapshot.author_id else None
-    user_id = link["discord_id"] if link else None
-    tag = tag_line(user_id, config.review_maintainer_role_id, ready=gate.ready)
-    if tag:
-        chunks.append(tag)
     try:
-        _publish(config, thread_id, chunks, user_id)
-    except RuntimeError as error:
-        logging.error(
-            "Could not post the review for #%s in thread %s: %s. "
-            "The bot needs Send Messages in Threads.",
-            number, thread_id, error,
+        history = ""
+        try:
+            history = history_text(fetch_recent_messages(thread_id, config.discord_token, limit=15))
+        except Exception:
+            logging.warning("Could not read thread history for #%s", number)
+        result = run_review_session(config, store, number, thread_id, mode="review", history=history)
+    except Exception:
+        logging.exception("Review agent failed for #%s", number)
+        return {"status": "error", "thread_id": thread_id, "detail": "the reviewer hit an error. try /recheck in a bit."}
+    store.mark_review_done(repository, number, iso(datetime.now(UTC)), result.head_sha or "")
+    if result.verdict_posted:
+        logging.info(
+            "Posted a %s review for #%s in thread %s",
+            "ready" if result.ready else "needs-work", number, thread_id,
         )
-        return {"status": "error", "thread_id": thread_id, "detail": "couldn't post in the review thread."}
-    store.mark_review_done(repository, number, iso(datetime.now(UTC)), snapshot.head_sha)
-    logging.info("Posted a %s review for #%s in thread %s", "ready" if gate.ready else "needs-work", number, thread_id)
-    return {"status": "posted", "thread_id": thread_id, "detail": ""}
+    elif result.exhausted:
+        logging.info("Review for #%s ran out of budget (%s)", number, result.exhausted)
+    return {"status": "posted", "thread_id": thread_id, "detail": result.text}
 
 
 def _ephemeral(content: str) -> dict:
@@ -346,9 +294,76 @@ def schedule_webhook_recheck(config: Config, store: Store, event: str, payload: 
     _spawn(lambda: perform_review(config, store, number, source="webhook"))
 
 
+def _classify_complete(config: Config, system: str, text: str) -> str:
+    model = config.review_classifier_model or config.review_model
+    return complete_litellm(model, [
+        {"role": "system", "content": system},
+        {"role": "user", "content": text},
+    ])
+
+
+def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
+    """Whether this message wants a review, and which LiteLLM PR numbers it names."""
+    if not config.review_classify:
+        numbers = should_review_message(message, config.github_repository, require_ask=config.review_require_ask)
+        return bool(numbers), numbers
+    text = message.get("content") or ""
+    asked = classify_review_request(
+        text,
+        config.github_repository,
+        complete=lambda system, body: _classify_complete(config, system, body),
+    )
+    if not asked:
+        return False, []
+    return True, should_review_message(message, config.github_repository, require_ask=False)
+
+
+def handle_thread_message(config: Config, store: Store, message: dict) -> None:
+    """Answer a follow-up inside a review thread, or re-review when they say they fixed it."""
+    if not config.pr_review_enabled:
+        return
+    author = message.get("author") or {}
+    if author.get("bot") or message.get("webhook_id"):
+        return
+    channel_id = str(message.get("channel_id") or "")
+    record = store.review_thread_by_discord(channel_id) if is_discord_id(channel_id) else None
+    if not record or record["repository"].lower() != config.github_repository.lower():
+        return
+    number = int(record["number"])
+    text = message.get("content") or ""
+    if wants_recheck(text):
+        perform_review(config, store, number, source="recheck")
+        return
+    remaining = cooldown_remaining(
+        {"last_reviewed_at": record.get("last_followup_at")},
+        config.review_followup_cooldown_seconds,
+        datetime.now(UTC),
+    )
+    if remaining:
+        logging.info("Skipping follow-up on #%s; cooldown has %ss left", number, remaining)
+        return
+    day = datetime.now(UTC).date().isoformat()
+    if not store.claim_daily_run(day, config.review_daily_run_budget):
+        _post(channel_id, config.discord_token, "ran out of budget for today. try again tomorrow.")
+        return
+    try:
+        history = history_text(fetch_recent_messages(channel_id, config.discord_token, limit=15))
+    except Exception:
+        logging.warning("Could not read follow-up history for #%s", number)
+        history = text
+    try:
+        run_review_session(config, store, number, channel_id, mode="followup", history=history)
+    except Exception:
+        logging.exception("Follow-up agent failed for #%s", number)
+    store.mark_followup(config.github_repository, number, iso(datetime.now(UTC)))
+
+
 def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
-    numbers = should_review_message(message, config.github_repository, require_ask=config.review_require_ask)
+    asked, numbers = message_decision(config, message)
     message_id = str(message.get("id") or "")
+    if asked and not numbers:
+        _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
+        return
     for number in numbers:
         record = store.review_thread(config.github_repository, number)
         if record:

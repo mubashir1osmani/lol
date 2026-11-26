@@ -1,4 +1,5 @@
-# The Friday roundup and contributor roles use the Python standard library only.
-# PR pre-review (PR_REVIEW_ENABLED) imports litellm when a review runs.
-# CI allows this one package and still rejects anything else.
+# discord.py keeps the bot online (gateway) and receives messages and slash commands.
+# litellm is imported only when a PR review agent run or a message classification needs it.
+# CI allows these two packages and still rejects anything else.
+discord.py==2.7.1
 litellm==1.111.0

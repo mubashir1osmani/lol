@@ -67,6 +67,7 @@ def _graphql_query_allowed(request: Request) -> bool:
 def _github_request_allowed(method: str, path: str) -> bool:
     pull = rf"/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}"
     commit = rf"/repos/{_OWNER_REPO}/commits/[0-9a-fA-F]{{40}}"
+    check_run = rf"/repos/{_OWNER_REPO}/check-runs/{_PR_NUMBER}"
     if method == "GET" and (
         re.fullmatch(pull, path)
         or re.fullmatch(pull + r"/files", path)
@@ -74,8 +75,11 @@ def _github_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(pull + r"/comments", path)
         or re.fullmatch(commit + r"/check-runs", path)
         or re.fullmatch(commit + r"/status", path)
+        or re.fullmatch(check_run, path)
+        or re.fullmatch(check_run + r"/annotations", path)
+        or re.fullmatch(rf"/repos/{_OWNER_REPO}/contents(?:/[^/]+)+", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/pulls", path)
-        or path in {"/search/issues", "/user"}
+        or path in {"/search/issues", "/search/code", "/user"}
     ):
         return True
     # The only GitHub write: an optional invite comment on a merged pull request.
@@ -97,6 +101,13 @@ def _discord_request_allowed(method: str, path: str) -> bool:
     if method == "POST" and re.fullmatch(
         rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}/threads", path
     ):
+        return True
+    # Edit a message this bot already posted. Not roles, members, or channels.
+    if method == "PATCH" and re.fullmatch(
+        rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}", path
+    ):
+        return True
+    if method == "GET" and re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/channels", path):
         return True
     # Add an existing role to a member. Creating roles, editing members, and
     # removing roles stay blocked.
@@ -595,6 +606,51 @@ def fetch_merged_numbers(repository: str, start, end, token: str | None, author:
         if not items:
             raise TransientAPIError("GitHub search ended before all results were read")
         page += 1
+
+
+def fetch_recent_messages(channel_id: str, token: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Newest messages in a channel or thread. One page, no history backfill."""
+    if not is_discord_id(channel_id) or not 1 <= limit <= 50:
+        raise ValueError("Unexpected Discord channel id")
+    messages = _request_json(Request(
+        f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}",
+        headers=_discord_headers(token),
+    ))
+    if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
+        raise RuntimeError("Discord returned an unexpected messages response")
+    return messages
+
+
+def edit_message(
+    channel_id: str,
+    message_id: str,
+    token: str,
+    content: str,
+    *,
+    mention_roles: list[str] | None = None,
+    mention_users: list[str] | None = None,
+) -> dict[str, Any]:
+    """Edit one message the bot sent. Role pings still require mention_roles."""
+    if not is_discord_id(channel_id) or not is_discord_id(message_id):
+        raise ValueError("Unexpected Discord message id")
+    users = list(mention_users or [])
+    roles = list(mention_roles or [])
+    if any(not is_discord_id(user_id) for user_id in users) or len(users) > 10:
+        raise ValueError("Only explicit Discord user IDs may be mentioned")
+    if len(roles) > 1 or any(not is_discord_id(role_id) for role_id in roles):
+        raise ValueError("Only one explicit Discord role ID may be mentioned")
+    allowed: dict[str, Any] = {"parse": [], "users": users}
+    if roles:
+        allowed["roles"] = roles
+    response = _request_json(Request(
+        f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}",
+        data=json.dumps({"content": content, "allowed_mentions": allowed}).encode("utf-8"),
+        method="PATCH",
+        headers={**_discord_headers(token), "Content-Type": "application/json"},
+    ))
+    if not isinstance(response, dict) or response.get("id") != message_id:
+        raise RuntimeError("Discord did not return an edited message")
+    return response
 
 
 def fetch_latest_message_id(channel_id: str, token: str) -> str | None:
