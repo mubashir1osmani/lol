@@ -38,26 +38,65 @@ _PR_NUMBER = r"[1-9][0-9]*"
 _INTERACTION_TOKEN = r"[A-Za-z0-9._~=-]{10,256}"
 
 
+def _graphql_query_allowed(request: Request) -> bool:
+    """Read-only GraphQL. Review-thread resolution has no REST field."""
+    if request.get_method() != "POST" or urlsplit(request.full_url).query:
+        return False
+    data = request.data
+    if not isinstance(data, bytes) or not data or len(data) > 20_000:
+        return False
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or set(payload) - {"query", "variables"}:
+        return False
+    query = payload.get("query")
+    variables = payload.get("variables", {})
+    if not isinstance(query, str) or not query.strip() or len(query) > 10_000:
+        return False
+    if variables is not None and not isinstance(variables, dict):
+        return False
+    folded = " ".join(query.split())
+    if re.search(r"\b(mutation|subscription)\b", folded, re.I):
+        return False
+    lowered = folded.lower()
+    return lowered.startswith("query ") or lowered.startswith("{")
+
+
 def _github_request_allowed(method: str, path: str) -> bool:
     pull = rf"/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}"
+    commit = rf"/repos/{_OWNER_REPO}/commits/[0-9a-fA-F]{{40}}"
     if method == "GET" and (
         re.fullmatch(pull, path)
         or re.fullmatch(pull + r"/files", path)
         or re.fullmatch(pull + r"/reviews", path)
+        or re.fullmatch(pull + r"/comments", path)
+        or re.fullmatch(commit + r"/check-runs", path)
+        or re.fullmatch(commit + r"/status", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/pulls", path)
         or path in {"/search/issues", "/user"}
     ):
         return True
     # The only GitHub write: an optional invite comment on a merged pull request.
+    # PR pre-review must not approve, merge, or comment. GraphQL is query-only.
     return method == "POST" and re.fullmatch(
         rf"/repos/{_OWNER_REPO}/issues/{_PR_NUMBER}/comments", path
     ) is not None
 
 
 def _discord_request_allowed(method: str, path: str) -> bool:
-    if method == "GET" and re.fullmatch(rf"/api/v10/channels/{_SNOWFLAKE}(?:/messages)?", path):
+    if method == "GET" and (
+        re.fullmatch(rf"/api/v10/channels/{_SNOWFLAKE}(?:/messages)?", path)
+        or re.fullmatch(rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}", path)
+    ):
         return True
     if method == "POST" and re.fullmatch(rf"/api/v10/channels/{_SNOWFLAKE}/messages", path):
+        return True
+    # A public thread hung off an existing message. One thread per message.
+    if method == "POST" and re.fullmatch(
+        rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}/threads", path
+    ):
         return True
     # Add an existing role to a member. Creating roles, editing members, and
     # removing roles stay blocked.
@@ -84,7 +123,10 @@ def _validate_request(request: Request) -> None:
     ):
         raise ValueError("Only approved HTTPS API requests are allowed")
     if url.netloc == "api.github.com":
-        allowed = _github_request_allowed(method, url.path)
+        if url.path == "/graphql":
+            allowed = _graphql_query_allowed(request)
+        else:
+            allowed = _github_request_allowed(method, url.path)
     elif url.netloc == "github.com":
         # OAuth code exchange only. The browser, not this bot, opens the authorize page.
         allowed = method == "POST" and url.path == "/login/oauth/access_token" and not url.query
@@ -316,6 +358,32 @@ def fetch_pull_files(repository: str, number: int, token: str | None) -> list[st
     raise RuntimeError("Pull request file list is too large")
 
 
+def fetch_pull_diff(repository: str, number: int, token: str | None) -> str:
+    """Unified diff for a pull request. Same read URL as the pull, with the diff media type."""
+    headers = github_headers(token)
+    headers["Accept"] = "application/vnd.github.diff"
+    status, _headers, body = _http(Request(f"{GITHUB_API}/repos/{repository}/pulls/{number}", headers=headers))
+    if status != 200:
+        raise RuntimeError(f"GitHub returned HTTP {status}")
+    text = body.decode("utf-8", errors="replace")
+    if text.lstrip().startswith("{"):
+        raise RuntimeError("GitHub did not return a diff")
+    return text
+
+
+def github_graphql(token: str | None, query: str, variables: dict[str, Any]) -> Any:
+    """One read-only GraphQL query. Mutations are rejected before the request is sent."""
+    payload = _request_json(Request(
+        f"{GITHUB_API}/graphql",
+        data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+        method="POST",
+        headers={**github_headers(token), "Content-Type": "application/json"},
+    ))
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned an unexpected GraphQL response")
+    return payload
+
+
 def fetch_pull_reviews(repository: str, number: int, token: str | None) -> list[dict[str, Any]]:
     reviews: list[dict[str, Any]] = []
     page = 1
@@ -421,7 +489,7 @@ def register_guild_commands(application_id: str, guild_id: str, token: str, comm
         raise RuntimeError("Discord did not accept the slash command list")
 
 
-def edit_original_interaction(application_id: str, interaction_token: str, message: dict[str, Any]) -> None:
+def edit_original_interaction(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
     """Finish a deferred slash command. Uses the interaction token, not the bot token."""
     if not is_discord_id(application_id) or not re.fullmatch(_INTERACTION_TOKEN, interaction_token):
         raise ValueError("Unexpected interaction token")
@@ -431,16 +499,16 @@ def edit_original_interaction(application_id: str, interaction_token: str, messa
         raise ValueError("Only explicit Discord user IDs may be mentioned")
     message = {**message, "allowed_mentions": {"parse": [], "users": users}}
     try:
-        _edit_original(application_id, interaction_token, message)
+        return _edit_original(application_id, interaction_token, message)
     except RuntimeError as error:
         if "HTTP 404" not in str(error):
             raise
         # Discord may not have recorded the deferred response yet.
         time.sleep(0.4)
-        _edit_original(application_id, interaction_token, message)
+        return _edit_original(application_id, interaction_token, message)
 
 
-def _edit_original(application_id: str, interaction_token: str, message: dict[str, Any]) -> None:
+def _edit_original(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
     response = _request_json(Request(
         f"{DISCORD_API}/webhooks/{application_id}/{interaction_token}/messages/@original",
         data=json.dumps(message).encode("utf-8"),
@@ -449,6 +517,7 @@ def _edit_original(application_id: str, interaction_token: str, message: dict[st
     ))
     if not isinstance(response, dict) or not is_discord_id(response.get("id")):
         raise RuntimeError("Discord did not return an interaction follow-up")
+    return response
 
 
 def post_issue_comment(repository: str, number: int, token: str, body: str) -> dict[str, Any]:
@@ -528,6 +597,75 @@ def fetch_merged_numbers(repository: str, start, end, token: str | None, author:
         page += 1
 
 
+def fetch_latest_message_id(channel_id: str, token: str) -> str | None:
+    """The newest message id, or None when the channel is empty. Does not page history."""
+    messages = _request_json(Request(
+        f"{DISCORD_API}/channels/{channel_id}/messages?limit=1",
+        headers=_discord_headers(token),
+    ))
+    if not isinstance(messages, list):
+        raise RuntimeError("Discord returned an unexpected messages response")
+    if not messages:
+        return None
+    message_id = messages[0].get("id") if isinstance(messages[0], dict) else None
+    if not is_discord_id(message_id):
+        raise RuntimeError("Discord returned an unexpected messages response")
+    return message_id
+
+
+def fetch_message(channel_id: str, message_id: str, token: str) -> dict[str, Any]:
+    if not is_discord_id(channel_id) or not is_discord_id(message_id):
+        raise ValueError("Unexpected Discord message id")
+    message = _request_json(Request(
+        f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}",
+        headers=_discord_headers(token),
+    ))
+    if not isinstance(message, dict) or message.get("id") != message_id:
+        raise RuntimeError("Discord returned an unexpected message response")
+    return message
+
+
+def start_public_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, Any]:
+    """Start one public thread on a message. Reuse the thread if that message already has one."""
+    if not is_discord_id(channel_id) or not is_discord_id(message_id):
+        raise ValueError("Thread requires Discord channel and message IDs")
+    cleaned = re.sub(r"\s+", " ", name).strip()[:100] or "pr review"
+    last_error: RuntimeError | None = None
+    for duration in (1440, 60):
+        try:
+            response = _request_json(Request(
+                f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}/threads",
+                data=json.dumps({"name": cleaned, "auto_archive_duration": duration}).encode("utf-8"),
+                method="POST",
+                headers={**_discord_headers(token), "Content-Type": "application/json"},
+            ))
+        except RuntimeError as error:
+            last_error = error
+            if "HTTP 400" not in str(error):
+                raise
+            existing = _thread_on_message(channel_id, message_id, token)
+            if existing:
+                return existing
+            continue
+        if not isinstance(response, dict) or not is_discord_id(response.get("id")):
+            raise RuntimeError("Discord did not return a thread")
+        return response
+    if last_error:
+        raise last_error
+    raise RuntimeError("Discord did not return a thread")
+
+
+def _thread_on_message(channel_id: str, message_id: str, token: str) -> dict[str, Any] | None:
+    try:
+        message = fetch_message(channel_id, message_id, token)
+    except (RuntimeError, TransientAPIError, ValueError):
+        return None
+    thread = message.get("thread")
+    if isinstance(thread, dict) and is_discord_id(thread.get("id")):
+        return thread
+    return None
+
+
 def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
     channel = _request_json(Request(
         f"{DISCORD_API}/channels/{channel_id}",
@@ -538,16 +676,29 @@ def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
     return channel
 
 
-def post_message(channel_id: str, token: str, message: dict[str, Any]) -> dict[str, Any]:
+def post_message(
+    channel_id: str,
+    token: str,
+    message: dict[str, Any],
+    *,
+    mention_roles: list[str] | None = None,
+) -> dict[str, Any]:
     mentions = message.get("allowed_mentions") or {}
     users = mentions.get("users", [])
+    roles = list(mention_roles or [])
     if (
         not isinstance(users, list)
         or len(users) > 100
         or any(not is_discord_id(user_id) for user_id in users)
     ):
         raise ValueError("Only explicit Discord user IDs may be mentioned")
-    message = {**message, "allowed_mentions": {"parse": [], "users": users}}
+    # Roles stuffed into the message are ignored. Callers pass mention_roles.
+    if len(roles) > 1 or any(not is_discord_id(role_id) for role_id in roles):
+        raise ValueError("Only one explicit Discord role ID may be mentioned")
+    allowed: dict[str, Any] = {"parse": [], "users": users}
+    if roles:
+        allowed["roles"] = roles
+    message = {**message, "allowed_mentions": allowed}
     response = _request_json(Request(
         f"{DISCORD_API}/channels/{channel_id}/messages",
         data=json.dumps(message).encode("utf-8"),

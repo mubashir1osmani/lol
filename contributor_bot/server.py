@@ -11,6 +11,7 @@ from .api import TransientAPIError
 from .config import Config
 from .interactions import handle_interaction
 from .oauth import callback_page
+from .review_job import schedule_webhook_recheck
 from .rewards import handle_github_event
 from .signatures import verify_discord_interaction, verify_github_signature
 from .store import Store
@@ -92,6 +93,10 @@ class RewardsHandler(BaseHTTPRequestHandler):
         except TransientAPIError:
             logging.warning("GitHub webhook deferred")
             status = 500
+        try:
+            schedule_webhook_recheck(self.server.config, self.server.store, event, payload)
+        except Exception:
+            logging.exception("PR review webhook hook failed")
         if status == 200:
             response = b'{"ok":true}'
         elif status == 400:
@@ -171,7 +176,7 @@ def start_http_server(config: Config, store: Store | None = None) -> RewardsHTTP
     thread = threading.Thread(target=server.serve_forever, name="contributor-roles-http", daemon=True)
     thread.start()
     host, port = server.server_address[:2]
-    logging.info("Contributor role HTTP server listening on %s:%s", host, port)
+    logging.info("Contributor HTTP server listening on %s:%s", host, port)
     return server
 
 

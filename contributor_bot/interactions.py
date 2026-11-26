@@ -15,6 +15,7 @@ from .api import (
 from .config import Config, is_discord_id
 from .oauth import authorize_url
 from .present import my_prs_text, review_status
+from .review_job import handle_review_command
 from .roles import DEFAULT_ROLE_NAMES, MergedPull, earned_role_keys
 from .schedule import UTC, iso, parse_time
 from .store import Store
@@ -35,6 +36,30 @@ SLASH_COMMANDS = [
     {
         "name": "my-prs",
         "description": "Show your open LiteLLM PRs, merged count, and roles",
+        "type": 1,
+        "dm_permission": False,
+    },
+]
+
+# Registered only when PR_REVIEW_ENABLED=true, so the role command list stays stable.
+REVIEW_SLASH_COMMANDS = [
+    {
+        "name": "review-pr",
+        "description": "Pre-review a LiteLLM pull request in a thread",
+        "type": 1,
+        "dm_permission": False,
+        "options": [
+            {
+                "type": 3,
+                "name": "url",
+                "description": "https://github.com/BerriAI/litellm/pull/123",
+                "required": True,
+            },
+        ],
+    },
+    {
+        "name": "recheck",
+        "description": "Re-check the pull request this thread is tracking",
         "type": 1,
         "dm_permission": False,
     },
@@ -70,6 +95,10 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
         return _unlink(store, discord_id)
     if name == "my-prs":
         return _my_prs(config, store, discord_id, payload.get("token"))
+    if name in {"review-pr", "recheck"}:
+        if not config.pr_review_enabled:
+            return _ephemeral("pr pre-review is off on this bot.")
+        return handle_review_command(config, store, payload)
     return _ephemeral("unknown command.")
 
 

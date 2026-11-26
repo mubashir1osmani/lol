@@ -44,6 +44,8 @@ class NetworkBoundaryTests(unittest.TestCase):
             ("https://docs.litellm.ai/release_notes", "POST"),
             ("https://discord.com/api/v10/guilds/123/members/456/roles/789", "DELETE"),
             ("https://api.github.com/repos/BerriAI/litellm/pulls/1/comments", "POST"),
+            ("https://api.github.com/repos/BerriAI/litellm/pulls/1/reviews", "POST"),
+            ("https://api.github.com/graphql", "GET"),
             ("https://github.com/login/oauth/access_token", "GET"),
             ("https://api.github.com/user/emails", "GET"),
             ("https://discord.com/api/v10/webhooks/123/" + ("a" * 20) + "/messages/999", "PATCH"),
@@ -123,6 +125,33 @@ class NetworkBoundaryTests(unittest.TestCase):
                 data=b"{}", method="PATCH",
             ))
         self.assertEqual(request.call_count, len(urls) + 5)
+
+    def test_pr_review_reads_are_allowed_and_graphql_mutations_are_not(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status, response.headers = 200, {}
+        response.read.return_value = b"{}"
+        sha = "a" * 40
+        urls = [
+            f"https://api.github.com/repos/BerriAI/litellm/pulls/12/comments?per_page=100",
+            f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/check-runs?per_page=100",
+            f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/status",
+            "https://discord.com/api/v10/channels/321/messages/654",
+        ]
+        query = json.dumps({"query": "query ReviewThreads($n: Int!) { repository { pullRequest { id } } }"}).encode()
+        mutation = json.dumps({"query": "mutation { addReaction(input: {subjectId: \"x\"}) { clientMutationId } }"}).encode()
+        with mock.patch.object(api, "_open_request", return_value=response) as request:
+            for url in urls:
+                with self.subTest(url=url):
+                    api._http(Request(url))
+            api._http(Request("https://api.github.com/graphql", data=query, method="POST"))
+            api._http(Request(
+                "https://discord.com/api/v10/channels/321/messages/654/threads",
+                data=b"{}", method="POST",
+            ))
+            with self.assertRaises(ValueError):
+                api._http(Request("https://api.github.com/graphql", data=mutation, method="POST"))
+        self.assertEqual(request.call_count, len(urls) + 2)
 
 
 class CredentialAndStateTests(unittest.TestCase):

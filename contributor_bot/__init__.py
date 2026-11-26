@@ -1,1 +1,1 @@
-"""Thank LiteLLM contributors, and grant Discord roles for merged pull requests."""
+"""Thank LiteLLM contributors, grant Discord roles, and optionally pre-review pull requests."""

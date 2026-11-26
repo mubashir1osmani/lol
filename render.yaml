@@ -8,7 +8,9 @@ services:
     runtime: python
     branch: main
     autoDeployTrigger: 'off'
-    # No package installs or build scripts from PyPI: this bot is stdlib-only.
+    # No package installs: the Friday worker stays on the standard library.
+    # PR pre-review is off here. Enabling it needs litellm (requirements.txt)
+    # and a public HTTPS service. See the README.
     buildCommand: python3 -I -m compileall -q bot.py contributor_bot
     startCommand: python3 bot.py
     # Keeps contributor IDs, PR history, and pending announcements on redeploy.
