@@ -20,8 +20,15 @@ from .review_job import handle_channel_message, handle_thread_message
 from .store import Store
 
 
-PRESENCE_REVIEW = "for PR reviews"
-PRESENCE_ROUNDUP = "LiteLLM contributors"
+DEFAULT_BOT_STATUS_TEXT = "skedaddling 🏃‍♂️"
+ROTATING_BOT_STATUSES = (
+    DEFAULT_BOT_STATUS_TEXT,
+    "squinting at diffs 👀",
+    "herding pull requests 🐑",
+    "cheering on contributors 🎉",
+    "chasing green checks ✅",
+)
+BOT_STATUS_ROTATE_MINUTES = 15
 THREAD_CHANNEL_TYPES = {10, 11, 12}
 
 # Interaction channel objects for threads omit fields discord.py's Thread
@@ -90,13 +97,13 @@ class Gateway:
 
         @client.event
         async def on_ready():
-            watching = PRESENCE_REVIEW if config.pr_review_enabled else PRESENCE_ROUNDUP
+            text = status_texts(config)[0]
             await client.change_presence(
                 status=discord.Status.online,
-                activity=discord.Activity(type=discord.ActivityType.watching, name=watching),
+                activity=status_activity(discord, text),
             )
             self.connected.set()
-            logging.info("Discord gateway connected as %s, watching %s", client.user, watching)
+            logging.info("Discord gateway connected as %s, status %s", client.user, text)
             if self._commands_synced or self._stop.is_set():
                 return
             try:
@@ -154,9 +161,57 @@ class Gateway:
 
         self.loop = asyncio.get_running_loop()
         _start_weekly_task(discord, client, config, store)
+        _start_status_rotation_task(discord, client, config)
         if self._stop.is_set():
             return
         await client.start(config.discord_token)
+
+
+def status_texts(config: Config) -> tuple[str, ...]:
+    """Custom status line(s) for Discord presence. First entry is used on connect."""
+    primary = (getattr(config, "bot_status_text", "") or DEFAULT_BOT_STATUS_TEXT).strip()[:128]
+    if not getattr(config, "bot_status_rotate", False):
+        return (primary,)
+    seen = {primary}
+    ordered = [primary]
+    for candidate in ROTATING_BOT_STATUSES:
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return tuple(ordered)
+
+
+def status_activity(discord, text: str):
+    """Build a Discord CustomActivity for the bot's presence."""
+    return discord.CustomActivity(name=text)
+
+
+def _start_status_rotation_task(discord, client, config: Config) -> None:
+    """Optionally rotate through fun custom statuses when BOT_STATUS_ROTATE=true."""
+    statuses = status_texts(config)
+    if len(statuses) <= 1:
+        return
+    from discord.ext import tasks
+
+    index = {"value": 0}
+
+    @tasks.loop(minutes=BOT_STATUS_ROTATE_MINUTES)
+    async def rotate_status():
+        index["value"] = (index["value"] + 1) % len(statuses)
+        text = statuses[index["value"]]
+        await client.change_presence(
+            status=discord.Status.online,
+            activity=status_activity(discord, text),
+        )
+
+    @rotate_status.before_loop
+    async def wait_until_ready():
+        await client.wait_until_ready()
+
+    try:
+        rotate_status.start()
+    except Exception:
+        logging.exception("Could not start Discord status rotation")
 
 
 def _start_weekly_task(discord, client, config, store) -> None:
@@ -539,9 +594,10 @@ async def sync_guild_commands(tree, discord, config: Config):
         return []
     guild = discord.Object(id=int(config.discord_guild_id))
     synced = await tree.sync(guild=guild)
+    names = ", ".join(getattr(command, "name", str(command)) for command in synced) or "(none)"
     logging.info(
-        "Synced %s slash commands to guild %s. They are available in channels and threads.",
-        len(synced), config.discord_guild_id,
+        "Synced %s slash commands to guild %s (%s). They are available in channels and threads.",
+        len(synced), config.discord_guild_id, names,
     )
     return synced
 

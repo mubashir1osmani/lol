@@ -11,6 +11,7 @@ from .api import (
     fetch_open_pulls_for_author,
     fetch_pull_request,
     fetch_pull_reviews,
+    post_interaction_followup,
 )
 from .config import Config, is_discord_id
 from .oauth import authorize_url
@@ -41,7 +42,7 @@ SLASH_COMMANDS = [
     },
 ]
 
-# Registered only when PR_REVIEW_ENABLED=true, so the role command list stays stable.
+# Registered whenever MERGED_WEEKLY_ENABLED=true and DISCORD_GUILD_ID is set.
 MERGED_SLASH_COMMANDS = [
     {
         "name": "merged-this-week",
@@ -105,7 +106,12 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
     if name == "my-prs":
         return _my_prs(config, store, discord_id, payload.get("token"))
     if name == "merged-this-week":
-        return _merged_preview(config, store)
+        return _merged_preview(
+            config,
+            store,
+            payload.get("token"),
+            application_id=str(payload.get("application_id") or config.discord_application_id or ""),
+        )
     if name in {"review-pr", "recheck"}:
         if not config.pr_review_enabled:
             return _ephemeral("pr pre-review is off on this bot.")
@@ -113,15 +119,59 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
     return _ephemeral("unknown command.")
 
 
-def _merged_preview(config: Config, store: Store) -> dict:
-    """Show the weekly summary without recording the week as posted."""
+def _merged_preview(
+    config: Config,
+    store: Store,
+    interaction_token: object,
+    *,
+    application_id: str = "",
+) -> dict:
+    """Defer immediately, then send the weekly summary without marking the week posted."""
+    if not isinstance(interaction_token, str) or not interaction_token:
+        return _ephemeral("couldn't open that reply. try /merged-this-week again.")
+    app_id = application_id or (config.discord_application_id or "")
+    threading.Thread(
+        target=_finish_merged_preview,
+        args=(config, store, interaction_token, app_id),
+        name="merged-this-week",
+        daemon=True,
+    ).start()
+    return {"type": 5, "data": {"flags": _EPHEMERAL}}
+
+
+def _finish_merged_preview(config: Config, store: Store, interaction_token: str, application_id: str) -> None:
+    from .weekly import WeeklyFetchError, build_weekly_chunks
+
     try:
-        from .weekly import build_weekly
-        text = build_weekly(config, store)
+        chunks = build_weekly_chunks(config, store, pace=False)
+    except WeeklyFetchError as error:
+        logging.warning("Weekly merge preview GitHub fetch failed: %s", error)
+        if error.rate_limited:
+            chunks = [
+                "github search rate limit hit while loading this week's merges. "
+                "set GITHUB_TOKEN or try again in a minute."
+            ]
+        else:
+            chunks = ["couldn't load this week's merges from github. try again in a minute."]
     except Exception:
         logging.exception("Could not build the weekly merge preview")
-        return _ephemeral("couldn't load this week's merges. try again in a minute.")
-    return _ephemeral(text[:1900])
+        chunks = ["couldn't load this week's merges. try again in a minute."]
+
+    if not chunks:
+        chunks = ["no community pull requests merged in the last 7 days."]
+    try:
+        edit_original_interaction(application_id, interaction_token, {
+            "content": chunks[0],
+            "allowed_mentions": {"parse": []},
+        })
+        for chunk in chunks[1:]:
+            post_interaction_followup(application_id, interaction_token, {
+                "content": chunk,
+                "flags": _EPHEMERAL,
+                "allowed_mentions": {"parse": []},
+            })
+    except Exception:
+        logging.exception("Could not send the /merged-this-week follow-up")
 
 
 def _link(config: Config, store: Store, discord_id: str) -> dict:
