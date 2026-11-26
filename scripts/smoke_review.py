@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from contributor_bot.ack import EYES, bind_ack_reactions, reset_ack_cache  # noqa: E402
+from contributor_bot.ack import EYES, reset_ack_cache  # noqa: E402
 from contributor_bot.config import Config  # noqa: E402
 from contributor_bot.review_agent import run_review_session  # noqa: E402
 from contributor_bot.review_job import handle_channel_message, handle_thread_message  # noqa: E402
@@ -196,7 +196,7 @@ def _discord_path(number: int) -> None:
     print("\n=== discord fake client ===")
     reset_ack_cache()
     config = _config(0)
-    bind_ack_reactions(config, [("ty", "111111111111111111")])
+    guild = SimpleNamespace(id=333, emojis=[SimpleNamespace(name="ty", id=111111111111111111)])
     directory = tempfile.TemporaryDirectory()
     store = Store(str(Path(directory.name) / "roles.db"))
     discord = {"reactions": [], "posts": [], "threads": []}
@@ -225,6 +225,8 @@ def _discord_path(number: int) -> None:
 
     handle_channel_message(config, store, "321", {
         "id": "654",
+        "guild_id": "333",
+        "_guild": guild,
         "author": {"id": "111", "bot": False},
         "content": f"please review https://github.com/BerriAI/litellm/pull/{number}",
     })
@@ -238,6 +240,8 @@ def _discord_path(number: int) -> None:
         raise SystemExit("discord path did not react with eyes first")
     handle_thread_message(config, store, {
         "id": "8888",
+        "guild_id": "333",
+        "_guild": guild,
         "channel_id": "900",
         "content": "check again",
         "author": {"id": "111", "bot": False},

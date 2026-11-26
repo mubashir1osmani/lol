@@ -325,10 +325,21 @@ class GatewayTests(unittest.TestCase):
         class Intents:
             @staticmethod
             def none():
-                return SimpleNamespace(guilds=False, guild_messages=False, message_content=False, members=False)
+                return SimpleNamespace(
+                    guilds=False,
+                    emojis_and_stickers=False,
+                    guild_messages=False,
+                    message_content=False,
+                    members=False,
+                )
 
         basic = build_intents(SimpleNamespace(Intents=Intents), members=False)
-        self.assertTrue(basic.guilds and basic.guild_messages and basic.message_content)
+        self.assertTrue(
+            basic.guilds
+            and basic.emojis_and_stickers
+            and basic.guild_messages
+            and basic.message_content
+        )
         self.assertFalse(basic.members)
         with_members = build_intents(SimpleNamespace(Intents=Intents), members=True)
         self.assertTrue(with_members.members)
