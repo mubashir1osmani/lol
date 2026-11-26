@@ -124,9 +124,13 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}/reactions/[^/]+/@me", path
     ):
         return True
-    # Deferred slash-command replies. Only the original interaction response.
-    return method == "PATCH" and re.fullmatch(
+    # Deferred slash-command replies: edit @original or post follow-up chunks.
+    if method == "PATCH" and re.fullmatch(
         rf"/api/v10/webhooks/{_SNOWFLAKE}/{_INTERACTION_TOKEN}/messages/@original", path
+    ):
+        return True
+    return method == "POST" and re.fullmatch(
+        rf"/api/v10/webhooks/{_SNOWFLAKE}/{_INTERACTION_TOKEN}", path
     ) is not None
 
 
@@ -510,21 +514,36 @@ def register_guild_commands(application_id: str, guild_id: str, token: str, comm
 
 def edit_original_interaction(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
     """Finish a deferred slash command. Uses the interaction token, not the bot token."""
+    payload = _interaction_message(application_id, interaction_token, message)
+    return _retry_interaction_404(lambda: _edit_original(application_id, interaction_token, payload))
+
+
+def post_interaction_followup(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
+    """Send an additional chunk for a deferred slash command."""
+    payload = _interaction_message(application_id, interaction_token, message)
+    return _retry_interaction_404(lambda: _post_followup(application_id, interaction_token, payload))
+
+
+def _interaction_message(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
     if not is_discord_id(application_id) or not re.fullmatch(_INTERACTION_TOKEN, interaction_token):
         raise ValueError("Unexpected interaction token")
     mentions = message.get("allowed_mentions") or {}
     users = mentions.get("users", [])
     if not isinstance(users, list) or any(not is_discord_id(user_id) for user_id in users):
         raise ValueError("Only explicit Discord user IDs may be mentioned")
-    message = {**message, "allowed_mentions": {"parse": [], "users": users}}
-    try:
-        return _edit_original(application_id, interaction_token, message)
-    except RuntimeError as error:
-        if "HTTP 404" not in str(error):
-            raise
-        # Discord may not have recorded the deferred response yet.
-        time.sleep(0.4)
-        return _edit_original(application_id, interaction_token, message)
+    return {**message, "allowed_mentions": {"parse": [], "users": users}}
+
+
+def _retry_interaction_404(action):
+    for delay in (0.4, 0.8):
+        try:
+            return action()
+        except RuntimeError as error:
+            if "HTTP 404" not in str(error):
+                raise
+            # Discord may not have recorded the deferred response yet.
+            time.sleep(delay)
+    return action()
 
 
 def _edit_original(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
@@ -532,6 +551,18 @@ def _edit_original(application_id: str, interaction_token: str, message: dict[st
         f"{DISCORD_API}/webhooks/{application_id}/{interaction_token}/messages/@original",
         data=json.dumps(message).encode("utf-8"),
         method="PATCH",
+        headers={"Content-Type": "application/json", "User-Agent": "litellm-contributor-discord-bot"},
+    ))
+    if not isinstance(response, dict) or not is_discord_id(response.get("id")):
+        raise RuntimeError("Discord did not return an interaction follow-up")
+    return response
+
+
+def _post_followup(application_id: str, interaction_token: str, message: dict[str, Any]) -> dict[str, Any]:
+    response = _request_json(Request(
+        f"{DISCORD_API}/webhooks/{application_id}/{interaction_token}",
+        data=json.dumps(message).encode("utf-8"),
+        method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "litellm-contributor-discord-bot"},
     ))
     if not isinstance(response, dict) or not is_discord_id(response.get("id")):

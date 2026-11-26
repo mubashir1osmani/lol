@@ -163,6 +163,188 @@ class WeeklyTests(unittest.TestCase):
         self.assertTrue(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
         self.assertFalse(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
 
+    def test_merged_this_week_defers_and_splits_long_summary_without_marking_posted(self):
+        import asyncio
+        from types import SimpleNamespace
+        from contributor_bot.gateway import _dispatch_command, commands_for_guild
+        from contributor_bot.interactions import handle_interaction
+        from contributor_bot.weekly import weekly_chunks
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        config = Config(
+            "token", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            merged_weekly_enabled=True,
+            oss_contributors_channel_id="",
+        )
+        self.assertIn("merged-this-week", [cmd["name"] for cmd in commands_for_guild(config)])
+
+        # Build >4500 chars of merged PRs across many contributors to force multi-chunk output.
+        items = [
+            {
+                "number": 1000 + i,
+                "title": f"feat(provider-{i}): add streaming tool-call metrics and fallback handling for region {i}",
+                "html_url": f"https://github.com/BerriAI/litellm/pull/{1000 + i}",
+                "user": {"login": f"contrib-{i:02d}", "type": "User", "id": 500 + i},
+            }
+            for i in range(45)
+        ]
+
+        edits = []
+        followups = []
+        deferred = []
+
+        class _InlineThread:
+            def __init__(self, target=None, args=(), kwargs=None, **_rest):
+                self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
+
+            def start(self):
+                self._target(*self._args, **self._kwargs)
+
+        class _FakeResponse:
+            def __init__(self):
+                self.done = False
+
+            def is_done(self):
+                return self.done
+
+            async def defer(self, *, ephemeral=False):
+                self.done = True
+                deferred.append(ephemeral)
+
+            async def send_message(self, content, *, ephemeral=False):
+                self.done = True
+                raise AssertionError(f"expected defer, got immediate message: {content}")
+
+        interaction = SimpleNamespace(
+            guild_id=333,
+            application_id=444,
+            channel_id=123,
+            token="tokentokentoken",
+            user=SimpleNamespace(id=111),
+            data={"name": "merged-this-week", "options": []},
+            channel=SimpleNamespace(id=123, type=SimpleNamespace(value=0), parent_id=None),
+            guild=None,
+            message=None,
+            extras={},
+            response=_FakeResponse(),
+            followup=SimpleNamespace(send=None),
+        )
+
+        with mock.patch("contributor_bot.interactions.threading.Thread", _InlineThread), \
+                mock.patch("contributor_bot.weekly.github_get_json", return_value={"items": items}), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
+                mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
+            asyncio.run(_dispatch_command(None, interaction, config, store))
+
+        self.assertEqual(deferred, [True])
+        self.assertEqual(len(edits), 1)
+        self.assertGreaterEqual(len(followups), 2)
+        all_chunks = [edits[0][2]["content"]] + [call[2]["content"] for call in followups]
+        for chunk in all_chunks:
+            self.assertLessEqual(len(chunk), 1900)
+            # Never split inside a markdown link.
+            self.assertEqual(chunk.count("["), chunk.count("]"))
+        self.assertTrue(all(call[2].get("flags") == 64 for call in followups))
+        # Preview must NOT mark the week posted in SQLite.
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", week_key(datetime.now(timezone.utc))))
+
+        # Direct handle_interaction returns type 5 immediately (defer).
+        started = []
+        with mock.patch("contributor_bot.interactions.threading.Thread") as thread_cls:
+            response = handle_interaction(config, store, {
+                "type": 2,
+                "guild_id": "333",
+                "application_id": "444",
+                "channel_id": "123",
+                "token": "tokentokentoken",
+                "member": {"user": {"id": "111"}},
+                "data": {"name": "merged-this-week", "options": []},
+            })
+            started.append(thread_cls.called)
+        self.assertEqual(response, {"type": 5, "data": {"flags": 64}})
+        self.assertEqual(started, [True])
+
+        # Huge summary capped at max_chunks gets a clean footer under the limit.
+        huge_groups = [
+            {
+                "login": f"dev-{i:03d}",
+                "discord_id": None,
+                "pulls": [{"number": i, "title": "fix " + ("x" * 90), "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
+            }
+            for i in range(120)
+        ]
+        capped = weekly_chunks(
+            huge_groups,
+            since=datetime(2026, 11, 19, tzinfo=timezone.utc),
+            limit=1900,
+            max_chunks=3,
+            show_maintainer_hint=True,
+        )
+        self.assertEqual(len(capped), 3)
+        for chunk in capped:
+            self.assertLessEqual(len(chunk), 1900)
+        self.assertIn("more contributors", capped[-1])
+        self.assertIn("MAINTAINER_GITHUB_LOGINS", capped[-1])
+
+    def test_merged_this_week_handles_github_rate_limit_and_optional_guild_config(self):
+        from contributor_bot.api import TransientAPIError
+        from contributor_bot.config import get_config
+        from contributor_bot.interactions import _finish_merged_preview
+
+        # Even with roles and PR review off, DISCORD_GUILD_ID / APPLICATION_ID are kept for /merged-this-week.
+        cfg = get_config({
+            "DISCORD_BOT_TOKEN": "token",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+            "ANNOUNCEMENTS_CHANNEL_ID": "456",
+            "DISCORD_GUILD_ID": "333",
+            "DISCORD_APPLICATION_ID": "444",
+        })
+        self.assertEqual(cfg.discord_guild_id, "333")
+        self.assertEqual(cfg.discord_application_id, "444")
+        self.assertEqual(cfg.oss_contributors_channel_id, "123")
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+
+        edits = []
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=TransientAPIError("rate limited")), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)):
+            _finish_merged_preview(cfg, store, "tokentokentoken", "444")
+        self.assertEqual(len(edits), 1)
+        self.assertIn("rate limit", edits[0][2]["content"].lower())
+        self.assertIn("GITHUB_TOKEN", edits[0][2]["content"])
+
+        # Rate limit on page 2 returns page 1 rows plus a note instead of failing.
+        page1 = {
+            "items": [
+                {
+                    "number": i,
+                    "title": f"fix {i}",
+                    "html_url": f"https://github.com/BerriAI/litellm/pull/{i}",
+                    "user": {"login": "octocat", "type": "User", "id": 5},
+                }
+                for i in range(1, 101)
+            ]
+        }
+        edits.clear()
+        followups = []
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=[page1, TransientAPIError("rate limited")]), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
+                mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
+            _finish_merged_preview(cfg, store, "tokentokentoken", "444")
+        combined = "\n".join([edits[0][2]["content"]] + [call[2]["content"] for call in followups])
+        self.assertIn("**octocat**", combined)
+        self.assertIn("rate limit", combined.lower())
+
 
 class SampleRoutingTests(unittest.TestCase):
     def test_sample_table_uses_the_mock(self):

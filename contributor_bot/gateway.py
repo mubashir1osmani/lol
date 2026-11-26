@@ -539,9 +539,10 @@ async def sync_guild_commands(tree, discord, config: Config):
         return []
     guild = discord.Object(id=int(config.discord_guild_id))
     synced = await tree.sync(guild=guild)
+    names = ", ".join(getattr(command, "name", str(command)) for command in synced) or "(none)"
     logging.info(
-        "Synced %s slash commands to guild %s. They are available in channels and threads.",
-        len(synced), config.discord_guild_id,
+        "Synced %s slash commands to guild %s (%s). They are available in channels and threads.",
+        len(synced), config.discord_guild_id, names,
     )
     return synced
 
