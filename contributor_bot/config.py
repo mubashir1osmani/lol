@@ -121,6 +121,8 @@ class Config:
     decision_reply_threshold: float = 0.7
     fast_model: str = "anthropic/claude-haiku-4-5"
     discord_members_intent: bool = False
+    bot_status_text: str = "skedaddling 🏃‍♂️"
+    bot_status_rotate: bool = False
 
     @property
     def scope(self) -> dict[str, str]:
@@ -252,6 +254,8 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         decision_reply_threshold=_threshold(values),
         fast_model=values.get("REVIEW_FAST_MODEL", "").strip() or "anthropic/claude-haiku-4-5",
         discord_members_intent=members_intent,
+        bot_status_text=(values.get("BOT_STATUS_TEXT", "").strip() or "skedaddling 🏃‍♂️")[:128],
+        bot_status_rotate=_flag(values, "BOT_STATUS_ROTATE", False),
     )
 
 

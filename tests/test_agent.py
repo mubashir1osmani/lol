@@ -12,13 +12,16 @@ from unittest import mock
 
 from contributor_bot.config import Config, get_config
 from contributor_bot.gateway import (
-    PRESENCE_REVIEW,
+    DEFAULT_BOT_STATUS_TEXT,
+    ROTATING_BOT_STATUSES,
     build_intents,
     commands_for_guild,
     interaction_place,
     message_is_thread,
     should_sync_guild_commands,
     start_gateway,
+    status_activity,
+    status_texts,
     stop_gateway,
     thread_payload,
     tree_handles,
@@ -343,7 +346,42 @@ class GatewayTests(unittest.TestCase):
         self.assertFalse(basic.members)
         with_members = build_intents(SimpleNamespace(Intents=Intents), members=True)
         self.assertTrue(with_members.members)
-        self.assertEqual(PRESENCE_REVIEW, "for PR reviews")
+        self.assertEqual(DEFAULT_BOT_STATUS_TEXT, "skedaddling 🏃‍♂️")
+
+    def test_custom_status_activity_config_and_rotation(self):
+        base_env = {
+            "DISCORD_BOT_TOKEN": "token",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+            "ANNOUNCEMENTS_CHANNEL_ID": "456",
+        }
+        default_cfg = get_config(base_env)
+        self.assertEqual(default_cfg.bot_status_text, "skedaddling 🏃‍♂️")
+        self.assertFalse(default_cfg.bot_status_rotate)
+        self.assertEqual(status_texts(default_cfg), ("skedaddling 🏃‍♂️",))
+
+        custom_cfg = get_config(base_env | {
+            "BOT_STATUS_TEXT": "shipping prs 🚀",
+            "BOT_STATUS_ROTATE": "true",
+        })
+        self.assertEqual(custom_cfg.bot_status_text, "shipping prs 🚀")
+        self.assertTrue(custom_cfg.bot_status_rotate)
+        texts = status_texts(custom_cfg)
+        self.assertEqual(texts[0], "shipping prs 🚀")
+        self.assertGreater(len(texts), 1)
+        self.assertEqual(len(texts), len(set(texts)))
+        for item in ROTATING_BOT_STATUSES:
+            self.assertIn(item, texts)
+
+        with self.assertRaises(ValueError):
+            get_config(base_env | {"BOT_STATUS_ROTATE": "maybe"})
+
+        class FakeCustomActivity:
+            def __init__(self, *, name):
+                self.name = name
+
+        activity = status_activity(SimpleNamespace(CustomActivity=FakeCustomActivity), default_cfg.bot_status_text)
+        self.assertIsInstance(activity, FakeCustomActivity)
+        self.assertEqual(activity.name, "skedaddling 🏃‍♂️")
 
     def test_missing_discord_py_stays_offline(self):
         config = Config("token", "123", "456")

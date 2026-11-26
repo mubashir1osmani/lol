@@ -246,9 +246,11 @@ want that comment on the repository.
 
 ## Discord gateway
 
-The bot connects to the Discord gateway with discord.py, so it shows as online.
-With PR review enabled the presence is **Watching for PR reviews**. Otherwise
-it is **Watching LiteLLM contributors**.
+The bot connects to the Discord gateway with discord.py, so it shows as online
+with a custom status (`discord.CustomActivity`) of **skedaddling 🏃‍♂️**. Set
+`BOT_STATUS_TEXT` to override the status text, and optionally set
+`BOT_STATUS_ROTATE=true` to rotate through a handful of fun statuses every 15
+minutes.
 
 Required intents in the Developer Portal:
 
