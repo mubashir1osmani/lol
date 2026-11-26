@@ -15,8 +15,10 @@ from .api import (
 )
 from .backfill import backfill_merged_pulls
 from .config import get_config, is_discord_id, load_dotenv
-from .interactions import SLASH_COMMANDS
+from .interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS
 from .poller import poll_once, preview_roundup
+from .review_job import poll_review_channels
+from .store import Store
 from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
 from .signatures import ed25519_public_key_ok
@@ -130,6 +132,12 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.once:
         poll_once(config)
+        if config.pr_review_enabled:
+            store = Store(config.roles_db_path)
+            try:
+                poll_review_channels(config, store)
+            finally:
+                store.close()
         return
     server = start_contributor_roles(config)
     stop_event = threading.Event()
@@ -141,7 +149,7 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     try:
-        _run_loop(config, stop_event)
+        _run_loop(config, stop_event, getattr(server, "store", None) if server is not None else None)
     finally:
         if server is not None:
             stop_http_server(server)
@@ -154,30 +162,36 @@ def run_backfill(config) -> None:
 
 
 def start_contributor_roles(config):
-    """Listen for webhooks and interactions when contributor roles are enabled.
+    """Listen for webhooks and interactions when roles or PR pre-review are enabled.
 
     A failure here does not stop the Friday thank-you loop.
     """
-    if not config.contributor_roles_enabled:
+    if not config.contributor_roles_enabled and not config.pr_review_enabled:
         return None
     server = None
     try:
         server = start_http_server(config)
     except OSError as error:
-        logging.error("Contributor roles HTTP server failed to start: %s", error)
-    try:
-        register_guild_commands(
-            config.discord_application_id or "",
-            config.discord_guild_id or "",
-            config.discord_token,
-            SLASH_COMMANDS,
-        )
-        logging.info("Registered contributor slash commands in guild %s", config.discord_guild_id)
-    except Exception:
-        logging.exception(
-            "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
-            "that the bot invite includes applications.commands, and that the bot is in the server."
-        )
+        logging.error("Contributor HTTP server failed to start: %s", error)
+    commands = []
+    if config.contributor_roles_enabled:
+        commands.extend(SLASH_COMMANDS)
+    if config.pr_review_enabled:
+        commands.extend(REVIEW_SLASH_COMMANDS)
+    if commands:
+        try:
+            register_guild_commands(
+                config.discord_application_id or "",
+                config.discord_guild_id or "",
+                config.discord_token,
+                commands,
+            )
+            logging.info("Registered slash commands in guild %s", config.discord_guild_id)
+        except Exception:
+            logging.exception(
+                "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
+                "that the bot invite includes applications.commands, and that the bot is in the server."
+            )
     if not ed25519_public_key_ok(config.discord_public_key or ""):
         logging.error(
             "DISCORD_PUBLIC_KEY is not a valid Ed25519 point. "
@@ -186,15 +200,21 @@ def start_contributor_roles(config):
     if not config.github_token:
         logging.warning(
             "GITHUB_TOKEN is unset. Merge webhooks can still record pull requests, "
-            "but file lists, backfill, and /my-prs may hit anonymous GitHub rate limits."
+            "but file lists, backfill, /my-prs, and PR pre-review may hit anonymous GitHub rate limits."
         )
-    if not config.role_announcements_channel_id:
+    if config.pr_review_enabled:
+        logging.info(
+            "PR pre-review is on for %s using %s. The bot only posts in Discord.",
+            ", ".join(config.review_channel_ids), config.review_model,
+        )
+    if config.contributor_roles_enabled and not config.role_announcements_channel_id:
         logging.warning("ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; new roles will be granted without a #shipped post")
     return server
 
 
-def _run_loop(config, stop_event: threading.Event) -> None:
-    if not config.announcements_enabled:
+def _run_loop(config, stop_event: threading.Event, store=None) -> None:
+    reviews = bool(config.pr_review_enabled and store is not None)
+    if not config.announcements_enabled and not reviews:
         logging.info(
             "Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false). "
             "Use --preview-channel-id for a no-ping weekly preview. "
@@ -202,21 +222,30 @@ def _run_loop(config, stop_event: threading.Event) -> None:
         )
         stop_event.wait()
         return
-    logging.info(
-        "Weekly contributor roundup: Friday %s %s, destination %s",
-        config.roundup_time, config.roundup_timezone, config.announcements_channel_id,
-    )
+    if config.announcements_enabled:
+        logging.info(
+            "Weekly contributor roundup: Friday %s %s, destination %s",
+            config.roundup_time, config.roundup_timezone, config.announcements_channel_id,
+        )
+    if config.pr_review_enabled and not reviews:
+        logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
     while not stop_event.is_set():
         delay = config.poll_interval_seconds
-        try:
-            poll_once(config)
-            window = load_state(config)["weekly"]
-            if window:
-                remaining = (parse_time(window["end"]) - datetime.now(UTC)).total_seconds()
-                if remaining > 0:
-                    delay = min(delay, remaining)
-        except TransientAPIError as error:
-            logging.warning("Contributor check deferred: %s", error)
-        except Exception:
-            logging.exception("Contributor check failed")
+        if config.announcements_enabled:
+            try:
+                poll_once(config)
+                window = load_state(config)["weekly"]
+                if window:
+                    remaining = (parse_time(window["end"]) - datetime.now(UTC)).total_seconds()
+                    if remaining > 0:
+                        delay = min(delay, remaining)
+            except TransientAPIError as error:
+                logging.warning("Contributor check deferred: %s", error)
+            except Exception:
+                logging.exception("Contributor check failed")
+        if reviews:
+            try:
+                poll_review_channels(config, store)
+            except Exception:
+                logging.exception("PR review poll failed")
         stop_event.wait(delay)

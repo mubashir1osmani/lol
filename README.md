@@ -12,8 +12,10 @@ Every **Friday at 9:00 AM America/Toronto**, combine contributors from the
 > We appreciate everything you do to help build LiteLLM!
 
 Names and PR numbers are clickable. Confirmed Discord accounts are tagged;
-otherwise the GitHub username is credited. No release announcements, support
-threads, LLM calls, or third-party Python dependencies.
+otherwise the GitHub username is credited. The weekly roundup does not post
+release announcements, open support threads, or call an LLM, and it has no
+third-party dependencies. Contributor roles and PR pre-review are separate
+features and stay off until their own flags are set.
 
 ## Exactly who is included?
 
@@ -241,6 +243,106 @@ a role once when a linked account newly qualifies.
 author has not linked Discord, inviting them to run `/link-github`. The GitHub
 token then needs permission to write issue comments. Leave this off unless you
 want that comment on the repository.
+
+## PR pre-review
+
+People ask for reviews on `BerriAI/litellm` faster than one maintainer can read
+them. With `PR_REVIEW_ENABLED=true` the bot pre-reviews a pull request in a
+Discord thread so the maintainer sees it after the automated reviewers are
+clean. It stays off by default, and turning it on does not change the Friday
+roundup.
+
+The bot only posts in Discord. It does not approve, merge, or comment on GitHub.
+
+It starts a public thread when either of these happens:
+
+- a human message in `REVIEW_CHANNEL_IDS` contains a `BerriAI/litellm` pull
+  request URL (set `REVIEW_REQUIRE_ASK=true` to also require a review ask such
+  as "please review" or "ptal")
+- someone runs `/review-pr <url>` in one of those channels
+
+One thread per pull request. A later link or `/review-pr` reuses it.
+`/recheck` inside that thread runs the gate again. The first time the bot
+watches a channel it does not backfill old messages.
+
+Optional `REVIEW_WEBHOOK_RECHECK=true` also re-checks a pull request the bot
+already has a thread for, when GitHub sends `pull_request` `synchronize` or
+`ready_for_review`, or `pull_request_review` `submitted`. New GitHub events do
+not open threads by themselves.
+
+Each run is rate-limited per pull request (`REVIEW_COOLDOWN_SECONDS`, default
+600, minimum 30). That applies to `/recheck` and to webhook updates.
+
+### What the thread says
+
+The gate uses the GitHub API:
+
+- review comments, reviews, and (via GraphQL) whether a review thread is
+  resolved or outdated
+- check runs and commit statuses
+- merge conflicts and draft state
+
+Configured bot logins default to the accounts that currently review
+`BerriAI/litellm` (seen on recent pull requests such as #54722):
+
+| Bot | GitHub login | How it shows up |
+| --- | --- | --- |
+| Cursor Bugbot | `cursor[bot]` | review body contains `<!-- BUGBOT_REVIEW -->`; stale passes contain `BUGBOT_REVIEW_STALE` |
+| Greptile | `greptile-apps[bot]` | inline comments and a summary |
+| Veria | `veria-ai[bot]` | inline comments and a summary |
+
+Override the list with `REVIEW_BOT_LOGINS` if a login changes. A pull request
+is **ready for maintainer ✅** only when every configured bot has reviewed the
+latest commit, none of them have an unresolved current thread, CI is green,
+the pull request is not a draft, and GitHub says it is mergeable. Anything
+else is **needs work** with the specific items. The linked Discord account
+for the GitHub author (from `/link-github`) is tagged. `REVIEW_MAINTAINER_ROLE_ID`
+is pinged only on a ready verdict. Make that role mentionable, or the ping is
+silent.
+
+A written review uses `litellm.completion` and `REVIEW_MODEL` (for example
+`openai/gpt-4o-mini`). Large diffs are split on file boundaries, capped, and
+the model is told what it did not see. The note covers what the pull request
+does, risks, missing tests, and a short checklist. If the SDK or the model
+call fails, the gate still posts. Provider credentials are the normal LiteLLM
+environment variables (`OPENAI_API_KEY`, and so on). They are not given new
+names here.
+
+Messages stay within Discord's 2000-character limit by splitting on line
+breaks.
+
+### Setup
+
+1. Install the optional dependency and set the model key the provider expects:
+   `pip install -r requirements.txt`. The Friday worker's build does not do
+   this. A process that serves reviews needs that install, plus
+   `python3 bot.py` on a public HTTPS port (the same web service as
+   contributor roles is enough). Do not run two pollers on one state file.
+2. Set `PR_REVIEW_ENABLED=true`, `REVIEW_MODEL`, and `REVIEW_CHANNEL_IDS`
+   (comma-separated channel snowflakes). Set `DISCORD_GUILD_ID`,
+   `DISCORD_APPLICATION_ID`, and `DISCORD_PUBLIC_KEY` if contributor roles
+   are not already configured. The interactions endpoint is the same URL:
+   `https://<public-host>/discord/interactions`.
+3. Invite the bot with the `bot` and `applications.commands` scopes. In the
+   review channels grant **View Channel**, **Read Message History**,
+   **Send Messages**, **Create Public Threads**, and **Send Messages in
+   Threads**. In the Developer Portal enable the **Message Content** intent.
+   Slash commands registered for the guild are `/review-pr` and `/recheck`
+   (plus the role commands, when those are enabled).
+4. `GITHUB_TOKEN` should be able to read pull requests, reviews, and checks
+   on `BerriAI/litellm`. Anonymous access works until the rate limit.
+   GraphQL is used only to read review-thread resolution. The token does not
+   need permission to write, approve, or merge.
+5. Restart, then paste a pull request URL in a review channel or run
+   `/review-pr`. The thread should show either `ready for maintainer ✅` or
+   `needs work`.
+6. For webhook re-checks, set `REVIEW_WEBHOOK_RECHECK=true` and
+   `GITHUB_WEBHOOK_SECRET` (already required when contributor roles are on).
+   On the existing GitHub webhook, keep **Pull requests** and also send
+   **Pull request reviews**. Payload URL and HMAC check are unchanged.
+
+`PR_REVIEW_ENABLED=false` leaves channels, slash commands, and webhooks
+exactly as they were.
 
 ## Checks
 

@@ -1,1 +1,4 @@
-# Python standard library only; no third-party dependencies.
+# The Friday roundup and contributor roles use the Python standard library only.
+# PR pre-review (PR_REVIEW_ENABLED) imports litellm when a review runs.
+# CI allows this one package and still rejects anything else.
+litellm==1.111.0

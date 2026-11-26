@@ -10,6 +10,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .roles import DEFAULT_ROLE_NAMES, ROLE_ID_ENV, ROLE_KEYS, ROLE_NAME_ENV
 
+# Same accounts as reviews.DEFAULT_REVIEW_BOTS. Kept here so config does not
+# import the review modules (those import the poller, which imports config).
+_DEFAULT_REVIEW_BOTS = ("cursor[bot]", "greptile-apps[bot]", "veria-ai[bot]")
+
 
 def load_dotenv(path: str = ".env") -> None:
     """Load a conventional KEY=VALUE .env file without dependencies."""
@@ -80,6 +84,14 @@ class Config:
     role_ids: dict[str, str] = field(default_factory=dict)
     role_names: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_NAMES))
     backfill_since: str = "2023-01-01T00:00:00+00:00"
+    pr_review_enabled: bool = False
+    review_channel_ids: tuple[str, ...] = ()
+    review_model: str = ""
+    review_bot_logins: tuple[str, ...] = ()
+    review_maintainer_role_id: str | None = None
+    review_cooldown_seconds: int = 600
+    review_webhook_recheck: bool = False
+    review_require_ask: bool = False
 
     @property
     def scope(self) -> dict[str, str]:
@@ -132,7 +144,15 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         raise ValueError("ANNOUNCEMENTS_ENABLED must be true or false")
 
     roles_enabled = _flag(values, "CONTRIBUTOR_ROLES_ENABLED", False)
+    review_enabled = _flag(values, "PR_REVIEW_ENABLED", False)
     role_settings = _role_settings(values) if roles_enabled else None
+    review_settings = _review_settings(values) if review_enabled else None
+    shared = role_settings or review_settings
+    webhook_secret = None
+    if role_settings is not None:
+        webhook_secret = role_settings["github_webhook_secret"]
+    elif review_settings is not None:
+        webhook_secret = review_settings.get("github_webhook_secret")
 
     return Config(
         discord_token=token,
@@ -147,23 +167,31 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         roundup_timezone=timezone,
         roundup_time=roundup_time,
         contributor_roles_enabled=roles_enabled,
-        discord_guild_id=None if role_settings is None else role_settings["discord_guild_id"],
-        discord_application_id=None if role_settings is None else role_settings["discord_application_id"],
-        discord_public_key=None if role_settings is None else role_settings["discord_public_key"],
+        discord_guild_id=None if shared is None else shared["discord_guild_id"],
+        discord_application_id=None if shared is None else shared["discord_application_id"],
+        discord_public_key=None if shared is None else shared["discord_public_key"],
         github_oauth_client_id=None if role_settings is None else role_settings["github_oauth_client_id"],
         github_oauth_client_secret=None if role_settings is None else role_settings["github_oauth_client_secret"],
-        github_webhook_secret=None if role_settings is None else role_settings["github_webhook_secret"],
+        github_webhook_secret=webhook_secret,
         github_oauth_redirect_uri=None if role_settings is None else role_settings["github_oauth_redirect_uri"],
         role_announcements_channel_id=None if role_settings is None else role_settings["role_announcements_channel_id"],
         discord_invite_url=None if role_settings is None else role_settings["discord_invite_url"],
         pr_comment_invites_enabled=False if role_settings is None else role_settings["pr_comment_invites_enabled"],
         merge_shoutouts_enabled=True if role_settings is None else role_settings["merge_shoutouts_enabled"],
-        http_host="0.0.0.0" if role_settings is None else role_settings["http_host"],
-        http_port=8080 if role_settings is None else role_settings["http_port"],
+        http_host="0.0.0.0" if shared is None else shared["http_host"],
+        http_port=8080 if shared is None else shared["http_port"],
         roles_db_path=values.get("ROLES_DB_PATH", "").strip() or ".data/contributor_roles.db",
         role_ids={} if role_settings is None else role_settings["role_ids"],
         role_names=dict(DEFAULT_ROLE_NAMES) if role_settings is None else role_settings["role_names"],
         backfill_since="2023-01-01T00:00:00+00:00" if role_settings is None else role_settings["backfill_since"],
+        pr_review_enabled=review_enabled,
+        review_channel_ids=() if review_settings is None else review_settings["review_channel_ids"],
+        review_model="" if review_settings is None else review_settings["review_model"],
+        review_bot_logins=() if review_settings is None else review_settings["review_bot_logins"],
+        review_maintainer_role_id=None if review_settings is None else review_settings["review_maintainer_role_id"],
+        review_cooldown_seconds=600 if review_settings is None else review_settings["review_cooldown_seconds"],
+        review_webhook_recheck=False if review_settings is None else review_settings["review_webhook_recheck"],
+        review_require_ask=False if review_settings is None else review_settings["review_require_ask"],
     )
 
 
@@ -204,7 +232,7 @@ def _iso_timestamp(name: str, value: str) -> str:
     return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
-def _role_settings(values: dict[str, str]) -> dict:
+def _discord_application(values: dict[str, str]) -> dict[str, str]:
     guild_id = values.get("DISCORD_GUILD_ID", "").strip()
     application_id = values.get("DISCORD_APPLICATION_ID", "").strip()
     if not is_discord_id(guild_id):
@@ -214,6 +242,14 @@ def _role_settings(values: dict[str, str]) -> dict:
     public_key = values.get("DISCORD_PUBLIC_KEY", "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", public_key):
         raise ValueError("DISCORD_PUBLIC_KEY must be a 64-character hex Ed25519 public key")
+    return {
+        "discord_guild_id": guild_id,
+        "discord_application_id": application_id,
+        "discord_public_key": public_key,
+    }
+
+
+def _http_bind(values: dict[str, str]) -> tuple[str, int]:
     port_text = values.get("HTTP_PORT", "").strip() or values.get("PORT", "").strip() or "8080"
     try:
         port = int(port_text)
@@ -224,6 +260,66 @@ def _role_settings(values: dict[str, str]) -> dict:
     host = values.get("HTTP_HOST", "").strip() or "0.0.0.0"
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,253}", host):
         raise ValueError("HTTP_HOST is not a valid bind address")
+    return host, port
+
+
+def _review_bots(values: dict[str, str]) -> tuple[str, ...]:
+    raw = values.get("REVIEW_BOT_LOGINS", "").strip() or ",".join(_DEFAULT_REVIEW_BOTS)
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts or any(not re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", part) for part in parts):
+        raise ValueError("REVIEW_BOT_LOGINS must be comma-separated GitHub logins")
+    ordered: list[str] = []
+    for part in parts:
+        login = part.lower()
+        if login not in ordered:
+            ordered.append(login)
+    return tuple(ordered)
+
+
+def _review_settings(values: dict[str, str]) -> dict:
+    app = _discord_application(values)
+    host, port = _http_bind(values)
+    raw_channels = values.get("REVIEW_CHANNEL_IDS", "").strip()
+    if not raw_channels:
+        raise ValueError("REVIEW_CHANNEL_IDS must list at least one Discord channel ID")
+    channels = [part.strip() for part in raw_channels.split(",") if part.strip()]
+    if not channels or any(not is_discord_id(channel) for channel in channels):
+        raise ValueError("REVIEW_CHANNEL_IDS must be comma-separated Discord channel IDs")
+    if len(set(channels)) != len(channels):
+        raise ValueError("REVIEW_CHANNEL_IDS must be distinct")
+    model = values.get("REVIEW_MODEL", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", model):
+        raise ValueError("REVIEW_MODEL must be a LiteLLM model name, like openai/gpt-4o-mini")
+    role_id = values.get("REVIEW_MAINTAINER_ROLE_ID", "").strip()
+    if role_id and not is_discord_id(role_id):
+        raise ValueError("REVIEW_MAINTAINER_ROLE_ID must be a Discord role ID")
+    cooldown_text = values.get("REVIEW_COOLDOWN_SECONDS", "").strip() or "600"
+    if not re.fullmatch(r"[0-9]+", cooldown_text):
+        raise ValueError("REVIEW_COOLDOWN_SECONDS must be a positive number of seconds")
+    cooldown = int(cooldown_text)
+    if not 30 <= cooldown <= 86400:
+        raise ValueError("REVIEW_COOLDOWN_SECONDS must be between 30 and 86400")
+    webhook_recheck = _flag(values, "REVIEW_WEBHOOK_RECHECK", False)
+    settings = {
+        **app,
+        "http_host": host,
+        "http_port": port,
+        "review_channel_ids": tuple(channels),
+        "review_model": model,
+        "review_bot_logins": _review_bots(values),
+        "review_maintainer_role_id": role_id or None,
+        "review_cooldown_seconds": cooldown,
+        "review_webhook_recheck": webhook_recheck,
+        "review_require_ask": _flag(values, "REVIEW_REQUIRE_ASK", False),
+    }
+    if webhook_recheck:
+        settings["github_webhook_secret"] = _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8)
+    return settings
+
+
+def _role_settings(values: dict[str, str]) -> dict:
+    app = _discord_application(values)
+    host, port = _http_bind(values)
     channel = values.get("ROLE_ANNOUNCEMENTS_CHANNEL_ID", "").strip()
     if channel and not is_discord_id(channel):
         raise ValueError("ROLE_ANNOUNCEMENTS_CHANNEL_ID must be a Discord channel ID")
@@ -253,9 +349,7 @@ def _role_settings(values: dict[str, str]) -> dict:
     if db_path == ":memory:" or "\x00" in db_path:
         raise ValueError("ROLES_DB_PATH must be a file path")
     return {
-        "discord_guild_id": guild_id,
-        "discord_application_id": application_id,
-        "discord_public_key": public_key,
+        **app,
         "github_oauth_client_id": _secret("GITHUB_OAUTH_CLIENT_ID", values, minimum=8),
         "github_oauth_client_secret": _secret("GITHUB_OAUTH_CLIENT_SECRET", values, minimum=8),
         "github_webhook_secret": _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8),

@@ -69,6 +69,23 @@ CREATE TABLE IF NOT EXISTS backfill_windows (
     completed_at TEXT NOT NULL,
     PRIMARY KEY (repository, window_start, window_end)
 );
+
+CREATE TABLE IF NOT EXISTS review_threads (
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_reviewed_at TEXT,
+    head_sha TEXT,
+    PRIMARY KEY (repository, number)
+);
+
+CREATE TABLE IF NOT EXISTS review_cursors (
+    channel_id TEXT PRIMARY KEY,
+    last_message_id TEXT NOT NULL
+);
 """
 
 
@@ -388,6 +405,98 @@ class Store:
                 (repository, window_start, window_end, completed_at),
             )
             self._conn.commit()
+
+    def review_cursor(self, channel_id: str) -> str | None:
+        if not is_discord_id(channel_id):
+            raise ValueError("Invalid Discord channel id")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_message_id FROM review_cursors WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+        return row["last_message_id"] if row else None
+
+    def set_review_cursor(self, channel_id: str, message_id: str) -> None:
+        if not is_discord_id(channel_id) or not is_discord_id(message_id):
+            raise ValueError("Invalid Discord message id")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO review_cursors (channel_id, last_message_id) VALUES (?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET last_message_id = excluded.last_message_id
+                """,
+                (channel_id, message_id),
+            )
+            self._conn.commit()
+
+    def review_thread(self, repository: str, number: int) -> dict | None:
+        self._review_key(repository, number)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM review_threads WHERE repository = ? AND number = ?",
+                (repository, number),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def review_thread_by_discord(self, thread_id: str) -> dict | None:
+        if not is_discord_id(thread_id):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM review_threads WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_review_thread(
+        self,
+        *,
+        repository: str,
+        number: int,
+        channel_id: str,
+        message_id: str,
+        thread_id: str,
+        created_at: str,
+    ) -> None:
+        self._review_key(repository, number)
+        if not all(is_discord_id(value) for value in (channel_id, message_id, thread_id)):
+            raise ValueError("Invalid Discord id for a review thread")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO review_threads (
+                    repository, number, channel_id, message_id, thread_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repository, number) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    thread_id = excluded.thread_id
+                """,
+                (repository, number, channel_id, message_id, thread_id, created_at),
+            )
+            self._conn.commit()
+
+    def mark_review_done(self, repository: str, number: int, reviewed_at: str, head_sha: str) -> None:
+        self._review_key(repository, number)
+        if not re.fullmatch(r"[0-9a-f]{40}", head_sha or ""):
+            head_sha = ""
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE review_threads SET last_reviewed_at = ?, head_sha = ?
+                WHERE repository = ? AND number = ?
+                """,
+                (reviewed_at, head_sha or None, repository, number),
+            )
+            self._conn.commit()
+
+    @staticmethod
+    def _review_key(repository: str, number: int) -> None:
+        if not _REPO.fullmatch(repository) or not isinstance(number, int) or number <= 0:
+            raise ValueError("Invalid pull request")
+
+
+_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
 def _pull_dict(row: sqlite3.Row) -> dict:
