@@ -1,5 +1,6 @@
-"""Ack reactions and the Discord path that posts a verdict after them."""
+"""Ack reactions, lazy per-guild emoji resolution, and the Discord verdict path."""
 
+import asyncio
 import inspect
 import tempfile
 import threading
@@ -15,14 +16,16 @@ from contributor_bot.ack import (
     TY_EMOJI_NAMES,
     acknowledge_message,
     apply_reactions,
-    bind_ack_reactions,
     parse_ack_reactions,
     reset_ack_cache,
     resolve_ack_reactions,
+    resolve_reactions_for_guild,
+    resolve_reactions_for_guild_async,
 )
 from contributor_bot.config import Config, get_config
-from contributor_bot.review_agent import tool_submit_verdict
+from contributor_bot.gateway import _message_payload
 from contributor_bot.interactions import handle_interaction
+from contributor_bot.review_agent import tool_submit_verdict
 from contributor_bot.review_job import handle_channel_message, handle_thread_message
 from contributor_bot.store import Store
 import contributor_bot.review_job as review_job
@@ -43,6 +46,21 @@ def _config(**overrides):
     return replace(config, **overrides) if overrides else config
 
 
+class _FakeGuild:
+    def __init__(self, guild_id: int, emojis=(), fetched=(), *, on_fetch=None):
+        self.id = guild_id
+        self.emojis = tuple(emojis)
+        self._fetched = list(fetched)
+        self._on_fetch = on_fetch
+        self.fetch_calls = 0
+
+    async def fetch_emojis(self):
+        self.fetch_calls += 1
+        if self._on_fetch is not None:
+            self._on_fetch()
+        return list(self._fetched)
+
+
 class AckResolutionTests(unittest.TestCase):
     def tearDown(self):
         reset_ack_cache()
@@ -53,11 +71,6 @@ class AckResolutionTests(unittest.TestCase):
         api, line = resolve_ack_reactions(None, [])
         self.assertEqual(api, (EYES, FALLBACK_TY))
         self.assertIn("fallback; no guild emoji named ty, litellm_ty, thankyou, thank_you", line)
-        with self.assertLogs(level="INFO") as fallback_logs:
-            bound = bind_ack_reactions(_config(ack_reactions=None), [])
-        self.assertEqual(bound, (EYES, FALLBACK_TY))
-        self.assertIn("🙏 (fallback;", "\n".join(fallback_logs.output))
-        reset_ack_cache()
 
         guild_ty = [SimpleNamespace(name="TY", id=111111111111111111)]
         api, line = resolve_ack_reactions(None, guild_ty)
@@ -74,35 +87,131 @@ class AckResolutionTests(unittest.TestCase):
         self.assertEqual(api, (EYES, "ThankYou:333333333333333333"))
         self.assertIn("ThankYou:333333333333333333 (thankyou)", line)
 
-    def test_ack_reactions_env_resolves_bare_ty_name(self):
-        guild = [SimpleNamespace(name="ty", id=444444444444444444)]
+    def test_empty_cache_falls_back_to_fetch_emojis_and_caches_with_ttl(self):
+        now = {"t": 100.0}
+        guild = _FakeGuild(
+            333,
+            emojis=(),
+            fetched=[
+                SimpleNamespace(name="shipit", id=999999999999999999),
+                SimpleNamespace(name="TY", id=444444444444444444),
+            ],
+        )
+        config = _config(ack_reactions=None)
+        with self.assertLogs(level="INFO") as logs:
+            first = asyncio.run(
+                resolve_reactions_for_guild_async(
+                    config, guild, ttl_seconds=60.0, clock=lambda: now["t"]
+                )
+            )
+            second = asyncio.run(
+                resolve_reactions_for_guild_async(
+                    config, guild, ttl_seconds=60.0, clock=lambda: now["t"] + 30.0
+                )
+            )
+        self.assertEqual(first, (EYES, "TY:444444444444444444"))
+        self.assertEqual(second, (EYES, "TY:444444444444444444"))
+        self.assertEqual(guild.fetch_calls, 1)
+
+        joined = "\n".join(logs.output)
+        self.assertEqual(joined.count("Guild 333 emojis"), 1)
+        self.assertIn("Guild 333 emojis (2): shipit, TY", joined)
+        self.assertIn("TY:444444444444444444 (ty)", joined)
+
+        # Past TTL, fetch_emojis runs again and sees updated emojis.
+        guild._fetched = [SimpleNamespace(name="litellm_ty", id=555555555555555555)]
+        now["t"] = 161.0
+        refreshed = asyncio.run(
+            resolve_reactions_for_guild_async(
+                config, guild, ttl_seconds=60.0, clock=lambda: now["t"]
+            )
+        )
+        self.assertEqual(refreshed, (EYES, "litellm_ty:555555555555555555"))
+        self.assertEqual(guild.fetch_calls, 2)
+
+        # Another guild has an independent cache entry and logs its own emoji list.
+        other = _FakeGuild(777, emojis=(), fetched=[SimpleNamespace(name="party", id=888888888888888888)])
+        with self.assertLogs(level="INFO") as other_logs:
+            fallback = asyncio.run(
+                resolve_reactions_for_guild_async(
+                    config, other, ttl_seconds=60.0, clock=lambda: now["t"]
+                )
+            )
+        self.assertEqual(fallback, (EYES, FALLBACK_TY))
+        self.assertEqual(other.fetch_calls, 1)
+        other_joined = "\n".join(other_logs.output)
+        self.assertIn("Guild 777 emojis (1): party", other_joined)
+        self.assertIn("🙏 (fallback;", other_joined)
+
+    def test_populated_guild_cache_skips_fetch_emojis(self):
+        guild = _FakeGuild(
+            333,
+            emojis=[SimpleNamespace(name="ty", id=111111111111111111)],
+            fetched=[SimpleNamespace(name="wrong", id=222222222222222222)],
+        )
+        with self.assertLogs(level="INFO") as logs:
+            chosen = resolve_reactions_for_guild(_config(ack_reactions=None), guild)
+        self.assertEqual(chosen, (EYES, "ty:111111111111111111"))
+        self.assertEqual(guild.fetch_calls, 0)
+        self.assertIn("Guild 333 emojis (1): ty", "\n".join(logs.output))
+
+    def test_ack_reactions_env_resolves_bare_ty_name_with_empty_cache_fallback(self):
         parsed = parse_ack_reactions("👀,ty")
         self.assertEqual(parsed, ("👀", "ty"))
-        api, line = resolve_ack_reactions(parsed, guild)
-        self.assertEqual(api, (EYES, "ty:444444444444444444"))
-        self.assertIn("ty:444444444444444444 (ty)", line)
-        bound = bind_ack_reactions(_config(ack_reactions=parsed), guild)
-        self.assertEqual(bound, (EYES, "ty:444444444444444444"))
+        guild = _FakeGuild(
+            333,
+            emojis=(),
+            fetched=[SimpleNamespace(name="ty", id=444444444444444444)],
+        )
+        chosen = asyncio.run(resolve_reactions_for_guild_async(_config(ack_reactions=parsed), guild))
+        self.assertEqual(chosen, (EYES, "ty:444444444444444444"))
+        self.assertEqual(guild.fetch_calls, 1)
 
-        custom, _line = resolve_ack_reactions(("👀", "<:wave:333333333333333333>", "TY"), guild)
+        custom, _line = resolve_ack_reactions(("👀", "<:wave:333333333333333333>", "TY"), guild._fetched)
         self.assertEqual(custom, (EYES, "wave:333333333333333333", "ty:444444444444444444"))
 
-    def test_explicit_list_rejects_a_broken_entry_and_logs_once(self):
+    def test_fetch_emojis_bridges_onto_running_gateway_loop(self):
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            loop.run_forever()
+
+        thread = threading.Thread(target=run_loop, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=2))
+        seen_loops = []
+        guild = _FakeGuild(
+            333,
+            emojis=(),
+            fetched=[SimpleNamespace(name="ty", id=123123123123123123)],
+            on_fetch=lambda: seen_loops.append(asyncio.get_running_loop()),
+        )
+        reacted = []
+        try:
+            with mock.patch(
+                "contributor_bot.ack.add_reaction",
+                side_effect=lambda _c, _m, emoji, _t: reacted.append(emoji),
+            ):
+                apply_reactions(_config(), "321", "654", guild=guild, loop=loop)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+            loop.close()
+
+        self.assertEqual(seen_loops, [loop])
+        self.assertEqual(reacted, [EYES, "ty:123123123123123123"])
+
+    def test_explicit_list_rejects_a_broken_entry(self):
         with self.assertRaises(ValueError):
             parse_ack_reactions("👀,,ty")
         with self.assertRaises(ValueError):
             parse_ack_reactions("<:not-an-emoji>")
-        config = _config(ack_reactions=None)
-        with self.assertLogs(level="INFO") as logs:
-            bind_ack_reactions(config, [("ty", "111111111111111111")])
-            bind_ack_reactions(config, [("ty", "111111111111111111")])
-        joined = "\n".join(logs.output)
-        self.assertEqual(joined.count("Ack reactions:"), 1)
-        self.assertIn("ty:111111111111111111", joined)
 
     def test_a_forbidden_reaction_does_not_stop_the_next_one(self):
-        reset_ack_cache()
-        bind_ack_reactions(_config(), [("ty", "111111111111111111")])
+        guild = _FakeGuild(333, emojis=[SimpleNamespace(name="ty", id=111111111111111111)])
         seen = []
 
         def react(channel_id, message_id, emoji, token):
@@ -111,8 +220,25 @@ class AckResolutionTests(unittest.TestCase):
                 raise RuntimeError("discord.com returned HTTP 403")
 
         with mock.patch("contributor_bot.ack.add_reaction", side_effect=react):
-            apply_reactions(_config(), "321", "654")
+            apply_reactions(_config(), "321", "654", guild=guild)
         self.assertEqual(seen, [EYES, "ty:111111111111111111"])
+
+    def test_message_payload_carries_guild_and_loop(self):
+        guild = _FakeGuild(333)
+        sentinel_loop = object()
+        message = SimpleNamespace(
+            id=654,
+            reference=None,
+            content="hello",
+            webhook_id=None,
+            author=SimpleNamespace(id=111, bot=False),
+            channel=SimpleNamespace(id=321),
+            guild=guild,
+        )
+        payload = _message_payload(message, loop=sentinel_loop)
+        self.assertEqual(payload["guild_id"], "333")
+        self.assertIs(payload["_guild"], guild)
+        self.assertIs(payload["_loop"], sentinel_loop)
 
 
 class DiscordAckFlowTests(unittest.TestCase):
@@ -123,7 +249,6 @@ class DiscordAckFlowTests(unittest.TestCase):
         self.store = Store(str(Path(self.directory.name) / "roles.db"))
         self.addCleanup(self.store.close)
         self.config = _config(review_classify=False)
-        bind_ack_reactions(self.config, [("ty", "111111111111111111")])
 
     def tearDown(self):
         reset_ack_cache()
@@ -133,8 +258,13 @@ class DiscordAckFlowTests(unittest.TestCase):
             if thread.name == "ack-react":
                 thread.join(timeout=2)
 
-    def test_review_request_reacts_then_posts_a_verdict_in_a_thread(self):
+    def test_review_request_reacts_via_fetch_emojis_then_posts_a_verdict_in_a_thread(self):
         discord = SimpleNamespace(reactions=[], posts=[], threads=[])
+        guild = _FakeGuild(
+            333,
+            emojis=(),
+            fetched=[SimpleNamespace(name="ty", id=111111111111111111)],
+        )
 
         def add_reaction(channel_id, message_id, emoji, token):
             discord.reactions.append((channel_id, message_id, emoji))
@@ -162,6 +292,8 @@ class DiscordAckFlowTests(unittest.TestCase):
 
         message = {
             "id": "654",
+            "guild_id": "333",
+            "_guild": guild,
             "author": {"id": "111", "bot": False},
             "content": "please review https://github.com/BerriAI/litellm/pull/12",
         }
@@ -182,6 +314,7 @@ class DiscordAckFlowTests(unittest.TestCase):
             for thread in threading.enumerate():
                 if thread.name == "pr-review":
                     thread.join(timeout=3)
+        self.assertEqual(guild.fetch_calls, 1)
         self.assertEqual([item[2] for item in discord.reactions], [
             EYES, "ty:111111111111111111",
         ])
@@ -199,8 +332,8 @@ class DiscordAckFlowTests(unittest.TestCase):
         )
         order = []
 
-        def note(*args):
-            if args[-1]:
+        def note(_config, _channel_id, message_id, **_kwargs):
+            if message_id:
                 order.append("react")
 
         with mock.patch("contributor_bot.review_job.acknowledge_message", side_effect=note), \
@@ -274,9 +407,9 @@ class AcknowledgeStartsBeforeTheAgentTests(unittest.TestCase):
 
         reset_ack_cache()
         config = _config()
-        bind_ack_reactions(config, [])
+        guild = _FakeGuild(333, emojis=[SimpleNamespace(name="ty", id=111111111111111111)])
         with mock.patch("contributor_bot.ack.add_reaction", side_effect=react):
-            acknowledge_message(config, "321", "654")
+            acknowledge_message(config, "321", "654", guild=guild)
             self.assertTrue(started.wait(timeout=2))
             release.set()
             for thread in threading.enumerate():

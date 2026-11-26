@@ -317,8 +317,13 @@ custom `ty` emoji before the agent runs. `ACK_REACTIONS` is a comma-separated
 list of unicode emoji, `<:name:id>`, `name:id`, or a guild emoji name (for
 example `ACK_REACTIONS=👀,ty`). Unset, it uses 👀 plus the first guild emoji
 matching `ty`, `litellm_ty`, `thankyou`, or `thank_you` (case-insensitive). If
-none of those names exist, it falls back to 🙏 and logs the fallback. The
-resolved list is logged once at startup. Slash
+none of those names exist, it falls back to 🙏 and logs the fallback. Reactions
+are resolved lazily at reaction time from `message.guild.emojis` (the gateway
+enables `Intents.emojis_and_stickers` so discord.py caches guild emojis), and
+fall back to `await guild.fetch_emojis()` cached per guild with a 5-minute TTL
+if the guild cache is empty. On the first resolution for a guild, the bot logs
+the guild id, emoji count, all visible emoji names, and the resolved reactions.
+Slash
 commands with no source message are not reacted to. Reactions are best-effort
 and need **Add Reactions** in addition to **Read Message History**.
 

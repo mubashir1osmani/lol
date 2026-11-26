@@ -14,7 +14,6 @@ import asyncio
 import logging
 import threading
 
-from .ack import bind_ack_reactions, emoji_index
 from .config import Config
 from .interactions import MERGED_SLASH_COMMANDS, REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
 from .review_job import handle_channel_message, handle_thread_message
@@ -74,8 +73,6 @@ class Gateway:
                 "discord.py is not installed, so the bot stays offline and uses REST. "
                 "pip install -r requirements.txt to show it online."
             )
-            if config.pr_review_enabled:
-                bind_ack_reactions(config, [])
             return
         try:
             asyncio.run(self._serve(discord, config, store))
@@ -100,10 +97,6 @@ class Gateway:
             )
             self.connected.set()
             logging.info("Discord gateway connected as %s, watching %s", client.user, watching)
-            try:
-                bind_ack_reactions(config, _guild_emojis(client, config.discord_guild_id))
-            except Exception:
-                logging.exception("Could not resolve ack reactions")
             if self._commands_synced or self._stop.is_set():
                 return
             try:
@@ -129,7 +122,7 @@ class Gateway:
             if store is None:
                 return
             try:
-                payload = _message_payload(message)
+                payload = _message_payload(message, loop=self.loop)
             except Exception:
                 logging.exception("Could not read a Discord message")
                 return
@@ -157,7 +150,7 @@ class Gateway:
             name = data.get("name") if isinstance(data, dict) else None
             if tree_handles(tree, name, interaction.guild_id):
                 return
-            await _dispatch_command(discord, interaction, config, store)
+            await _dispatch_command(discord, interaction, config, store, client=client)
 
         self.loop = asyncio.get_running_loop()
         _start_weekly_task(discord, client, config, store)
@@ -208,9 +201,10 @@ def _start_worker(target, args, name: str) -> None:
 
 
 def build_intents(discord, *, members: bool):
-    """Guilds, guild messages, and message content. Members only when requested."""
+    """Guilds, guild emojis/stickers, guild messages, and message content. Members only when requested."""
     intents = discord.Intents.none()
     intents.guilds = True
+    intents.emojis_and_stickers = True
     intents.guild_messages = True
     intents.message_content = True
     if members:
@@ -388,9 +382,9 @@ def message_is_thread(message, store: Store | None) -> bool:
     return store.review_thread_by_discord(channel_id) is not None
 
 
-def _message_payload(message) -> dict:
+def _message_payload(message, *, loop=None) -> dict:
     author = message.author
-    return {
+    payload = {
         "id": str(message.id),
         "type": 19 if message.reference else 0,
         "content": message.content or "",
@@ -398,9 +392,18 @@ def _message_payload(message) -> dict:
         "author": {"id": str(author.id), "bot": bool(author.bot)},
         "channel_id": message_channel_id(message),
     }
+    guild = getattr(message, "guild", None)
+    if guild is not None:
+        guild_id = getattr(guild, "id", None)
+        if guild_id is not None:
+            payload["guild_id"] = str(guild_id)
+        payload["_guild"] = guild
+    if loop is not None:
+        payload["_loop"] = loop
+    return payload
 
 
-def _interaction_payload(interaction) -> dict:
+def _interaction_payload(interaction, *, guild=None, loop=None) -> dict:
     data = interaction.data or {}
     options = []
     for option in data.get("options") or []:
@@ -437,26 +440,30 @@ def _interaction_payload(interaction) -> dict:
     message_id = getattr(message, "id", None) if message is not None else None
     if message_id:
         payload["message"] = {"id": str(message_id)}
+    resolved_guild = guild if guild is not None else getattr(interaction, "guild", None)
+    if resolved_guild is not None:
+        payload["_guild"] = resolved_guild
+    if loop is not None:
+        payload["_loop"] = loop
     return payload
 
 
-def _guild_emojis(client, guild_id: str | None):
-    """Custom emoji on the configured guild. Empty when the guild is not cached yet."""
-    guild = None
-    if guild_id and hasattr(client, "get_guild"):
-        try:
-            guild = client.get_guild(int(guild_id))
-        except (TypeError, ValueError):
-            guild = None
-    return emoji_index(getattr(guild, "emojis", ()) if guild is not None else ())
-
-
-async def _dispatch_command(discord, interaction, config: Config, store: Store | None) -> None:
+async def _dispatch_command(discord, interaction, config: Config, store: Store | None, *, client=None) -> None:
     try:
         if store is None:
             await interaction.response.send_message("this bot isn't ready for commands yet.", ephemeral=True)
             return
-        response = handle_interaction(config, store, _interaction_payload(interaction))
+        guild = getattr(interaction, "guild", None)
+        if guild is None and client is not None and getattr(interaction, "guild_id", None) and hasattr(client, "get_guild"):
+            try:
+                guild = client.get_guild(int(interaction.guild_id))
+            except (TypeError, ValueError):
+                guild = None
+        response = handle_interaction(
+            config,
+            store,
+            _interaction_payload(interaction, guild=guild, loop=asyncio.get_running_loop()),
+        )
         data = response.get("data") or {}
         content = data.get("content") or "ok"
         ephemeral = bool(data.get("flags", 0) & 64)
@@ -498,7 +505,7 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
     if config.contributor_roles_enabled:
         for spec in SLASH_COMMANDS:
             async def callback(interaction):
-                await _dispatch_command(discord, interaction, config, store)
+                await _dispatch_command(discord, interaction, config, store, client=client)
 
             callback.__name__ = spec["name"].replace("-", "_")
             add(spec, callback)
@@ -507,12 +514,12 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
         review_spec = next(spec for spec in REVIEW_SLASH_COMMANDS if spec["name"] == "review-pr")
 
         async def recheck(interaction):
-            await _dispatch_command(discord, interaction, config, store)
+            await _dispatch_command(discord, interaction, config, store, client=client)
 
         add(recheck_spec, recheck)
 
         async def review_pr(interaction, url: str):
-            await _dispatch_command(discord, interaction, config, store)
+            await _dispatch_command(discord, interaction, config, store, client=client)
 
         described = app.describe(url=review_spec["options"][0]["description"])(review_pr)
         add(review_spec, described)
@@ -520,7 +527,7 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
         spec = MERGED_SLASH_COMMANDS[0]
 
         async def merged_this_week(interaction):
-            await _dispatch_command(discord, interaction, config, store)
+            await _dispatch_command(discord, interaction, config, store, client=client)
 
         add(spec, merged_this_week)
     return tree

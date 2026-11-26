@@ -218,7 +218,7 @@ def _review_command(config: Config, store: Store, payload: dict) -> dict:
     )
     if not numbers:
         return _ephemeral("that isn't a berriai/litellm pull request url.")
-    acknowledge_message(config, channel_id, _source_message_id(payload))
+    _ack(config, channel_id, _source_message_id(payload), payload)
     number = numbers[0]
     record = store.review_thread(config.github_repository, number)
     if record:
@@ -313,6 +313,19 @@ def recheck_followup_text(result: dict) -> str:
     return detail or "couldn't recheck. try again in a bit."
 
 
+def _ack(config: Config, channel_id: object, message_id: object, source: dict | None = None) -> None:
+    if not isinstance(source, dict):
+        acknowledge_message(config, channel_id, message_id)
+        return
+    guild = source.get("_guild")
+    guild_id = source.get("guild_id")
+    loop = source.get("_loop")
+    if guild is None and not guild_id and loop is None:
+        acknowledge_message(config, channel_id, message_id)
+        return
+    acknowledge_message(config, channel_id, message_id, guild=guild, guild_id=guild_id, loop=loop)
+
+
 def _source_message_id(payload: dict) -> str | None:
     """A slash command can name a message. Most do not, and then there is nothing to react to."""
     message = payload.get("message")
@@ -325,7 +338,7 @@ def _recheck_command(config: Config, store: Store, payload: dict) -> dict:
     record = review_record_for_command(config, store, payload)
     if not record:
         return _ephemeral("run /recheck inside a pr review thread.")
-    acknowledge_message(config, payload.get("channel_id"), _source_message_id(payload))
+    _ack(config, payload.get("channel_id"), _source_message_id(payload), payload)
     remaining = cooldown_remaining(record, config.review_cooldown_seconds, datetime.now(UTC))
     if remaining:
         minutes = max(1, (remaining + 59) // 60)
@@ -438,7 +451,7 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
     text = message.get("content") or ""
     message_id = message.get("id")
     if wants_recheck(text):
-        acknowledge_message(config, channel_id, message_id)
+        _ack(config, channel_id, message_id, message)
         perform_review(config, store, number, source="recheck")
         return
     remaining = cooldown_remaining(
@@ -451,10 +464,10 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
         return
     day = datetime.now(UTC).date().isoformat()
     if not store.claim_daily_run(day, config.review_daily_run_budget):
-        acknowledge_message(config, channel_id, message_id)
+        _ack(config, channel_id, message_id, message)
         _post(channel_id, config.discord_token, "ran out of budget for today. try again tomorrow.")
         return
-    acknowledge_message(config, channel_id, message_id)
+    _ack(config, channel_id, message_id, message)
     try:
         history = history_text(fetch_recent_messages(channel_id, config.discord_token, limit=15))
     except Exception:
@@ -475,7 +488,7 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
     asked, numbers = message_decision(config, message)
     message_id = str(message.get("id") or "")
     if asked and not numbers:
-        acknowledge_message(config, channel_id, message_id)
+        _ack(config, channel_id, message_id, message)
         _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
         return
     planned = []
@@ -489,7 +502,7 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
         planned.append((number, record))
     if not planned:
         return
-    acknowledge_message(config, channel_id, message_id)
+    _ack(config, channel_id, message_id, message)
     for number, record in planned:
         if record:
             _spawn(lambda number=number: perform_review(config, store, number, source="recheck"))
@@ -513,7 +526,7 @@ def _answer_if_decided(config: Config, channel_id: str, message: dict) -> None:
     )
     if not decision.reply:
         return
-    acknowledge_message(config, channel_id, message.get("id"))
+    _ack(config, channel_id, message.get("id"), message)
     from .questions import answer_question
     answer_question(
         config, channel_id, message.get("content") or "",
