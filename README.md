@@ -262,9 +262,17 @@ the portal too, or set `DISCORD_MEMBERS_INTENT=false` so the gateway can still
 connect. Role assignment itself uses REST and does not need the members intent.
 
 Slash commands are delivered over the gateway when the Interactions Endpoint
-URL is empty. Leave it empty unless you want HTTP interactions. The HTTP server
-still handles GitHub webhooks and GitHub OAuth. If the endpoint URL is set,
-Discord sends interactions there and the existing HTTP handler answers them.
+URL is empty. Leave it empty unless you want HTTP interactions. On connect the
+bot syncs its slash commands to the guild with discord.py's command tree, which
+is what makes `/recheck` and `/review-pr` show up in channels and in threads.
+An empty tree is not synced, so a failed sync cannot wipe commands that were
+already registered. The HTTP server still handles GitHub webhooks and GitHub
+OAuth. If the endpoint URL is set, Discord sends interactions there and the
+existing HTTP handler answers them. `/recheck` only works inside a review
+thread. The parent channel does not have to be in `REVIEW_CHANNEL_IDS`. The
+bot defers the interaction before the agent run and edits that reply when the
+run finishes, including the cooldown and daily-budget notes. A plain message
+such as `check again` in the thread starts the same recheck.
 
 If discord.py is not installed, the process logs a warning, stays offline, and
 keeps the Friday roundup on REST. Channel review messages are polled only while
@@ -277,15 +285,22 @@ them. With `PR_REVIEW_ENABLED=true` an agent pre-reviews a pull request in a
 Discord thread. It stays off by default, and turning it on does not change who
 the Friday roundup thanks.
 
-The agent calls `litellm.completion` with tools and loops until the model stops.
-`REVIEW_AGENT_MAX_TOKENS`, `REVIEW_AGENT_MAX_STEPS`, and `REVIEW_DAILY_RUN_BUDGET`
-are unlimited when unset, empty, or `0`. A positive number is a cap. Steps still
-stop at 50 so a tool loop cannot run forever, even when the step budget is
-unlimited or set higher. Each model call may use up to 8192 output tokens, which
-Anthropic needs in order to finish a tool call. Tool results are truncated per
-call, and a context-window error trims those results and retries instead of
-failing the run. `REVIEW_AGENT_TIMEOUT_SECONDS` defaults to 600. `0` means no
-wall-time cap. A run that does hit a cap you set posts `ran out of budget`.
+The agent runs on the OpenAI Agents SDK (`openai-agents`) through
+`LitellmModel`, so `REVIEW_MODEL=anthropic/claude-sonnet-4-5` still uses
+`ANTHROPIC_API_KEY` (or whichever provider key LiteLLM expects). Message
+classification stays a small `litellm.completion` call and does not need the
+Agents SDK. `REVIEW_AGENT_MAX_TOKENS`, `REVIEW_AGENT_MAX_STEPS`, and
+`REVIEW_DAILY_RUN_BUDGET` are unlimited when unset, empty, or `0`. A positive
+number is a cap. Steps still stop at 50 (`max_turns`) so a tool loop cannot
+run forever, even when the step budget is unlimited or set higher. Each model
+call may use up to 8192 output tokens, which Anthropic needs in order to
+finish a tool call. Tool results are truncated to valid JSON per call. If the
+provider still reports a context-window error, the run retries once with
+shorter tool results. `REVIEW_AGENT_TIMEOUT_SECONDS` defaults to 600. `0`
+means no wall-time cap. A run that does hit a cap you set posts `ran out of
+budget`. OpenAI tracing is off unless `OPENAI_API_KEY` is set or
+`REVIEW_AGENT_TRACING=true`. Set `REVIEW_AGENT_TRACING=false` to force it off
+even when that key is present.
 
 Tools are read-only on GitHub: pull request metadata, the file list, one file's
 diff, a full file at the pull request head or base, code search in this
@@ -310,7 +325,9 @@ Set `REVIEW_CLASSIFY_MESSAGES=false` to go back to URL detection, plus
 `REVIEW_REQUIRE_ASK=true` if the message must also ask for a review.
 
 Inside that thread the agent answers follow-ups ("why is this a bug?").
-"i fixed it, check again" runs another review, still under the per-PR cooldown.
+`check again`, `recheck`, `fixed it`, `pushed a fix`, or `updated the pr`
+runs another review, still under the per-PR cooldown. `/recheck` does the
+same thing from the slash-command menu inside the thread.
 
 ### How a thread goes
 
@@ -357,7 +374,7 @@ unless `REVIEW_DAILY_RUN_BUDGET` is a positive number.
 
 The deploy is a Render **web service**. Build command
 `pip install -r requirements.txt`. Start command `python3 bot.py`. That
-installs discord.py and litellm. Do not run two pollers on one state file.
+installs discord.py, litellm, and the OpenAI Agents SDK. Do not run two pollers on one state file.
 Set the provider key the model expects (`OPENAI_API_KEY`, and so on).
 
 1. Enable **Guilds**, **Guild Messages**, and **Message Content** on the bot.

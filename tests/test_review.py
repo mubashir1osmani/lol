@@ -15,7 +15,7 @@ from urllib.request import Request
 from contributor_bot import api, review_github
 from contributor_bot.config import Config, get_config
 from contributor_bot.interactions import REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
-from contributor_bot.review_agent import Completion, ToolCall
+from contributor_bot.review_agent import tool_submit_verdict
 from contributor_bot.review_github import Snapshot, gather_snapshot
 from contributor_bot.review_job import handle_channel_message, perform_review, poll_review_channels, schedule_webhook_recheck
 from contributor_bot.review_llm import chunk_diff, complete_litellm, parse_review_json, run_llm_review
@@ -355,6 +355,56 @@ class LlmAndGithubMockTests(unittest.TestCase):
             self.assertIsNone(review_github._threads("BerriAI/litellm", 12, "token"))
 
 
+def _fake_sdk(on_run):
+    """A stand-in for the Agents SDK. Tests never import openai-agents."""
+    calls = {"n": 0, "model": None, "settings": {}}
+
+    class LitellmModel:
+        def __init__(self, model, **kwargs):
+            calls["model"] = model
+
+    class ModelSettings:
+        def __init__(self, **kwargs):
+            calls["settings"] = kwargs
+
+    class Agent:
+        def __init__(self, **kwargs):
+            calls["instructions"] = kwargs.get("instructions")
+
+    class Runner:
+        @staticmethod
+        async def run(agent, incoming, context=None, max_turns=None, hooks=None):
+            calls["n"] += 1
+            calls["max_turns"] = max_turns
+            on_run(context)
+            return type("Result", (), {"final_output": "done"})()
+
+    def function_tool(func=None, **kwargs):
+        def deco(fn):
+            return fn
+        if callable(func):
+            return deco(func)
+        return deco
+
+    class RunHooks:
+        pass
+
+    class RunContextWrapper:
+        pass
+
+    sdk = type("SDK", (), {})()
+    sdk.Agent = Agent
+    sdk.Runner = Runner
+    sdk.ModelSettings = ModelSettings
+    sdk.LitellmModel = LitellmModel
+    sdk.function_tool = function_tool
+    sdk.RunContextWrapper = RunContextWrapper
+    sdk.RunHooks = RunHooks
+    sdk.MaxTurnsExceeded = type("MaxTurnsExceeded", (Exception,), {})
+    sdk.set_tracing_disabled = lambda disabled: calls.__setitem__("tracing_disabled", disabled)
+    return sdk, calls
+
+
 class DiscordPostTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -393,16 +443,10 @@ class DiscordPostTests(unittest.TestCase):
             "checklist": ["run the proxy tests"],
             "blocking": [],
         }
-        calls = {"n": 0}
-
-        def fake_complete(model, messages, tools, timeout=0):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return Completion(None, [ToolCall("1", "submit_verdict", verdict)], 30)
-            return Completion("done", [], 5)
+        sdk, calls = _fake_sdk(lambda context: tool_submit_verdict(context, verdict))
 
         with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._snapshot()) as gather, \
-                mock.patch("contributor_bot.review_agent.complete_with_tools", side_effect=fake_complete) as llm, \
+                mock.patch("contributor_bot.review_agent._load_sdk", return_value=sdk), \
                 mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]), \
                 mock.patch("contributor_bot.review_job.start_public_thread", return_value={"id": "900"}) as thread, \
                 mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post, \
@@ -412,7 +456,9 @@ class DiscordPostTests(unittest.TestCase):
         self.assertEqual(result["status"], "posted")
         self.assertEqual(result["thread_id"], "900")
         gather.assert_called_once()
-        self.assertGreaterEqual(llm.call_count, 1)
+        self.assertGreaterEqual(calls["n"], 1)
+        self.assertEqual(calls["model"], "openai/gpt-4o-mini")
+        self.assertGreaterEqual(calls["settings"]["max_tokens"], 4096)
         thread.assert_called_once()
         comment.assert_not_called()
         contents = [call.args[2]["content"] for call in post.call_args_list]
@@ -432,14 +478,10 @@ class DiscordPostTests(unittest.TestCase):
             reviews=[],
             check_runs=[{"name": "pytest", "status": "completed", "conclusion": "failure"}],
         )
-        def fake_complete(model, messages, tools, timeout=0):
-            if not getattr(fake_complete, "done", False):
-                fake_complete.done = True
-                return Completion(None, [ToolCall("1", "submit_verdict", {"summary": "draft", "blocking": []})], 20)
-            return Completion("done", [], 5)
+        sdk, _calls = _fake_sdk(lambda context: tool_submit_verdict(context, {"summary": "draft", "blocking": []}))
 
         with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=snapshot), \
-                mock.patch("contributor_bot.review_agent.complete_with_tools", side_effect=fake_complete), \
+                mock.patch("contributor_bot.review_agent._load_sdk", return_value=sdk), \
                 mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]), \
                 mock.patch("contributor_bot.review_job.start_public_thread", return_value={"id": "900"}), \
                 mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:

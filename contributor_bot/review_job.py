@@ -7,6 +7,7 @@ repeat work.
 
 import logging
 import threading
+import time
 from datetime import datetime
 
 from .api import (
@@ -263,18 +264,107 @@ def _finish_new_command(config, store, number, channel_id, application_id, token
     edit(result.get("detail") or "couldn't review that pr. try again in a minute.")
 
 
-def _recheck_command(config: Config, store: Store, payload: dict) -> dict:
+def review_record_for_command(config: Config, store: Store, payload: dict) -> dict | None:
+    """The review thread a slash command was used in.
+
+    The channel id is the thread. A parent channel id is not a thread id, and
+    the parent does not have to be listed in REVIEW_CHANNEL_IDS.
+    """
+    channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
     channel_id = payload.get("channel_id")
-    record = store.review_thread_by_discord(channel_id) if is_discord_id(channel_id) else None
+    nested_id = channel.get("id")
+    if channel.get("type") in {10, 11, 12} and is_discord_id(nested_id):
+        channel_id = nested_id
+    if not is_discord_id(channel_id):
+        logging.warning(
+            "/recheck did not include a thread id (channel_id=%s parent_id=%s type=%s)",
+            channel_id, channel.get("parent_id"), channel.get("type"),
+        )
+        return None
+    record = store.review_thread_by_discord(str(channel_id))
     if not record or record["repository"].lower() != config.github_repository.lower():
+        logging.warning(
+            "/recheck channel %s is not a review thread (parent_id=%s type=%s)",
+            channel_id, channel.get("parent_id"), channel.get("type"),
+        )
+        return None
+    return record
+
+
+def recheck_followup_text(result: dict) -> str:
+    """Text for the slash-command follow-up. Cooldown and budget are shown, not only logged."""
+    status = result.get("status")
+    detail = result.get("detail") if isinstance(result.get("detail"), str) else ""
+    thread_id = result.get("thread_id")
+    if status == "posted" and thread_id:
+        return f"updated the review in <#{thread_id}>."
+    if status == "budget":
+        return detail or "ran out of budget for today. try again tomorrow."
+    if status == "cooldown":
+        return detail or "checked recently. try again in a bit."
+    if status == "busy":
+        return detail or "already checking that pr."
+    return detail or "couldn't recheck. try again in a bit."
+
+
+def _recheck_command(config: Config, store: Store, payload: dict) -> dict:
+    record = review_record_for_command(config, store, payload)
+    if not record:
         return _ephemeral("run /recheck inside a pr review thread.")
     remaining = cooldown_remaining(record, config.review_cooldown_seconds, datetime.now(UTC))
     if remaining:
         minutes = max(1, (remaining + 59) // 60)
-        return _ephemeral(f"checked recently. try again in {minutes}m.")
+        detail = f"checked recently. try again in {minutes}m."
+        _post_note(record["thread_id"], config.discord_token, detail, record.get("number"), "cooldown")
+        return _ephemeral(detail)
     number = int(record["number"])
-    _spawn(lambda: perform_review(config, store, number, source="recheck"))
-    return _ephemeral("rechecking. i'll post an update in this thread.")
+    token = payload.get("token") if isinstance(payload.get("token"), str) else ""
+    application_id = str(payload.get("application_id") or "")
+    # Defer first (type 5). The agent run follows up by editing this response,
+    # so Discord gets an ack inside 3 seconds and the user sees the outcome.
+    _spawn(lambda: _finish_recheck(config, store, number, application_id, token))
+    return _defer(ephemeral=True)
+
+
+def _post_note(thread_id: str, token: str, detail: str, number, kind: str) -> None:
+    try:
+        _post(thread_id, token, detail)
+    except Exception:
+        logging.exception("Could not post the /recheck %s note for #%s", kind, number)
+
+
+def _finish_recheck(config, store, number: int, application_id: str, token: str) -> None:
+    try:
+        result = perform_review(config, store, number, source="recheck")
+        detail = recheck_followup_text(result)
+    except Exception:
+        logging.exception("Recheck failed for #%s", number)
+        detail = "couldn't recheck. try again in a bit."
+    _edit_recheck_followup(application_id, token, detail, number)
+
+
+def _edit_recheck_followup(application_id: str, token: str, detail: str, number: int) -> None:
+    if not token:
+        logging.error("No interaction token for the /recheck follow-up on #%s", number)
+        return
+    delay = 0.3
+    for attempt in range(4):
+        try:
+            edit_original_interaction(application_id, token, {
+                "content": detail,
+                "allowed_mentions": {"parse": []},
+            })
+            return
+        except RuntimeError as error:
+            if "HTTP 404" not in str(error) or attempt == 3:
+                logging.exception("Could not send the /recheck follow-up for #%s", number)
+                return
+            # The deferred ack may not be stored yet. Retry so the note is shown.
+            time.sleep(delay)
+            delay *= 2
+        except Exception:
+            logging.exception("Could not send the /recheck follow-up for #%s", number)
+            return
 
 
 def schedule_webhook_recheck(config: Config, store: Store, event: str, payload: dict) -> None:

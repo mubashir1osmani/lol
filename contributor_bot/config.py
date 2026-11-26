@@ -100,6 +100,7 @@ class Config:
     review_daily_run_budget: int = 0
     review_followup_cooldown_seconds: int = 45
     review_classifier_model: str = ""
+    review_agent_tracing: bool | None = None
     discord_members_intent: bool = False
 
     @property
@@ -211,6 +212,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_daily_run_budget=0 if review_settings is None else review_settings["review_daily_run_budget"],
         review_followup_cooldown_seconds=45 if review_settings is None else review_settings["review_followup_cooldown_seconds"],
         review_classifier_model="" if review_settings is None else review_settings["review_classifier_model"],
+        review_agent_tracing=None if review_settings is None else review_settings["review_agent_tracing"],
         discord_members_intent=members_intent,
     )
 
@@ -248,6 +250,17 @@ def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high
     if not low <= number <= high:
         raise ValueError(f"{name} must be between {low} and {high}")
     return number
+
+
+def _optional_flag(values: dict[str, str], name: str) -> bool | None:
+    """Unset or empty means the caller picks. true and false are explicit."""
+    raw = values.get(name)
+    if raw is None or not str(raw).strip():
+        return None
+    value = str(raw).strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true or false")
+    return value == "true"
 
 
 def _flag(values: dict[str, str], name: str, default: bool) -> bool:
@@ -377,6 +390,7 @@ def _review_settings(values: dict[str, str]) -> dict:
         "review_daily_run_budget": _optional_cap(values, "REVIEW_DAILY_RUN_BUDGET"),
         "review_followup_cooldown_seconds": _bounded_int(values, "REVIEW_FOLLOWUP_COOLDOWN_SECONDS", 45, 10, 3600),
         "review_classifier_model": classifier,
+        "review_agent_tracing": _optional_flag(values, "REVIEW_AGENT_TRACING"),
     }
     if webhook_recheck:
         settings["github_webhook_secret"] = _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8)

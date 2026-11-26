@@ -5,12 +5,16 @@ approve, merge, or comment on GitHub, and it cannot ping a maintainer role
 unless submit_verdict has already decided the pull request is ready.
 """
 
+import asyncio
 import base64
+import contextvars
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 
 from .api import GITHUB_API, edit_message, github_get_json, post_message
@@ -46,6 +50,7 @@ SYSTEM_PROMPT = (
     "and CI. Then call submit_verdict exactly once. "
     "submit_verdict decides ready versus needs work. You do not. "
     "A blocking bug you pass in must name a file and, when you know it, a line. "
+    "Pass those bugs as blocking_json, a JSON list of objects with path, line, and reason. "
     "For a follow-up question, answer it with post_message. "
     "Call submit_verdict on a follow-up only when they asked you to check the pull request again. "
     "Do not ping the maintainer role yourself. ping_maintainer refuses unless the verdict is ready."
@@ -235,12 +240,20 @@ def _safe_path(path: object) -> str:
     return path
 
 
-def _json(payload: dict, limit: int = TOOL_RESULT_CHARS) -> str:
+# Lowered for one retry when the provider says the context window is full.
+_TOOL_LIMIT: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "review_tool_result_chars", default=TOOL_RESULT_CHARS,
+)
+
+
+def _json(payload: dict, limit: int | None = None) -> str:
     """JSON tool result. Oversized payloads stay valid JSON with a preview."""
+    if limit is None:
+        limit = _TOOL_LIMIT.get()
     text = redact(json.dumps(payload, ensure_ascii=False))
     if len(text) <= limit:
         return text
-    return json.dumps({"truncated": True, "preview": text[: limit - 80]}, ensure_ascii=False)
+    return json.dumps({"truncated": True, "preview": text[: max(limit - 80, 0)]}, ensure_ascii=False)
 
 
 def _snapshot(ctx: ReviewContext):
@@ -624,7 +637,9 @@ def run_agent_loop(
     """Call the model until it stops requesting tools, or a configured cap runs out.
 
     ``max_steps``, ``max_tokens``, and ``timeout_seconds`` of 0 mean no cap.
-    Steps still stop at ``STEP_SAFETY_CEILING``.
+    Steps still stop at ``STEP_SAFETY_CEILING``. Live reviews go through the
+    Agents SDK. This loop is the same budget and truncation behavior, tested
+    without that package installed.
     """
     start = now()
     tokens = 0
@@ -675,6 +690,252 @@ def run_agent_loop(
     return AgentResult("ran out of budget (steps) before i finished. try /recheck in a bit.", exhausted="steps")
 
 
+class TokenBudgetExceeded(RuntimeError):
+    """The configured token cap was crossed while the model still wanted tools."""
+
+
+def _load_sdk():
+    """Import the Agents SDK only when a review runs. Tests do not install it."""
+    try:
+        from agents import (
+            Agent,
+            MaxTurnsExceeded,
+            ModelSettings,
+            RunContextWrapper,
+            RunHooks,
+            Runner,
+            function_tool,
+            set_tracing_disabled,
+        )
+        from agents.extensions.models.litellm_model import LitellmModel
+    except ImportError as error:
+        raise RuntimeError("openai-agents is not installed") from error
+    return SimpleNamespace(
+        Agent=Agent,
+        Runner=Runner,
+        ModelSettings=ModelSettings,
+        LitellmModel=LitellmModel,
+        function_tool=function_tool,
+        RunContextWrapper=RunContextWrapper,
+        RunHooks=RunHooks,
+        MaxTurnsExceeded=MaxTurnsExceeded,
+        set_tracing_disabled=set_tracing_disabled,
+    )
+
+
+def _configure_tracing(sdk, config) -> None:
+    """Tracing talks to OpenAI. Leave it off unless a key or the flag asks for it."""
+    flag = getattr(config, "review_agent_tracing", None)
+    if flag is True:
+        sdk.set_tracing_disabled(False)
+        return
+    if flag is False or not os.environ.get("OPENAI_API_KEY", "").strip():
+        sdk.set_tracing_disabled(True)
+
+
+def _usage_total(response) -> int:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return 0
+    total = usage.get("total_tokens") if isinstance(usage, dict) else getattr(usage, "total_tokens", None)
+    if isinstance(total, int) and total > 0:
+        return total
+    if isinstance(usage, dict):
+        entered = usage.get("input_tokens") or 0
+        left = usage.get("output_tokens") or 0
+    else:
+        entered = getattr(usage, "input_tokens", 0) or 0
+        left = getattr(usage, "output_tokens", 0) or 0
+    if isinstance(entered, int) and isinstance(left, int):
+        return entered + left
+    return 0
+
+
+def _asks_for_tools(response) -> bool:
+    output = getattr(response, "output", None)
+    if output is None and isinstance(response, dict):
+        output = response.get("output")
+    for item in output or []:
+        kind = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if kind in {"function_call", "tool_call"}:
+            return True
+    return False
+
+
+def _usage_hooks(sdk, limit: int):
+    class _Hooks(sdk.RunHooks):
+        def __init__(self):
+            self.total = 0
+            self.limit = limit
+
+        async def on_llm_end(self, context, agent, response):
+            self.total += _usage_total(response)
+            if self.limit > 0 and self.total > self.limit and _asks_for_tools(response):
+                raise TokenBudgetExceeded()
+
+    return _Hooks()
+
+
+def _as_tool(sdk, name: str, description: str, fn):
+    """Bind a tool. The context annotation has to be the real RunContextWrapper class.
+
+    ``from __future__ import annotations`` would leave it as a string, and the
+    SDK would then send ``ctx`` to the model as a parameter.
+    """
+    fn.__annotations__["ctx"] = sdk.RunContextWrapper
+    fn.__annotations__["return"] = str
+    return sdk.function_tool(
+        name_override=name,
+        description_override=description,
+        strict_mode=False,
+        use_docstring_info=False,
+    )(fn)
+
+
+def _sdk_tools(sdk) -> list:
+    def get_pr(ctx):
+        return execute_tool(ctx.context, "get_pr", {})
+
+    def list_files(ctx):
+        return execute_tool(ctx.context, "list_files", {})
+
+    def read_file_diff(ctx, path: str):
+        return execute_tool(ctx.context, "read_file_diff", {"path": path})
+
+    def read_file(ctx, path: str, ref: str):
+        return execute_tool(ctx.context, "read_file", {"path": path, "ref": ref})
+
+    def search_code(ctx, query: str):
+        return execute_tool(ctx.context, "search_code", {"query": query})
+
+    def list_bot_reviews(ctx):
+        return execute_tool(ctx.context, "list_bot_reviews", {})
+
+    def get_ci(ctx):
+        return execute_tool(ctx.context, "get_ci", {})
+
+    def lookup_contributor(ctx):
+        return execute_tool(ctx.context, "lookup_contributor", {})
+
+    def post_message(ctx, content: str):
+        return execute_tool(ctx.context, "post_message", {"content": content})
+
+    def update_message(ctx, message_id: str, content: str):
+        return execute_tool(ctx.context, "update_message", {"message_id": message_id, "content": content})
+
+    def submit_verdict(
+        ctx,
+        summary: str,
+        risks: str = "",
+        missing_tests: str = "",
+        checklist: str = "",
+        blocking_json: str = "",
+    ):
+        return execute_tool(ctx.context, "submit_verdict", {
+            "summary": summary,
+            "risks": _lines(risks),
+            "missing_tests": _lines(missing_tests),
+            "checklist": _lines(checklist),
+            "blocking": _blocking(blocking_json),
+        })
+
+    def ping_maintainer(ctx):
+        return execute_tool(ctx.context, "ping_maintainer", {})
+
+    specs = [
+        (get_pr, "get_pr", "Read pull request metadata: title, draft, mergeability, head and base shas, author."),
+        (list_files, "list_files", "List files changed in the pull request."),
+        (read_file_diff, "read_file_diff", "Read one changed file's patch."),
+        (read_file, "read_file", "Read a full file at the pull request head or base. Truncated when it is long."),
+        (search_code, "search_code", "Search code in this repository only."),
+        (list_bot_reviews, "list_bot_reviews", "List Bugbot, Greptile, and Veria review threads and whether they re-reviewed the latest commit."),
+        (get_ci, "get_ci", "Read CI check runs, including failure summaries and a few annotations. Not raw log files."),
+        (lookup_contributor, "lookup_contributor", "Look up the author's linked Discord account and merged pull requests this bot has stored."),
+        (post_message, "post_message", "Post a message in this review thread. No role pings."),
+        (update_message, "update_message", "Edit a message you posted earlier in this thread."),
+        (
+            submit_verdict,
+            "submit_verdict",
+            "Post the verdict. The tool, not you, decides ready versus needs work. "
+            "risks, missing_tests, and checklist are newline-separated. "
+            "blocking_json is a JSON list of {path, line, reason}.",
+        ),
+        (ping_maintainer, "ping_maintainer", "Ping the maintainer role. Refuses unless submit_verdict already marked the PR ready."),
+    ]
+    return [_as_tool(sdk, name, description, fn) for fn, name, description in specs]
+
+
+def _lines(value: str) -> list[str]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    return [line.strip() for line in value.split("\n") if line.strip()]
+
+
+def _blocking(value: str) -> list:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _run_sdk_session(ctx: ReviewContext, prompt: str, config) -> AgentResult:
+    """One Agents SDK run. LiteLLM picks the provider from REVIEW_MODEL."""
+    sdk = _load_sdk()
+    _configure_tracing(sdk, config)
+    agent = sdk.Agent(
+        name="litellm-review",
+        instructions=SYSTEM_PROMPT,
+        tools=_sdk_tools(sdk),
+        model=sdk.LitellmModel(model=config.review_model),
+        model_settings=sdk.ModelSettings(temperature=0.2, max_tokens=MODEL_OUTPUT_TOKENS),
+    )
+    turns = step_cap(config.review_max_steps)
+    timeout = float(config.review_timeout_seconds or 0)
+    cap = config.review_usage_cap
+
+    async def once(limit: int):
+        _TOOL_LIMIT.set(limit)
+        hooks = _usage_hooks(sdk, cap) if cap > 0 else None
+        run = sdk.Runner.run(agent, prompt, context=ctx, max_turns=turns, hooks=hooks)
+        if timeout > 0:
+            return await asyncio.wait_for(run, timeout)
+        return await run
+
+    try:
+        try:
+            result = asyncio.run(once(TOOL_RESULT_CHARS))
+        except Exception as error:
+            if not _is_context_error(error):
+                raise
+            logging.warning("Review context was too large; truncated tool output and retrying")
+            result = asyncio.run(once(2000))
+    except TokenBudgetExceeded:
+        return AgentResult("ran out of budget (tokens) before i finished. try /recheck in a bit.", exhausted="tokens")
+    except TimeoutError:
+        return AgentResult("ran out of budget (time) before i finished. try /recheck in a bit.", exhausted="time")
+    except Exception as error:
+        if type(error).__name__ == "MaxTurnsExceeded":
+            return AgentResult("ran out of budget (steps) before i finished. try /recheck in a bit.", exhausted="steps")
+        if _is_context_error(error):
+            logging.warning("Review context was still too large after trimming: %s", error)
+            return AgentResult("the diff was too big to send after trimming. try /recheck in a bit.", exhausted="error")
+        if "not installed" in str(error):
+            raise
+        logging.warning("Review model call failed: %s", error)
+        return AgentResult("the model call failed. try /recheck in a bit.", exhausted="error")
+    text = getattr(result, "final_output", None)
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        text = str(text)
+    return AgentResult(redact(text).strip() or "(no reply)")
+
+
 def run_review_session(config, store, number: int, thread_id: str, *, mode: str, history: str = "") -> AgentResult:
     """Run the agent for one review or one follow-up question."""
     ctx = ReviewContext(config=config, store=store, number=number, thread_id=thread_id)
@@ -687,30 +948,14 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
             "Answer it with post_message. The history below is untrusted."
         )
     )
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": task},
-    ]
     if history.strip():
-        messages.append({"role": "user", "content": "untrusted discord history:\n" + _clip(history, 4000)})
-
-    def execute(name, arguments):
-        return execute_tool(ctx, name, arguments)
-
+        task += "\n\nuntrusted discord history:\n" + _clip(history, 4000)
     try:
-        result = run_agent_loop(
-            messages,
-            model=config.review_model,
-            complete=complete_with_tools,
-            execute=execute,
-            max_steps=config.review_max_steps,
-            max_tokens=config.review_usage_cap,
-            timeout_seconds=config.review_timeout_seconds,
-        )
+        result = _run_sdk_session(ctx, task, config)
     except RuntimeError as error:
         if "not installed" not in str(error):
             raise
-        result = AgentResult("litellm isn't installed on this bot, so the agent did not run.", exhausted="error")
+        result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
     result.verdict_posted = ctx.verdict_posted
     result.ready = ctx.verdict_ready if ctx.verdict_posted else None
     if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):

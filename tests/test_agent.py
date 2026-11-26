@@ -1,6 +1,8 @@
 """Agent loop, read-only tools, classification, budgets, and the Discord gateway."""
 
+import asyncio
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,15 +11,31 @@ from types import SimpleNamespace
 from unittest import mock
 
 from contributor_bot.config import Config, get_config
-from contributor_bot.gateway import PRESENCE_REVIEW, build_intents, start_gateway, stop_gateway
+from contributor_bot.gateway import (
+    PRESENCE_REVIEW,
+    build_intents,
+    commands_for_guild,
+    interaction_place,
+    message_is_thread,
+    should_sync_guild_commands,
+    start_gateway,
+    stop_gateway,
+    thread_payload,
+    tree_handles,
+    _interaction_payload,
+)
+from contributor_bot.interactions import handle_interaction
 from contributor_bot.review_agent import (
     MODEL_OUTPUT_TOKENS,
     STEP_SAFETY_CEILING,
     SYSTEM_PROMPT,
+    TOOL_RESULT_CHARS,
     Completion,
     ReviewContext,
     ToolCall,
+    _TOOL_LIMIT,
     _json,
+    _run_sdk_session,
     complete_with_tools,
     completion_from_response,
     execute_tool,
@@ -26,6 +44,13 @@ from contributor_bot.review_agent import (
     tool_ping_maintainer,
     tool_read_file,
     tool_search_code,
+)
+from contributor_bot.review_job import (
+    _finish_recheck,
+    _recheck_command,
+    handle_thread_message,
+    message_decision,
+    recheck_followup_text,
 )
 from contributor_bot.review_github import Snapshot
 from contributor_bot.review_job import handle_thread_message, message_decision
@@ -358,6 +383,9 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(explicit.review_daily_run_budget, 3)
         self.assertEqual(explicit.review_timeout_seconds, 90)
         self.assertEqual(get_config(env | {"REVIEW_AGENT_TIMEOUT_SECONDS": "0"}).review_timeout_seconds, 0)
+        self.assertIsNone(config.review_agent_tracing)
+        self.assertTrue(get_config(env | {"REVIEW_AGENT_TRACING": "true"}).review_agent_tracing)
+        self.assertFalse(get_config(env | {"REVIEW_AGENT_TRACING": "false"}).review_agent_tracing)
         self.assertFalse(config.discord_members_intent)
         fake = mock.Mock()
         fake.completion.return_value = {"choices": [{"message": {"content": "hi"}}], "usage": {"total_tokens": 3}}
@@ -368,3 +396,256 @@ class GatewayTests(unittest.TestCase):
         message = {"content": "please review https://github.com/BerriAI/litellm/pull/9", "author": {"bot": False}}
         asked, numbers = message_decision(replace(config, review_classify=False), message)
         self.assertEqual((asked, numbers), (True, [9]))
+
+
+def _thread_interaction():
+    """What discord.py hands us for /recheck inside an uncached thread.
+
+    ``channel`` is None, so the ``channel_id`` property is None. The raw gateway
+    payload still has the thread id. The parent is not a watched review channel.
+    """
+
+    class Interaction:
+        channel = None
+        token = "tokentoken"
+        guild_id = 333
+        application_id = 444
+        data = {"name": "recheck", "options": []}
+        extras = {
+            "litellm_channel_id": "900",
+            "litellm_parent_id": "777",
+            "litellm_channel_type": 11,
+        }
+        user = SimpleNamespace(id="111")
+
+        @property
+        def channel_id(self):
+            return self.channel.id if self.channel is not None else None
+
+    return Interaction()
+
+
+class RecheckThreadTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = Store(str(Path(self.directory.name) / "roles.db"))
+        self.addCleanup(self.store.close)
+        self.config = _config()
+        from contributor_bot.schedule import UTC, iso
+        from datetime import datetime
+        self.now = iso(datetime.now(UTC))
+        self.store.save_review_thread(
+            repository="BerriAI/litellm", number=12, channel_id="321", message_id="654",
+            thread_id="900", created_at=self.now,
+        )
+
+    def test_uncached_thread_maps_to_the_pr_without_the_parent_channel(self):
+        interaction = _thread_interaction()
+        self.assertIsNone(interaction.channel_id)
+        self.assertNotIn("777", self.config.review_channel_ids)
+        place = interaction_place(interaction)
+        self.assertEqual(place["channel_id"], "900")
+        self.assertEqual(place["parent_id"], "777")
+        self.assertEqual(place["channel_type"], 11)
+        payload = _interaction_payload(interaction)
+        self.assertEqual(payload["channel_id"], "900")
+        self.assertEqual(payload["channel"]["parent_id"], "777")
+        # A resolved parent must not replace the raw thread id.
+        interaction.channel = SimpleNamespace(id="777", parent_id=None, type=SimpleNamespace(value=0))
+        self.assertEqual(interaction_place(interaction)["channel_id"], "900")
+        with mock.patch("contributor_bot.review_job._spawn") as spawn:
+            response = handle_interaction(self.config, self.store, payload)
+        self.assertEqual(response["type"], 5)
+        self.assertEqual(response["data"]["flags"], 64)
+        spawn.assert_called_once()
+        self.assertNotIn("inside a pr review thread", str(response))
+
+    def test_cooldown_and_budget_are_shown_and_errors_are_logged(self):
+        self.store.mark_review_done("BerriAI/litellm", 12, self.now, HEAD)
+        payload = _interaction_payload(_thread_interaction())
+        with mock.patch("contributor_bot.review_job._post") as posted:
+            response = _recheck_command(self.config, self.store, payload)
+        self.assertEqual(response["type"], 4)
+        self.assertIn("checked recently", response["data"]["content"])
+        posted.assert_called_once()
+        self.assertIn("ran out of budget", recheck_followup_text({
+            "status": "budget", "detail": "ran out of budget for today. try again tomorrow.",
+        }))
+        with mock.patch("contributor_bot.review_job.perform_review", return_value={
+            "status": "budget", "thread_id": "900",
+            "detail": "ran out of budget for today. try again tomorrow.",
+        }), mock.patch("contributor_bot.review_job.edit_original_interaction") as edit:
+            _finish_recheck(self.config, self.store, 12, "444", "tokentoken")
+        self.assertIn("ran out of budget", edit.call_args.args[2]["content"])
+        with mock.patch("contributor_bot.review_job.perform_review", side_effect=RuntimeError("boom")), \
+                mock.patch("contributor_bot.review_job.edit_original_interaction") as failed, \
+                self.assertLogs(level="ERROR") as logs:
+            _finish_recheck(self.config, self.store, 12, "444", "tokentoken")
+        self.assertTrue(any("Recheck failed" in line for line in logs.output))
+        self.assertIn("couldn't recheck", failed.call_args.args[2]["content"])
+
+    def test_check_again_in_an_uncached_thread_rechecks(self):
+        message = SimpleNamespace(
+            id="1", content="check again", reference=None, webhook_id=None,
+            author=SimpleNamespace(id="111", bot=False),
+            channel=SimpleNamespace(id="900", type=None),
+        )
+        self.assertTrue(message_is_thread(message, self.store))
+        self.assertFalse(message_is_thread(
+            SimpleNamespace(channel=SimpleNamespace(id="555", type=None)), self.store,
+        ))
+        with mock.patch("contributor_bot.review_job.perform_review", return_value={"status": "posted"}) as review:
+            handle_thread_message(self.config, self.store, {
+                "channel_id": "900",
+                "content": "check again",
+                "author": {"id": "111", "bot": False},
+            })
+        review.assert_called_once()
+        self.assertEqual(review.call_args.kwargs["source"], "recheck")
+
+    def test_guild_sync_includes_recheck_and_skips_an_empty_tree(self):
+        names = [command["name"] for command in commands_for_guild(self.config)]
+        self.assertEqual(names, ["review-pr", "recheck"])
+        self.assertTrue(should_sync_guild_commands(self.config))
+        self.assertEqual(commands_for_guild(Config("token", "123", "456")), [])
+        self.assertFalse(should_sync_guild_commands(Config("token", "123", "456")))
+        self.assertFalse(should_sync_guild_commands(replace(self.config, discord_guild_id=None)))
+        tree = SimpleNamespace(_guild_commands={333: {"recheck": object()}}, _global_commands={})
+        self.assertTrue(tree_handles(tree, "recheck", "333"))
+        self.assertFalse(tree_handles(tree, "nope", 333))
+        self.assertFalse(tree_handles(None, "recheck", 333))
+        filled = thread_payload({"id": "900", "type": 11, "name": "pr 12 review", "parent_id": "777"})
+        for key in ("owner_id", "message_count", "member_count", "parent_id", "thread_metadata"):
+            self.assertIn(key, filled)
+        self.assertEqual(filled["parent_id"], "777")
+        self.assertIn("archive_timestamp", filled["thread_metadata"])
+
+
+class AgentsSdkTests(unittest.TestCase):
+    def _sdk(self, run):
+        calls = {"n": 0, "tracing": []}
+
+        class LitellmModel:
+            def __init__(self, model, **kwargs):
+                calls["model"] = model
+
+        class ModelSettings:
+            def __init__(self, **kwargs):
+                calls["settings"] = kwargs
+
+        class Agent:
+            def __init__(self, **kwargs):
+                calls["instructions"] = kwargs.get("instructions")
+                calls["tool_count"] = len(kwargs.get("tools") or [])
+
+        class Runner:
+            @staticmethod
+            async def run(agent, incoming, context=None, max_turns=None, hooks=None):
+                calls["n"] += 1
+                calls["max_turns"] = max_turns
+                calls["hooks"] = hooks
+                calls["limit"] = _TOOL_LIMIT.get()
+                return await run(calls, hooks)
+
+        def function_tool(func=None, **kwargs):
+            def deco(fn):
+                return fn
+            return deco if not callable(func) else deco(func)
+
+        sdk = SimpleNamespace(
+            Agent=Agent,
+            Runner=Runner,
+            ModelSettings=ModelSettings,
+            LitellmModel=LitellmModel,
+            function_tool=function_tool,
+            RunContextWrapper=object,
+            RunHooks=type("RunHooks", (), {}),
+            MaxTurnsExceeded=type("MaxTurnsExceeded", (Exception,), {}),
+            set_tracing_disabled=lambda disabled: calls["tracing"].append(disabled),
+        )
+        return sdk, calls
+
+    def _run(self, config, run, env=None):
+        sdk, calls = self._sdk(run)
+        ctx = ReviewContext(config=config, store=None, number=12, thread_id="900")
+        with mock.patch("contributor_bot.review_agent._load_sdk", return_value=sdk), \
+                mock.patch.dict(os.environ, env or {}, clear=False):
+            if env is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            result = _run_sdk_session(ctx, "review this", config)
+        return result, calls
+
+    def test_runner_uses_litellm_model_and_disables_tracing_without_an_openai_key(self):
+        config = replace(_config(), review_model="anthropic/claude-sonnet-4-5", review_usage_cap=0, review_timeout_seconds=0)
+
+        async def run(calls, hooks):
+            return SimpleNamespace(final_output="looks fine")
+
+        result, calls = self._run(config, run)
+        self.assertIn("looks fine", result.text)
+        self.assertEqual(calls["model"], "anthropic/claude-sonnet-4-5")
+        self.assertEqual(calls["settings"]["max_tokens"], MODEL_OUTPUT_TOKENS)
+        self.assertEqual(calls["max_turns"], 4)
+        self.assertIsNone(calls["hooks"])
+        self.assertEqual(calls["tracing"], [True])
+        self.assertIn("untrusted", calls["instructions"])
+        self.assertGreaterEqual(calls["tool_count"], 8)
+        unlimited = replace(config, review_max_steps=0)
+        _result, wide = self._run(unlimited, run)
+        self.assertEqual(wide["max_turns"], STEP_SAFETY_CEILING)
+
+        async def noop(calls, hooks):
+            return SimpleNamespace(final_output="ok")
+
+        _traced, traced = self._run(
+            replace(config, review_agent_tracing=True), noop, {"OPENAI_API_KEY": ""},
+        )
+        self.assertEqual(traced["tracing"], [False])
+        _keyed, keyed = self._run(config, noop, {"OPENAI_API_KEY": "sk-test"})
+        self.assertEqual(keyed["tracing"], [])
+        _forced, forced = self._run(
+            replace(config, review_agent_tracing=False), noop, {"OPENAI_API_KEY": "sk-test"},
+        )
+        self.assertEqual(forced["tracing"], [True])
+
+    def test_step_token_time_and_context_limits(self):
+        config = _config()
+
+        class MaxTurnsExceeded(Exception):
+            pass
+
+        async def steps(calls, hooks):
+            raise MaxTurnsExceeded()
+
+        result, _calls = self._run(config, steps)
+        self.assertEqual(result.exhausted, "steps")
+
+        async def tokens(calls, hooks):
+            await hooks.on_llm_end(None, None, SimpleNamespace(
+                usage=SimpleNamespace(total_tokens=500),
+                output=[SimpleNamespace(type="function_call")],
+            ))
+            return SimpleNamespace(final_output="should not be used")
+
+        capped, _calls = self._run(replace(config, review_usage_cap=10, review_timeout_seconds=0), tokens)
+        self.assertEqual(capped.exhausted, "tokens")
+
+        async def slow(calls, hooks):
+            await asyncio.sleep(30)
+            return SimpleNamespace(final_output="late")
+
+        timed, _calls = self._run(replace(config, review_usage_cap=0, review_timeout_seconds=1), slow)
+        self.assertEqual(timed.exhausted, "time")
+
+        async def flaky(calls, hooks):
+            if calls["n"] == 1:
+                raise RuntimeError("prompt is too long for the context window")
+            self.assertEqual(calls["limit"], 2000)
+            self.assertLess(2000, TOOL_RESULT_CHARS)
+            return SimpleNamespace(final_output="ok after trim")
+
+        retried, calls = self._run(replace(config, review_usage_cap=0, review_timeout_seconds=0), flaky)
+        self.assertIsNone(retried.exhausted)
+        self.assertIn("ok after trim", retried.text)
+        self.assertEqual(calls["n"], 2)
