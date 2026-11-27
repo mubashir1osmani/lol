@@ -103,7 +103,26 @@ class Gateway:
                 activity=status_activity(discord, text),
             )
             self.connected.set()
-            logging.info("Discord gateway connected as %s, status %s", client.user, text)
+            guild_info = ""
+            if config.discord_guild_id and hasattr(client, "get_guild"):
+                try:
+                    ready_guild = client.get_guild(int(config.discord_guild_id))
+                except (TypeError, ValueError):
+                    ready_guild = None
+                if ready_guild is not None:
+                    guild_info = (
+                        f", guild={config.discord_guild_id} "
+                        f"cached_members={len(getattr(ready_guild, 'members', ()) or ())}"
+                        f"/{getattr(ready_guild, 'member_count', '?')} "
+                        f"chunked={getattr(ready_guild, 'chunked', False)}"
+                    )
+            logging.info(
+                "Discord gateway connected as %s, status %s, members_intent=%s%s",
+                client.user,
+                text,
+                config.discord_members_intent,
+                guild_info,
+            )
             if self._commands_synced or self._stop.is_set():
                 return
             try:

@@ -1,6 +1,7 @@
 """Jev gate, trigger dedup, and the weekly community summary."""
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -811,6 +812,310 @@ class WeeklyTests(unittest.TestCase):
         self.assertNotIn("@octocat", combined)
         self.assertEqual(edits[0][2].get("allowed_mentions"), {"parse": [], "users": ["777777777777777777"]})
         self.assertIn("rate limit", combined.lower())
+
+    def test_matcher_no_jev_key_deterministic_fallback_and_display_name(self):
+        from contributor_bot.matcher import (
+            DiscordMemberInfo,
+            match_community_contributors_with_diagnostics,
+        )
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "token", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            typesafe_api_key=None,
+        )
+        members = [
+            DiscordMemberInfo("111111111111111111", username="octocat"),
+            DiscordMemberInfo("222222222222222222", username="randomhandle", display_name="Jane Doe"),
+            DiscordMemberInfo("333333333333333333", username="samsmith"),
+            DiscordMemberInfo("444444444444444444", username="alexmuller"),
+        ]
+        groups = [
+            {"login": "octocat", "user_id": 1, "first_time": False, "pulls": [{"number": 10, "title": "fix a", "url": "https://github.com/BerriAI/litellm/pull/10"}]},
+            {"login": "gh-jane", "user_id": 2, "first_time": True, "pulls": [{"number": 11, "title": "fix b", "url": "https://github.com/BerriAI/litellm/pull/11"}]},
+            {"login": "gh-sam-99", "user_id": 3, "first_time": False, "pulls": [{"number": 12, "title": "fix c", "url": "https://github.com/BerriAI/litellm/pull/12"}]},
+            {"login": "alexmullr", "user_id": 4, "first_time": False, "pulls": [{"number": 13, "title": "fix d", "url": "https://github.com/BerriAI/litellm/pull/13"}]},
+            {"login": "totalstranger", "user_id": 5, "first_time": False, "pulls": [{"number": 14, "title": "fix e", "url": "https://github.com/BerriAI/litellm/pull/14"}]},
+        ]
+
+        def fake_github(url, _token, **_kwargs):
+            if url.endswith("/users/gh-jane"):
+                return {"login": "gh-jane", "name": "Jane Doe"}
+            if url.endswith("/users/gh-sam-99"):
+                return {"login": "gh-sam-99", "name": ""}
+            if "/pulls/12/commits" in url:
+                return [{"author": {"login": "gh-sam-99"}, "commit": {"author": {"name": "Sam Smith", "email": "samsmith@example.com"}}}]
+            if url.endswith("/users/alexmullr"):
+                return {"login": "alexmullr", "name": ""}
+            if url.endswith("/users/totalstranger"):
+                return {"login": "totalstranger", "name": "No Match"}
+            return []
+
+        cleared_env = {
+            key: ""
+            for key in (
+                "TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY", "LITELLM_API_KEY", "GEMINI_API_KEY",
+                "AZURE_API_KEY", "AWS_ACCESS_KEY_ID", "VERTEXAI_PROJECT",
+            )
+        }
+        with mock.patch.dict(os.environ, cleared_env, clear=False):
+            matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
+                groups,
+                cfg,
+                store,
+                members=members,
+                github_getter=fake_github,
+            )
+
+        by_login = {g["login"]: g for g in matched}
+        self.assertEqual(by_login["octocat"]["discord_id"], "111111111111111111")
+        self.assertEqual(by_login["octocat"]["match_method"], "exact_login")
+        # Matches via Discord display_name even without Jev/Haiku keys.
+        self.assertEqual(by_login["gh-jane"]["discord_id"], "222222222222222222")
+        self.assertEqual(by_login["gh-jane"]["match_method"], "exact_name")
+        # Unique exact normalized commit_name/email_local matched via deterministic_fallback.
+        self.assertEqual(by_login["gh-sam-99"]["discord_id"], "333333333333333333")
+        self.assertEqual(by_login["gh-sam-99"]["match_method"], "deterministic_fallback")
+        # Fuzzy-only pair (alexmullr vs alexmuller) is NOT guessed without an LLM; stranger skipped too.
+        self.assertNotIn("alexmullr", by_login)
+        self.assertNotIn("totalstranger", by_login)
+        self.assertEqual(skipped, 2)
+        self.assertEqual(diag.contributor_count, 5)
+        self.assertEqual(diag.member_count, 4)
+        self.assertEqual(diag.matched_count, 3)
+        self.assertEqual(diag.llm_source, "deterministic_fallback")
+        skip_map = dict(diag.skip_reasons)
+        self.assertEqual(skip_map.get("llm_unavailable"), 1)
+        self.assertEqual(skip_map.get("no_signal_match"), 1)
+
+    def test_matcher_empty_and_partial_member_cache_fallbacks(self):
+        from types import SimpleNamespace
+        from contributor_bot.matcher import (
+            load_guild_members_with_source,
+            match_community_contributors_with_diagnostics,
+            reset_guild_members_cache,
+        )
+
+        reset_guild_members_cache()
+
+        # 1) Partial cache (2 cached out of 5000, chunked=False) triggers guild.chunk(cache=True).
+        chunk_called = {"n": 0}
+        partial_guild = SimpleNamespace(
+            id=333,
+            member_count=5000,
+            chunked=False,
+            members=[
+                SimpleNamespace(id=100000000000000001, name="someone", global_name=None, nick=None, display_name="someone", bot=False),
+                SimpleNamespace(id=100000000000000002, name="other", global_name=None, nick=None, display_name="other", bot=False),
+            ],
+        )
+
+        async def fake_chunk(cache=True):
+            chunk_called["n"] += 1
+            partial_guild.members.append(
+                SimpleNamespace(id=100000000000000003, name="targetdev", global_name=None, nick=None, display_name="targetdev", bot=False)
+            )
+            partial_guild.chunked = True
+
+        partial_guild.chunk = fake_chunk
+        loaded, source = load_guild_members_with_source(partial_guild)
+        self.assertEqual(chunk_called["n"], 1)
+        self.assertEqual(source, "guild_chunk")
+        self.assertIn("targetdev", [m.username for m in loaded])
+
+        # 2) Empty cache + fetch_members raising ClientException (intents.members=False on Render)
+        #    falls back cleanly to REST GET /guilds/{id}/members!
+        def fail_fetch_members(limit=None):
+            raise RuntimeError("Intents.members must be enabled to use this.")
+
+        no_intent_guild = SimpleNamespace(
+            id=333,
+            member_count=8000,
+            chunked=False,
+            members=[],
+            fetch_members=fail_fetch_members,
+        )
+        rest_payload = [
+            {"user": {"id": "555555555555555555", "username": "alice_dev", "global_name": "Alice Dev", "bot": False}, "nick": None},
+            {"user": {"id": "555555555555555556", "username": "helperbot", "bot": True}, "nick": None},
+        ]
+        loaded_rest, source_rest = load_guild_members_with_source(
+            no_intent_guild,
+            guild_id="333",
+            discord_token="tok",
+            rest_fetcher=lambda _gid, _tok: rest_payload,
+        )
+        self.assertEqual(source_rest, "rest_members")
+        self.assertEqual([m.username for m in loaded_rest], ["alice_dev"])
+
+        # 3) guild=None (HTTP interaction) also uses REST /members.
+        loaded_http, source_http = load_guild_members_with_source(
+            None,
+            guild_id="333",
+            discord_token="tok",
+            rest_fetcher=lambda _gid, _tok: rest_payload,
+        )
+        self.assertEqual(source_http, "rest_members")
+        self.assertEqual(len(loaded_http), 1)
+
+        # 4) When REST /members returns 403, falls back to REST /members/search per contributor.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444")
+
+        def rest_403(_gid, _tok):
+            raise RuntimeError("discord.com returned HTTP 403")
+
+        def fake_search(_gid, query, _tok, limit=10):
+            if query.lower() == "bobbuilder":
+                return [{"user": {"id": "666666666666666666", "username": "bobbuilder", "bot": False}}]
+            return []
+
+        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
+            [{"login": "bobbuilder", "user_id": 99, "first_time": False, "pulls": [{"number": 7, "title": "fix x", "url": "https://github.com/BerriAI/litellm/pull/7"}]}],
+            cfg,
+            store,
+            guild=no_intent_guild,
+            rest_fetcher=rest_403,
+            rest_searcher=fake_search,
+            skip_github_enrichment=True,
+        )
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(matched[0]["discord_id"], "666666666666666666")
+        self.assertEqual(diag.members_source, "rest_search")
+
+    def test_matcher_sqlite_ttl_and_no_negative_caching(self):
+        from datetime import timedelta
+        from contributor_bot.matcher import (
+            DiscordMemberInfo,
+            MATCH_CACHE_TTL_DAYS,
+            match_community_contributors_with_diagnostics,
+        )
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444")
+        t0 = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+        groups = [{"login": "cacheddev", "user_id": 42, "first_time": False, "pulls": [{"number": 1, "title": "fix", "url": "https://github.com/BerriAI/litellm/pull/1"}]}]
+
+        # Run 1: empty member list -> 0 matches and NOTHING saved as a negative cache entry.
+        matched0, skipped0, _d0, diag0 = match_community_contributors_with_diagnostics(
+            groups, cfg, store, members=[], now=t0, skip_github_enrichment=True,
+        )
+        self.assertEqual(matched0, [])
+        self.assertEqual(skipped0, 1)
+        self.assertEqual(dict(diag0.skip_reasons), {"no_guild_members": 1})
+        self.assertIsNone(store.get_confirmed_match("cacheddev"))
+
+        # Run 2: members available -> matches and persists to SQLite.
+        members = [DiscordMemberInfo("888888888888888888", username="cacheddev")]
+        matched1, _s1, _d1, _diag1 = match_community_contributors_with_diagnostics(
+            groups, cfg, store, members=members, now=t0, skip_github_enrichment=True,
+        )
+        self.assertEqual(matched1[0]["match_method"], "exact_login")
+        self.assertIsNotNone(store.get_confirmed_match("cacheddev"))
+
+        # Run 3: within TTL -> reuses SQLite cache.
+        matched2, _s2, _d2, _diag2 = match_community_contributors_with_diagnostics(
+            groups, cfg, store, members=members, now=t0 + timedelta(days=5), skip_github_enrichment=True,
+        )
+        self.assertEqual(matched2[0]["match_method"], "sqlite:exact_login")
+
+        # Run 4: past TTL -> stale SQLite cache expires and recomputes fresh match.
+        new_members = [DiscordMemberInfo("999999999999999999", username="cacheddev")]
+        matched3, _s3, _d3, _diag3 = match_community_contributors_with_diagnostics(
+            groups,
+            cfg,
+            store,
+            members=new_members,
+            now=t0 + timedelta(days=MATCH_CACHE_TTL_DAYS + 1),
+            skip_github_enrichment=True,
+        )
+        self.assertEqual(matched3[0]["discord_id"], "999999999999999999")
+        self.assertEqual(matched3[0]["match_method"], "exact_login")
+
+    def test_merged_this_week_ephemeral_zero_match_diagnostic_and_post_format(self):
+        from contributor_bot.interactions import _finish_merged_preview
+        from contributor_bot.matcher import reset_guild_members_cache
+        from contributor_bot.weekly import reset_org_members_cache
+
+        reset_org_members_cache()
+        reset_guild_members_cache()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444")
+
+        search_payload = {
+            "items": [
+                {
+                    "number": 501,
+                    "title": "feat: add gemini cache",
+                    "html_url": "https://github.com/BerriAI/litellm/pull/501",
+                    "user": {"login": "alice-dev", "type": "User", "id": 10},
+                    "author_association": "FIRST_TIME_CONTRIBUTOR",
+                },
+                {
+                    "number": 502,
+                    "title": "fix: handle timeout",
+                    "html_url": "https://github.com/BerriAI/litellm/pull/502",
+                    "user": {"login": "bob-dev", "type": "User", "id": 11},
+                    "author_association": "CONTRIBUTOR",
+                },
+            ]
+        }
+
+        def fake_github(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            if "/search/issues" in url:
+                return search_payload
+            return []
+
+        # Case 1: 0 members available -> ephemeral reply includes diagnostic line.
+        edits = []
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github), \
+                mock.patch("contributor_bot.matcher.fetch_guild_members", side_effect=RuntimeError("HTTP 403")), \
+                mock.patch("contributor_bot.matcher.search_guild_members", return_value=[]), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)):
+            _finish_merged_preview(cfg, store, "tokentokentoken", "444", guild=None)
+
+        self.assertEqual(len(edits), 1)
+        zero_text = edits[0][2]["content"]
+        self.assertIn("no discord-matched community pull requests merged since", zero_text)
+        self.assertIn("checked 2 contributors against 0 members", zero_text)
+        self.assertIn("no_guild_members=2", zero_text)
+
+        # Case 2: REST /members succeeds -> exact hand-made weekly post format, no diagnostic clutter.
+        edits.clear()
+        rest_members = [
+            {"user": {"id": "111111111111111111", "username": "alice_dev", "bot": False}},
+            {"user": {"id": "222222222222222222", "username": "bob_dev", "bot": False}},
+        ]
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github), \
+                mock.patch("contributor_bot.matcher.fetch_guild_members", return_value=rest_members), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)):
+            _finish_merged_preview(cfg, store, "tokentokentoken", "444", guild=None)
+
+        self.assertEqual(len(edits), 1)
+        post_text = edits[0][2]["content"]
+        self.assertTrue(post_text.startswith("thank you to this week's contributors 🙏\n\n"))
+        self.assertIn("<@111111111111111111> 🎉 - add gemini cache (<https://github.com/BerriAI/litellm/pull/501>)", post_text)
+        self.assertIn("<@222222222222222222> - handle timeout (<https://github.com/BerriAI/litellm/pull/502>)", post_text)
+        self.assertIn("want to be on next week's list? grab a good first issue: <https://github.com/BerriAI/litellm/issues>", post_text)
+        self.assertNotIn("checked 2 contributors", post_text)
 
 
 class SampleRoutingTests(unittest.TestCase):

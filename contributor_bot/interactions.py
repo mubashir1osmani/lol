@@ -154,10 +154,16 @@ def _finish_merged_preview(
     guild=None,
     loop=None,
 ) -> None:
-    from .weekly import WeeklyFetchError, build_weekly_chunks, chunk_mention_user_ids
+    from .weekly import WeeklyFetchError, build_weekly_report, chunk_mention_user_ids
 
     try:
-        chunks = build_weekly_chunks(config, store, guild=guild, loop=loop, pace=False)
+        report = build_weekly_report(config, store, guild=guild, loop=loop, pace=False)
+        chunks = list(report.chunks)
+        if report.matched_count == 0 and report.diagnostics is not None and chunks:
+            diag_line = report.diagnostics.summary_line()
+            candidate = f"{chunks[0]}\n\n{diag_line}"
+            if len(candidate) <= 1900:
+                chunks[0] = candidate
     except WeeklyFetchError as error:
         logging.warning("Weekly merge preview GitHub fetch failed: %s", error)
         if error.rate_limited:

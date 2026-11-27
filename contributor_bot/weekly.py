@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
 from .config import is_discord_id
-from .matcher import MatchDetail, match_community_contributors
+from .matcher import MatchDetail, MatchDiagnostics, match_community_contributors_with_diagnostics
 from .routing import FAST_MODEL
 from .schedule import UTC, iso
 
@@ -90,6 +90,7 @@ class WeeklyReport:
     rate_limited: bool = False
     match_details: tuple[MatchDetail, ...] = ()
     issues_url: str = ""
+    diagnostics: MatchDiagnostics | None = None
 
 
 def reset_org_members_cache() -> None:
@@ -666,6 +667,8 @@ def build_weekly_report(
     jev_transport=None,
     haiku_complete=None,
     title_summarizer=None,
+    rest_fetcher=None,
+    rest_searcher=None,
 ) -> WeeklyReport:
     moment = now or datetime.now(UTC)
     since = moment - timedelta(days=7)
@@ -680,7 +683,7 @@ def build_weekly_report(
         org_members=org_members,
         org=org,
     )
-    matched, skipped, details = match_community_contributors(
+    matched, skipped, details, diagnostics = match_community_contributors_with_diagnostics(
         raw_groups,
         config,
         store,
@@ -691,13 +694,17 @@ def build_weekly_report(
         github_getter=github_get_json,
         jev_transport=jev_transport,
         haiku_complete=haiku_complete,
+        rest_fetcher=rest_fetcher,
+        rest_searcher=rest_searcher,
     )
     if matched and not rate_limited:
         matched = _mark_first_time_contributors(matched, config.github_repository, token)
     logging.info(
-        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped",
+        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped (members=%d source=%s)",
         len(matched),
         skipped,
+        diagnostics.member_count,
+        diagnostics.members_source,
     )
     summaries = summarize_pr_titles(config, matched, summarizer=title_summarizer) if matched else {}
     issues_url = good_first_issue_url(config.github_repository, token) if matched else ""
@@ -721,6 +728,7 @@ def build_weekly_report(
         rate_limited=rate_limited,
         match_details=tuple(details),
         issues_url=issues_url,
+        diagnostics=diagnostics,
     )
 
 
