@@ -1451,6 +1451,298 @@ class WeeklyTests(unittest.TestCase):
         self.assertNotIn("Weekly contributor roundup:", combined_logs)
 
 
+class FridaySchedulerReliabilityTests(unittest.TestCase):
+    def setUp(self):
+        from contributor_bot.weekly import reset_org_members_cache, reset_weekly_scheduler_state
+        reset_org_members_cache()
+        reset_weekly_scheduler_state()
+
+    def tearDown(self):
+        from contributor_bot.weekly import reset_org_members_cache, reset_weekly_scheduler_state
+        reset_org_members_cache()
+        reset_weekly_scheduler_state()
+
+    def _make_guild(self):
+        from types import SimpleNamespace
+        member = SimpleNamespace(
+            id=111111111111111111,
+            name="alice-dev",
+            display_name="Alice Dev",
+            global_name="Alice Dev",
+            nick=None,
+            bot=False,
+        )
+        return SimpleNamespace(
+            id=333,
+            members=[member],
+            member_count=1,
+            chunked=True,
+            channels=[SimpleNamespace(id=456, name="announcements", type=0)],
+        )
+
+    def _make_fake_github(self, *, include_match: bool = True):
+        def fake_github(url, _token=None, **_kwargs):
+            if "/public_members" in url:
+                return []
+            if "/search/issues" in url:
+                author = "alice-dev" if include_match else "unmatched-contributor"
+                return {
+                    "items": [
+                        {
+                            "number": 901,
+                            "title": "feat: add anthropic prompt cache helper",
+                            "html_url": "https://github.com/BerriAI/litellm/pull/901",
+                            "user": {"login": author, "type": "User", "id": 9001},
+                            "author_association": "FIRST_TIME_CONTRIBUTOR",
+                        },
+                    ]
+                }
+            if "/users/alice-dev" in url:
+                return {"login": "alice-dev", "name": "Alice Dev", "bio": "", "blog": "", "twitter_username": ""}
+            if "/users/unmatched-contributor" in url:
+                return {"login": "unmatched-contributor", "name": "Nobody Here", "bio": "", "blog": "", "twitter_username": ""}
+            return []
+
+        return fake_github
+
+    def test_manual_command_never_consumes_scheduled_friday_slot_and_late_friday_deploy_catches_up(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from contributor_bot.interactions import handle_interaction
+        from contributor_bot.store import Store
+        from contributor_bot.weekly import (
+            build_weekly_chunks,
+            post_weekly_if_due,
+            week_key,
+            weekly_schedule_status,
+        )
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "tok", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            merged_weekly_enabled=True,
+            merged_weekday=4,
+            merged_time="10:00",
+            merged_timezone="America/Toronto",
+        )
+        guild = self._make_guild()
+        fake_gh = self._make_fake_github(include_match=True)
+
+        # Thursday evening Nov 26, 2026: manual /merged-this-week runs and posts.
+        thu_evening = datetime(2026, 11, 27, 1, 0, tzinfo=timezone.utc)  # Thu 8:00 PM Toronto
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            chunks = build_weekly_chunks(cfg, store, thu_evening, guild=guild)
+        self.assertEqual(len(chunks), 1)
+        # Manual run must NOT touch merged_weeks in SQLite.
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+        # Even invoking handle_interaction for /merged-this-week does not mark merged_weeks.
+        with mock.patch("contributor_bot.interactions.threading.Thread"):
+            resp = handle_interaction(cfg, store, {
+                "type": 2,
+                "guild_id": "333",
+                "application_id": "444",
+                "channel_id": "123",
+                "token": "tok",
+                "member": {"user": {"id": "111"}},
+                "data": {"name": "merged-this-week", "options": []},
+            })
+        self.assertEqual(resp, {"type": 5, "data": {"flags": 64}})
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+        # Friday afternoon Nov 27, 2026 2:35 PM Toronto (missed 10:00 AM window):
+        # deploying now reports "due now (will catch up)" and immediately posts once.
+        fri_afternoon = datetime(2026, 11, 27, 19, 35, tzinfo=timezone.utc)
+        status = weekly_schedule_status(cfg, store, fri_afternoon)
+        self.assertIn("week=2026-W48", status)
+        self.assertIn("status=due now (will catch up)", status)
+
+        posted = []
+        send = lambda ch, _tok, msg: posted.append((ch, msg))
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
+                self.assertLogs(level="INFO") as post_logs:
+            result = post_weekly_if_due(cfg, store, fri_afternoon, post=send, guild=guild)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0][0], "456")
+        self.assertTrue(store.merged_week_posted("BerriAI/litellm", week_key(fri_afternoon)))
+        self.assertTrue(any("Posted weekly merge summary for 2026-W48" in line for line in post_logs.output))
+
+        # Subsequent ticks on Friday skip cleanly, log once why, and never double-post.
+        fri_next_min = datetime(2026, 11, 27, 19, 36, tzinfo=timezone.utc)
+        fri_next_min2 = datetime(2026, 11, 27, 19, 37, tzinfo=timezone.utc)
+        with self.assertLogs(level="INFO") as skip_logs:
+            self.assertIsNone(post_weekly_if_due(cfg, store, fri_next_min, post=send, guild=guild))
+            self.assertIsNone(post_weekly_if_due(cfg, store, fri_next_min2, post=send, guild=guild))
+        already_lines = [line for line in skip_logs.output if "already posted at" in line]
+        self.assertEqual(len(already_lines), 1)
+        self.assertEqual(len(posted), 1)
+
+    def test_zero_match_run_does_not_poison_sqlite_and_retries_after_backoff(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from contributor_bot.store import Store
+        from contributor_bot.weekly import WEEKLY_ZERO_MATCH_RETRY_SECONDS, post_weekly_if_due
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "tok", "123", "456",
+            discord_guild_id="333",
+            merged_weekly_enabled=True,
+        )
+        guild = self._make_guild()
+        fri = datetime(2026, 11, 27, 15, 0, tzinfo=timezone.utc)  # Friday 10:00 AM Toronto
+        now_mono = [1000.0]
+        posted = []
+        send = lambda ch, _tok, msg: posted.append((ch, msg))
+
+        # Transient 0-match run with member_count > 0 must NOT mark merged_weeks in SQLite.
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=self._make_fake_github(include_match=False)):
+            self.assertIsNone(post_weekly_if_due(cfg, store, fri, post=send, guild=guild, clock=lambda: now_mono[0]))
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+        self.assertEqual(posted, [])
+
+        # Within the backoff window, next 60s tick defers without hitting GitHub.
+        now_mono[0] += 60.0
+        with mock.patch("contributor_bot.weekly.github_get_json") as gh_mock:
+            self.assertIsNone(post_weekly_if_due(cfg, store, fri, post=send, guild=guild, clock=lambda: now_mono[0]))
+        gh_mock.assert_not_called()
+
+        # After backoff expires, a healthy run succeeds and posts!
+        now_mono[0] += WEEKLY_ZERO_MATCH_RETRY_SECONDS + 1.0
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=self._make_fake_github(include_match=True)):
+            result = post_weekly_if_due(cfg, store, fri, post=send, guild=guild, clock=lambda: now_mono[0])
+        self.assertIsNotNone(result)
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+    def test_skip_logs_clear_reasons_for_wrong_weekday_and_before_time(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from contributor_bot.store import Store
+        from contributor_bot.weekly import post_weekly_if_due
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config("tok", "123", "456", discord_guild_id="333", merged_weekly_enabled=True)
+
+        thu = datetime(2026, 11, 26, 15, 0, tzinfo=timezone.utc)
+        fri_before = datetime(2026, 11, 27, 14, 58, tzinfo=timezone.utc)  # 09:58 Toronto
+        with self.assertLogs(level="INFO") as logs:
+            self.assertIsNone(post_weekly_if_due(cfg, store, thu))
+            self.assertIsNone(post_weekly_if_due(cfg, store, thu))  # deduplicated
+            self.assertIsNone(post_weekly_if_due(cfg, store, fri_before))
+            self.assertIsNone(post_weekly_if_due(cfg, store, fri_before))  # deduplicated
+        wrong_day = [line for line in logs.output if "today is thursday" in line]
+        before_time = [line for line in logs.output if "is before friday 10:00 America/Toronto" in line]
+        self.assertEqual(len(wrong_day), 1)
+        self.assertEqual(len(before_time), 1)
+
+    def test_main_run_loop_watchdog_runs_weekly_check_and_survives_exceptions(self):
+        import tempfile
+        from pathlib import Path
+        from contributor_bot.main import _run_loop
+        from contributor_bot.store import Store
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "tok", "123", "456",
+            merged_weekly_enabled=True,
+            pr_review_enabled=False,
+            poll_interval_seconds=300,
+        )
+
+        # Simulate 2 loop iterations: tick 1 raises RuntimeError, tick 2 succeeds, then stops.
+        ticks = {"count": 0}
+        stop_event = mock.Mock()
+        stop_event.is_set.side_effect = lambda: ticks["count"] >= 2
+
+        def fake_wait(_delay):
+            ticks["count"] += 1
+            return False
+
+        stop_event.wait.side_effect = fake_wait
+        calls = []
+
+        def flaky_weekly(*_args, **_kwargs):
+            calls.append(len(calls) + 1)
+            if len(calls) == 1:
+                raise RuntimeError("transient network error")
+            return "posted"
+
+        with mock.patch("contributor_bot.main.post_weekly_if_due", side_effect=flaky_weekly), \
+                self.assertLogs(level="INFO") as logs:
+            _run_loop(cfg, stop_event, store=store, gateway=None)
+
+        self.assertEqual(calls, [1, 2])
+        self.assertTrue(any("Weekly merge summary watchdog check failed" in line for line in logs.output))
+        # Delay must be capped at 60s when weekly watchdog is active.
+        for call_args in stop_event.wait.call_args_list:
+            self.assertLessEqual(call_args.args[0], 60.0)
+
+    def test_gateway_run_reconnects_after_unexpected_exit(self):
+        from contributor_bot.gateway import Gateway
+
+        gw = Gateway()
+        attempts = {"count": 0}
+
+        async def fake_serve(_discord, _config, _store):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("gateway dropped overnight")
+            gw._stop.set()
+            return True
+
+        gw._serve = fake_serve
+        cfg = Config("tok", "123", "456")
+        with mock.patch("contributor_bot.gateway._load_discord", return_value=object()), \
+                mock.patch.object(gw._stop, "wait", return_value=False), \
+                self.assertLogs(level="WARNING") as logs:
+            gw._run(cfg, None)
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertTrue(any("reconnecting in" in line for line in logs.output))
+
+    def test_force_weekly_post_now_posts_and_marks_week(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from contributor_bot.store import Store
+        from contributor_bot.weekly import post_weekly_if_due
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config("tok", "123", "456", discord_guild_id="333", merged_weekly_enabled=True)
+        guild = self._make_guild()
+        posted = []
+        send = lambda ch, _tok, msg: posted.append((ch, msg))
+        sat = datetime(2026, 11, 28, 15, 0, tzinfo=timezone.utc)  # Saturday (outside Friday window)
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=self._make_fake_github(include_match=True)):
+            result = post_weekly_if_due(cfg, store, sat, post=send, guild=guild, force=True)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+
 class SampleRoutingTests(unittest.TestCase):
     def test_sample_table_uses_the_mock(self):
         from scripts.dry_run_decisions import SAMPLES, table

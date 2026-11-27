@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -21,6 +22,7 @@ _WEEKDAYS = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6,
 }
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 WEEKLY_CHUNK_LIMIT = 1900
 SUPPRESS_EMBEDS_FLAG = 1 << 2  # Discord message flag: SUPPRESS_EMBEDS (4)
@@ -28,6 +30,7 @@ WEEKLY_HEADER = "thank you to this week's contributors 🙏"
 DEFAULT_WEEKLY_CHANNEL_NAME = "announcements"
 _POSTABLE_CHANNEL_TYPES = frozenset({0, 5})  # GUILD_TEXT, GUILD_ANNOUNCEMENT
 WEEKLY_LOOKBACK_MAX_DAYS = 14
+WEEKLY_ZERO_MATCH_RETRY_SECONDS = 900.0
 
 COMMUNITY_AUTHOR_ASSOCIATIONS = frozenset({"CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"})
 EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
@@ -35,6 +38,11 @@ EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
 ORG_MEMBERS_CACHE_TTL_SECONDS = 3600.0
 _org_cache_lock = threading.Lock()
 _org_members_cache: dict[str, tuple[frozenset[str], float]] = {}
+
+_weekly_post_lock = threading.Lock()
+_weekly_state_lock = threading.Lock()
+_weekly_retry_after: dict[tuple[str, str], float] = {}
+_weekly_last_skip_log: dict[tuple[str, str], str] = {}
 
 _MENTION_ID = re.compile(r"<@([1-9][0-9]{0,19})>")
 _LEADING_BRACKET_TAG = re.compile(r"^\s*\[[^\]]{1,40}\]\s*")
@@ -844,6 +852,78 @@ def build_weekly_chunks(
     return report.chunks
 
 
+def reset_weekly_scheduler_state() -> None:
+    """Clear in-memory weekly retry backoff and skip-log deduplication (for tests)."""
+    with _weekly_state_lock:
+        _weekly_retry_after.clear()
+        _weekly_last_skip_log.clear()
+
+
+def _weekday_name(weekday: int) -> str:
+    return _WEEKDAY_NAMES[weekday] if 0 <= weekday <= 6 else str(weekday)
+
+
+def _merged_week_info(store, repository: str, key: str) -> dict | None:
+    if store is None:
+        return None
+    if hasattr(store, "merged_week_info"):
+        return store.merged_week_info(repository, key)
+    if store.merged_week_posted(repository, key):
+        return {"week_key": key, "posted_at": None}
+    return None
+
+
+def _store_db_label(store) -> str:
+    raw = getattr(store, "path", None)
+    if not raw:
+        return "<unknown>"
+    if raw == ":memory:":
+        return ":memory:"
+    try:
+        return str(Path(raw).resolve())
+    except OSError:
+        return str(raw)
+
+
+def _log_weekly_skip(repository: str, scope_key: str, reason_code: str, message: str, *args) -> None:
+    """Emit one INFO log per (repo, scope, reason) transition so 60s ticks stay readable."""
+    cache_key = (repository.lower(), scope_key)
+    with _weekly_state_lock:
+        if _weekly_last_skip_log.get(cache_key) == reason_code:
+            return
+        _weekly_last_skip_log[cache_key] = reason_code
+    logging.info(message, *args)
+
+
+def _clear_weekly_skip(repository: str, scope_key: str) -> None:
+    with _weekly_state_lock:
+        _weekly_last_skip_log.pop((repository.lower(), scope_key), None)
+
+
+def weekly_schedule_status(config, store, now: datetime | None = None) -> str:
+    """Human-readable one-line status of the weekly scheduler and its SQLite state."""
+    moment = now or datetime.now(UTC)
+    local = moment.astimezone(ZoneInfo(config.merged_timezone))
+    key = week_key(local)
+    dest = (config.announcements_channel_id or "").strip() or f"#{DEFAULT_WEEKLY_CHANNEL_NAME}"
+    day_label = _weekday_name(config.merged_weekday)
+    info = _merged_week_info(store, config.github_repository, key) if store is not None else None
+    if not config.merged_weekly_enabled:
+        state = "disabled"
+    elif info is not None:
+        posted_at = info.get("posted_at") or "unknown time"
+        state = f"already posted at {posted_at}"
+    elif weekly_is_due(moment, config.merged_weekday, config.merged_time, config.merged_timezone, None):
+        state = "due now (will catch up)"
+    else:
+        state = f"waiting for {day_label} {config.merged_time} {config.merged_timezone}"
+    return (
+        f"{day_label} {config.merged_time} {config.merged_timezone}, "
+        f"destination {dest}, now={local.strftime('%Y-%m-%d %H:%M %Z')}, "
+        f"week={key}, status={state}, db={_store_db_label(store)}"
+    )
+
+
 def post_weekly_if_due(
     config,
     store,
@@ -853,68 +933,172 @@ def post_weekly_if_due(
     guild=None,
     loop=None,
     channels_fetcher=None,
+    force: bool = False,
+    clock=time.monotonic,
 ) -> str | None:
-    """Post this week's summary once on the configured weekday/time.
+    """Post this week's summary once on the configured weekday at or after the configured time.
 
-    Safe across process restarts:
-    - Before the scheduled time: returns None.
-    - At or after the scheduled time on the target weekday: posts once and
-      persists ``week_key`` in SQLite so later restarts never double-post.
+    Safe across restarts and concurrent scheduler ticks:
+    - Protected by a process-wide lock so gateway and fallback watchdogs cannot double-post.
+    - Before the scheduled time (or on other weekdays): logs a clear INFO skip reason once and returns None.
+    - At or after the scheduled time on the target weekday: catches up automatically if not yet posted
+      for that ISO week, posts once, and persists ``week_key`` in SQLite.
+    - Never marks ``merged_weeks`` when 0 contributors matched or when an error occurs, so transient
+      blips cannot silently poison the rest of the week.
     """
-    if not config.merged_weekly_enabled:
+    if not force and not config.merged_weekly_enabled:
         return None
-    moment = now or datetime.now(UTC)
-    local = moment.astimezone(ZoneInfo(config.merged_timezone))
-    key = week_key(local)
-    if not weekly_is_due(
-        moment, config.merged_weekday, config.merged_time, config.merged_timezone,
-        key if store.merged_week_posted(config.github_repository, key) else None,
-    ):
-        return None
-    channel = resolve_weekly_channel_id(config, guild=guild, channels_fetcher=channels_fetcher)
-    if not channel:
-        logging.warning("Weekly merge summary skipped: no destination channel configured or #announcements found")
+    if not _weekly_post_lock.acquire(blocking=False):
+        logging.info("Weekly merge summary check skipped: another weekly post run is already in progress")
         return None
     try:
-        report = build_weekly_report(
-            config,
-            store,
-            moment,
-            guild=guild,
-            loop=loop,
-            pace=True,
-        )
-    except WeeklyFetchError as error:
-        if error.rate_limited:
-            wait_note = f" (retry_after={error.retry_after:.0f}s)" if isinstance(error.retry_after, (int, float)) else ""
+        moment = now or datetime.now(UTC)
+        local = moment.astimezone(ZoneInfo(config.merged_timezone))
+        key = week_key(local)
+        day_scope = local.date().isoformat()
+        repo = config.github_repository
+        day_label = _weekday_name(config.merged_weekday)
+
+        if not force:
+            posted_info = _merged_week_info(store, repo, key)
+            if posted_info is not None:
+                posted_at = posted_info.get("posted_at") or "unknown time"
+                _log_weekly_skip(
+                    repo,
+                    key,
+                    "already_posted",
+                    "Weekly merge summary skipped for %s: already posted at %s",
+                    key,
+                    posted_at,
+                )
+                return None
+            if local.weekday() != config.merged_weekday:
+                _log_weekly_skip(
+                    repo,
+                    day_scope,
+                    f"wrong_weekday:{local.weekday()}",
+                    "Weekly merge summary skipped for %s: today is %s (scheduled for %s %s %s)",
+                    key,
+                    _weekday_name(local.weekday()),
+                    day_label,
+                    config.merged_time,
+                    config.merged_timezone,
+                )
+                return None
+            hour, minute = (int(part) for part in config.merged_time.split(":", 1))
+            if (local.hour, local.minute) < (hour, minute):
+                _log_weekly_skip(
+                    repo,
+                    day_scope,
+                    "before_time",
+                    "Weekly merge summary waiting for %s: local time %s is before %s %s %s",
+                    key,
+                    local.strftime("%H:%M %Z"),
+                    day_label,
+                    config.merged_time,
+                    config.merged_timezone,
+                )
+                return None
+            # Double-check with weekly_is_due as single source of truth.
+            if not weekly_is_due(
+                moment, config.merged_weekday, config.merged_time, config.merged_timezone, None,
+            ):
+                return None
+            retry_key = (repo.lower(), key)
+            with _weekly_state_lock:
+                retry_deadline = _weekly_retry_after.get(retry_key, 0.0)
+            if clock() < retry_deadline:
+                remaining = int(max(1.0, retry_deadline - clock()))
+                _log_weekly_skip(
+                    repo,
+                    key,
+                    "zero_match_backoff",
+                    "Weekly merge summary for %s deferred after 0-match run; retrying in ~%ds",
+                    key,
+                    remaining,
+                )
+                return None
+
+        channel = resolve_weekly_channel_id(config, guild=guild, channels_fetcher=channels_fetcher)
+        if not channel:
             logging.warning(
-                "Weekly merge summary deferred due to GitHub rate limit%s; will retry automatically: %s",
-                wait_note,
-                error,
+                "Weekly merge summary skipped for %s: no destination channel configured or #%s found",
+                key,
+                DEFAULT_WEEKLY_CHANNEL_NAME,
             )
             return None
-        raise
-    if report.matched_count == 0:
-        diag = report.diagnostics.summary_line() if report.diagnostics is not None else ""
-        logging.warning("Weekly merge summary skipped: 0 discord-matched contributors %s", diag)
-        # If guild members were actually loaded and truly 0 matched, record the week so
-        # the 60s scheduler does not re-query GitHub every minute. If 0 members were
-        # loaded (transient outage), leave unmarked so the next tick retries.
-        if report.diagnostics is not None and report.diagnostics.member_count > 0:
-            store.mark_merged_week(config.github_repository, key, iso(moment))
-        return None
-    sender = post or post_message
-    recorded = False
-    for chunk in report.chunks:
-        users = chunk_mention_user_ids(chunk)
-        sender(channel, config.discord_token, {
-            "content": chunk,
-            "flags": SUPPRESS_EMBEDS_FLAG,
-            "allowed_mentions": {"parse": [], "users": users},
-        })
-        if not recorded:
-            recorded = True
-            if not store.mark_merged_week(config.github_repository, key, iso(moment)):
-                logging.info("Weekly merge summary for %s was already recorded", key)
-    logging.info("Posted weekly merge summary for %s to channel %s (%d chunks)", key, channel, len(report.chunks))
-    return "\n\n".join(report.chunks)
+
+        _clear_weekly_skip(repo, day_scope)
+        _clear_weekly_skip(repo, key)
+        logging.info(
+            "Weekly merge summary %s for %s (local=%s, channel=%s); building report",
+            "forced" if force else "due",
+            key,
+            local.strftime("%Y-%m-%d %H:%M %Z"),
+            channel,
+        )
+        try:
+            report = build_weekly_report(
+                config,
+                store,
+                moment,
+                guild=guild,
+                loop=loop,
+                pace=True,
+            )
+        except WeeklyFetchError as error:
+            if error.rate_limited:
+                wait_note = (
+                    f" (retry_after={error.retry_after:.0f}s)"
+                    if isinstance(error.retry_after, (int, float))
+                    else ""
+                )
+                logging.warning(
+                    "Weekly merge summary for %s deferred due to GitHub rate limit%s; will retry automatically: %s",
+                    key,
+                    wait_note,
+                    error,
+                )
+                return None
+            raise
+
+        if report.matched_count == 0:
+            diag = report.diagnostics.summary_line() if report.diagnostics is not None else ""
+            if not force:
+                with _weekly_state_lock:
+                    _weekly_retry_after[(repo.lower(), key)] = clock() + WEEKLY_ZERO_MATCH_RETRY_SECONDS
+            logging.warning(
+                "Weekly merge summary skipped for %s: 0 discord-matched contributors %s "
+                "(week left unmarked in SQLite; will retry in %ds)",
+                key,
+                diag,
+                int(WEEKLY_ZERO_MATCH_RETRY_SECONDS),
+            )
+            return None
+
+        with _weekly_state_lock:
+            _weekly_retry_after.pop((repo.lower(), key), None)
+
+        sender = post or post_message
+        recorded = False
+        for chunk in report.chunks:
+            users = chunk_mention_user_ids(chunk)
+            sender(channel, config.discord_token, {
+                "content": chunk,
+                "flags": SUPPRESS_EMBEDS_FLAG,
+                "allowed_mentions": {"parse": [], "users": users},
+            })
+            if not recorded:
+                recorded = True
+                if not store.mark_merged_week(repo, key, iso(moment)):
+                    logging.info("Weekly merge summary for %s was already recorded in SQLite", key)
+        logging.info(
+            "Posted weekly merge summary for %s to channel %s (%d contributors, %d chunks)",
+            key,
+            channel,
+            report.matched_count,
+            len(report.chunks),
+        )
+        return "\n\n".join(report.chunks)
+    finally:
+        _weekly_post_lock.release()

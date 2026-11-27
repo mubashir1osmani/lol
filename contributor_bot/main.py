@@ -24,6 +24,7 @@ from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
 from .signatures import ed25519_public_key_ok
 from .state import load_state, save_state
+from .weekly import post_weekly_if_due, weekly_schedule_status
 
 
 def moderator_channel(channel_id: str, token: str) -> dict:
@@ -112,6 +113,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Scan historical merged PRs and grant contributor roles to linked Discord users",
     )
+    mode.add_argument(
+        "--post-weekly-now",
+        action="store_true",
+        help="Post this week's contributor summary to ANNOUNCEMENTS_CHANNEL_ID right now and exit",
+    )
     args = parser.parse_args(argv)
     load_dotenv()
     logging.basicConfig(
@@ -130,6 +136,16 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.backfill_merged_prs:
         run_backfill(config)
+        return
+    if args.post_weekly_now:
+        store = Store(config.roles_db_path)
+        try:
+            posted = post_weekly_if_due(config, store, force=True)
+        finally:
+            store.close()
+        if posted is None:
+            raise SystemExit("Weekly summary was not posted (0 matched contributors or missing destination channel)")
+        print("Weekly summary posted.")
         return
     if args.once:
         poll_once(config)
@@ -241,33 +257,43 @@ def start_contributor_roles(config):
 
 def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
     reviews = bool(config.pr_review_enabled and store is not None)
-    weekday_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-    day_label = weekday_names[config.merged_weekday] if 0 <= config.merged_weekday <= 6 else str(config.merged_weekday)
+    weekly_watchdog = bool(config.merged_weekly_enabled and store is not None)
     if config.merged_weekly_enabled:
-        dest = (config.announcements_channel_id or "").strip() or "#announcements"
-        logging.info(
-            "Weekly contributor summary: %s %s %s, destination %s",
-            day_label, config.merged_time, config.merged_timezone, dest,
-        )
+        logging.info("Weekly contributor summary: %s", weekly_schedule_status(config, store))
     if config.announcements_enabled:
         logging.info(
             "Legacy roundup poller (ANNOUNCEMENTS_ENABLED) is retired; "
             "weekly posts run only via the Friday %s %s summary scheduler.",
             config.merged_time, config.merged_timezone,
         )
-    if not reviews:
+    if not reviews and not weekly_watchdog:
         if not config.announcements_enabled:
             logging.info("Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false).")
         stop_event.wait()
         return
     if config.pr_review_enabled and not reviews:
         logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
+    first_tick = True
     while not stop_event.is_set():
-        delay = config.poll_interval_seconds
+        delay = min(config.poll_interval_seconds, 60.0) if weekly_watchdog else config.poll_interval_seconds
         gateway_live = gateway is not None and gateway.connected.is_set()
         if reviews and not gateway_live:
             try:
                 poll_review_channels(config, store)
             except Exception:
                 logging.exception("PR review poll failed")
+        # Give a freshly started gateway one brief cycle to connect and use its
+        # cached guild member list; thereafter run a 60s watchdog regardless so
+        # a dead gateway or stopped tasks.loop can never silence the Friday post.
+        if weekly_watchdog and not (first_tick and gateway is not None and not gateway_live):
+            guild, loop = (
+                gateway.current_guild_and_loop(config)
+                if gateway is not None and hasattr(gateway, "current_guild_and_loop")
+                else (None, None)
+            )
+            try:
+                post_weekly_if_due(config, store, guild=guild, loop=loop)
+            except Exception:
+                logging.exception("Weekly merge summary watchdog check failed")
+        first_tick = False
         stop_event.wait(delay)
