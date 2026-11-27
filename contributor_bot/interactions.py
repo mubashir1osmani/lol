@@ -172,7 +172,7 @@ def _finish_merged_preview(
         chunks = ["couldn't load this week's merges. try again in a minute."]
 
     if not chunks:
-        chunks = ["no Discord-matched community pull requests merged in the last 7 days."]
+        chunks = ["no discord-matched community pull requests merged in the last 7 days."]
     try:
         edit_original_interaction(application_id, interaction_token, {
             "content": chunks[0],
