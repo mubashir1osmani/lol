@@ -2050,6 +2050,71 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
                 post_weekly_if_due(cfg, store, fri, post=send, guild=guild)
         self.assertTrue(any("Weekly merge summary report build failed" in line for line in err_logs.output))
 
+    def test_manual_merged_in_announcements_on_friday_marks_week_other_runs_do_not(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from contributor_bot.interactions import _finish_merged_preview
+        from contributor_bot.store import Store
+        from contributor_bot.weekly import post_weekly_if_due
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "tok", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            merged_weekly_enabled=True,
+            merged_weekday=4,
+            merged_time="10:00",
+            merged_timezone="America/Toronto",
+        )
+        guild = self._make_guild()
+        fake_gh = self._make_fake_github(include_match=True)
+        fri_after = datetime(2026, 11, 27, 19, 30, tzinfo=timezone.utc)   # Fri 2:30 PM Toronto
+        fri_before = datetime(2026, 11, 27, 14, 55, tzinfo=timezone.utc)  # Fri 9:55 AM Toronto
+        thu_evening = datetime(2026, 11, 27, 1, 0, tzinfo=timezone.utc)   # Thu 8:00 PM Toronto
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction"), \
+                mock.patch("contributor_bot.interactions.post_interaction_followup"):
+            # 1) Non-destination channel on Friday afternoon -> does NOT mark merged_weeks.
+            _finish_merged_preview(cfg, store, "tok", "444", channel_id="123", guild=guild, now=fri_after)
+            self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+            # 2) Destination channel on Thursday evening or Friday before 10:00 -> does NOT mark merged_weeks.
+            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=thu_evening)
+            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=fri_before)
+            self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+        # 3) Destination channel on Friday afternoon with 0 matches -> does NOT mark merged_weeks.
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=self._make_fake_github(include_match=False)), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction"), \
+                mock.patch("contributor_bot.interactions.post_interaction_followup"):
+            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=fri_after)
+            self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+        # 4) Destination channel (#announcements = "456") on Friday >= 10:00 with matches -> marks 2026-W48!
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
+                mock.patch("contributor_bot.interactions.edit_original_interaction"), \
+                mock.patch("contributor_bot.interactions.post_interaction_followup"), \
+                self.assertLogs(level="INFO") as logs:
+            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=fri_after)
+        self.assertTrue(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+        self.assertTrue(any("Marked weekly merge summary 2026-W48 as posted via /merged-this-week" in l for l in logs.output))
+
+        # Scheduled post afterwards must NOT duplicate it!
+        posted = []
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            res = post_weekly_if_due(
+                cfg, store, datetime(2026, 11, 27, 19, 35, tzinfo=timezone.utc),
+                post=lambda ch, _t, m: posted.append((ch, m)), guild=guild,
+            )
+        self.assertIsNone(res)
+        self.assertEqual(posted, [])
+
 
 class SampleRoutingTests(unittest.TestCase):
     def test_sample_table_uses_the_mock(self):

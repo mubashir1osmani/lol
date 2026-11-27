@@ -141,6 +141,7 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
             store,
             payload.get("token"),
             application_id=str(payload.get("application_id") or config.discord_application_id or ""),
+            channel_id=str(payload.get("channel_id") or ""),
             guild=payload.get("_guild"),
             loop=payload.get("_loop"),
         )
@@ -157,21 +158,53 @@ def _merged_preview(
     interaction_token: object,
     *,
     application_id: str = "",
+    channel_id: str = "",
     guild=None,
     loop=None,
 ) -> dict:
-    """Defer immediately, then send the weekly summary without marking the week posted."""
+    """Defer immediately, then send the weekly summary.
+
+    Marks ``merged_weeks`` only when run in the weekly destination channel
+    on the scheduled weekday at or after the scheduled time.
+    """
     if not isinstance(interaction_token, str) or not interaction_token:
         return _ephemeral("couldn't open that reply. try /merged-this-week again.")
     app_id = application_id or (config.discord_application_id or "")
     threading.Thread(
         target=_finish_merged_preview,
         args=(config, store, interaction_token, app_id),
-        kwargs={"guild": guild, "loop": loop},
+        kwargs={"channel_id": channel_id, "guild": guild, "loop": loop},
         name="merged-this-week",
         daemon=True,
     ).start()
     return {"type": 5, "data": {"flags": _EPHEMERAL}}
+
+
+def _should_mark_manual_weekly_post(
+    config: Config,
+    channel_id: str,
+    moment: datetime,
+    *,
+    guild=None,
+) -> bool:
+    """True when /merged-this-week ran in the weekly destination channel on/after the scheduled Friday slot."""
+    from .weekly import resolve_weekly_channel_id, weekly_is_due
+
+    cleaned_channel = (channel_id or "").strip()
+    if not cleaned_channel:
+        return False
+    destination = (config.announcements_channel_id or "").strip()
+    if not destination:
+        destination = resolve_weekly_channel_id(config, guild=guild) or ""
+    if cleaned_channel != destination:
+        return False
+    return weekly_is_due(
+        moment,
+        config.merged_weekday,
+        config.merged_time,
+        config.merged_timezone,
+        None,
+    )
 
 
 def _finish_merged_preview(
@@ -180,13 +213,19 @@ def _finish_merged_preview(
     interaction_token: str,
     application_id: str,
     *,
+    channel_id: str = "",
     guild=None,
     loop=None,
+    now: datetime | None = None,
 ) -> None:
-    from .weekly import WeeklyFetchError, build_weekly_report, chunk_mention_user_ids
+    from zoneinfo import ZoneInfo
+    from .weekly import WeeklyFetchError, build_weekly_report, chunk_mention_user_ids, week_key
 
+    moment = now or datetime.now(UTC)
+    matched_count = 0
     try:
-        report = build_weekly_report(config, store, guild=guild, loop=loop, pace=False)
+        report = build_weekly_report(config, store, moment, guild=guild, loop=loop, pace=False)
+        matched_count = report.matched_count
         chunks = list(report.chunks)
         if report.matched_count == 0 and report.diagnostics is not None and chunks:
             diag_line = report.diagnostics.summary_line()
@@ -220,6 +259,19 @@ def _finish_merged_preview(
                 "flags": _EPHEMERAL | _SUPPRESS_EMBEDS,
                 "allowed_mentions": {"parse": [], "users": chunk_mention_user_ids(chunk)},
             })
+        if (
+            matched_count > 0
+            and store is not None
+            and _should_mark_manual_weekly_post(config, channel_id, moment, guild=guild)
+        ):
+            local = moment.astimezone(ZoneInfo(config.merged_timezone))
+            key = week_key(local)
+            if store.mark_merged_week(config.github_repository, key, iso(moment)):
+                logging.info(
+                    "Marked weekly merge summary %s as posted via /merged-this-week in destination channel %s",
+                    key,
+                    channel_id,
+                )
     except Exception:
         logging.exception("Could not send the /merged-this-week follow-up")
 
