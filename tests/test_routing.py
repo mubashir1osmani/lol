@@ -140,17 +140,43 @@ class TriggerTests(unittest.TestCase):
 
 
 class WeeklyTests(unittest.TestCase):
-    def test_groups_skip_maintainers_and_a_week_posts_once(self):
+    def tearDown(self):
+        from contributor_bot.weekly import reset_org_members_cache
+        reset_org_members_cache()
+
+    def test_groups_filter_org_members_staff_associations_and_bots(self):
+        from contributor_bot.weekly import fetch_org_public_members, reset_org_members_cache
+        reset_org_members_cache()
+
         groups = community_groups([
-            {"login": "octocat", "type": "User", "user_id": 5, "number": 12, "title": "add a timeout", "url": "https://github.com/BerriAI/litellm/pull/12"},
-            {"login": "ishaan-berri", "type": "User", "user_id": 9, "number": 13, "title": "internal", "url": "https://github.com/BerriAI/litellm/pull/13"},
-            {"login": "cursor[bot]", "type": "Bot", "user_id": 1, "number": 14, "title": "bot", "url": "https://github.com/BerriAI/litellm/pull/14"},
-        ], ("ishaan-berri",), {5: "111"})
+            {"login": "octocat", "type": "User", "user_id": 5, "number": 12, "title": "add a timeout", "url": "https://github.com/BerriAI/litellm/pull/12", "author_association": "CONTRIBUTOR"},
+            {"login": "octocat", "type": "User", "user_id": 5, "number": 19, "title": "fix docs", "url": "https://github.com/BerriAI/litellm/pull/19", "author_association": "CONTRIBUTOR"},
+            {"login": "newbie", "type": "User", "user_id": 6, "number": 18, "title": "first pr", "url": "https://github.com/BerriAI/litellm/pull/18", "author_association": "FIRST_TIME_CONTRIBUTOR"},
+            {"login": "public-org-member", "type": "User", "user_id": 7, "number": 15, "title": "org", "url": "https://github.com/BerriAI/litellm/pull/15", "author_association": "CONTRIBUTOR"},
+            {"login": "core-member", "type": "User", "user_id": 8, "number": 16, "title": "member", "url": "https://github.com/BerriAI/litellm/pull/16", "author_association": "MEMBER"},
+            {"login": "repo-owner", "type": "User", "user_id": 10, "number": 20, "title": "owner", "url": "https://github.com/BerriAI/litellm/pull/20", "author_association": "OWNER"},
+            {"login": "collab", "type": "User", "user_id": 11, "number": 21, "title": "collab", "url": "https://github.com/BerriAI/litellm/pull/21", "author_association": "COLLABORATOR"},
+            {"login": "yuneng-berri", "type": "User", "user_id": 12, "number": 22, "title": "berri staff", "url": "https://github.com/BerriAI/litellm/pull/22", "author_association": "CONTRIBUTOR"},
+            {"login": "ishaan", "type": "User", "user_id": 9, "number": 13, "title": "internal", "url": "https://github.com/BerriAI/litellm/pull/13", "author_association": "CONTRIBUTOR"},
+            {"login": "cursor[bot]", "type": "Bot", "user_id": 1, "number": 14, "title": "bot", "url": "https://github.com/BerriAI/litellm/pull/14", "author_association": "CONTRIBUTOR"},
+        ], ("ishaan",), {5: "111"}, org_members={"public-org-member"}, org="BerriAI")
+        self.assertEqual([g["login"] for g in groups], ["octocat", "newbie"])
+
         text = render_weekly(groups, since=datetime(2026, 11, 19, tzinfo=timezone.utc))
-        self.assertIn("**octocat** <@111>", text)
-        self.assertIn("add a timeout", text)
-        self.assertNotIn("ishaan-berri", text)
-        self.assertNotIn("cursor[bot]", text)
+        self.assertIn("- <@111>: 2 PRs ([#12](<https://github.com/BerriAI/litellm/pull/12>), [#19](<https://github.com/BerriAI/litellm/pull/19>))", text)
+        self.assertNotIn("octocat", text)
+        self.assertNotIn("newbie", text)
+        for excluded in ("public-org-member", "core-member", "repo-owner", "collab", "yuneng-berri", "ishaan", "cursor[bot]"):
+            self.assertNotIn(excluded, text)
+
+        # Public org members lookup caches with TTL.
+        with mock.patch("contributor_bot.weekly.github_get_json", return_value=[{"login": "AliceStaff"}, {"login": "BobStaff"}]) as getter:
+            first = fetch_org_public_members("BerriAI", None)
+            second = fetch_org_public_members("BerriAI", None)
+        self.assertEqual(first, frozenset({"alicestaff", "bobstaff"}))
+        self.assertEqual(second, first)
+        self.assertEqual(getter.call_count, 1)
+
         from zoneinfo import ZoneInfo
         moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)  # Monday 10:00 in Toronto
         local = moment.astimezone(ZoneInfo("America/Toronto"))
@@ -163,13 +189,247 @@ class WeeklyTests(unittest.TestCase):
         self.assertTrue(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
         self.assertFalse(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
 
-    def test_merged_this_week_defers_and_splits_long_summary_without_marking_posted(self):
+    def test_automatic_matcher_signals_jev_batch_haiku_fallback_and_sqlite_cache(self):
+        from types import SimpleNamespace
+        from contributor_bot.matcher import (
+            extract_discord_handles_from_text,
+            extract_discord_ids_from_text,
+            normalize_base,
+            normalize_strict,
+        )
+        from contributor_bot.weekly import build_weekly_report, reset_org_members_cache
+
+        reset_org_members_cache()
+        self.assertEqual(normalize_strict("Pavel.N_83"), "paveln83")
+        self.assertEqual(normalize_base("Pavel.N_83"), "paveln")
+        self.assertEqual(extract_discord_handles_from_text("Join discord.gg/litellm | Discord: @izzy_dev"), ["izzy_dev"])
+        self.assertEqual(extract_discord_ids_from_text("https://discord.com/users/900000000000000009"), ["900000000000000009"])
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        # No /link-github entries needed at all; optional link_store still works if present.
+        store.link_account("100000000000000001", "linkedDev", 101, "2026-11-20T00:00:00+00:00")
+
+        gh_items = [
+            {"number": 1, "title": "a", "html_url": "https://github.com/BerriAI/litellm/pull/1", "user": {"login": "linkedDev", "type": "User", "id": 101}, "author_association": "CONTRIBUTOR"},
+            {"number": 2, "title": "b", "html_url": "https://github.com/BerriAI/litellm/pull/2", "user": {"login": "paveln83", "type": "User", "id": 102}, "author_association": "CONTRIBUTOR"},
+            {"number": 3, "title": "c", "html_url": "https://github.com/BerriAI/litellm/pull/3", "user": {"login": "gh-bio-user", "type": "User", "id": 103}, "author_association": "CONTRIBUTOR"},
+            {"number": 4, "title": "d", "html_url": "https://github.com/BerriAI/litellm/pull/4", "user": {"login": "gh-twit-user", "type": "User", "id": 104}, "author_association": "CONTRIBUTOR"},
+            {"number": 5, "title": "e", "html_url": "https://github.com/BerriAI/litellm/pull/5", "user": {"login": "gh-name-user", "type": "User", "id": 105}, "author_association": "CONTRIBUTOR"},
+            {"number": 6, "title": "f", "html_url": "https://github.com/BerriAI/litellm/pull/6", "user": {"login": "gh-fuzzy-win", "type": "User", "id": 106}, "author_association": "CONTRIBUTOR"},
+            {"number": 7, "title": "g", "html_url": "https://github.com/BerriAI/litellm/pull/7", "user": {"login": "gh-fuzzy-low", "type": "User", "id": 107}, "author_association": "CONTRIBUTOR"},
+            {"number": 8, "title": "h", "html_url": "https://github.com/BerriAI/litellm/pull/8", "user": {"login": "totally-unknown", "type": "User", "id": 108}, "author_association": "CONTRIBUTOR"},
+        ]
+
+        profiles = {
+            "paveln83": {"login": "paveln83", "name": "Pavel", "bio": "", "blog": "", "twitter_username": None},
+            "gh-bio-user": {"login": "gh-bio-user", "name": "", "bio": "ML eng | Discord: @real_bio_handle", "blog": "", "twitter_username": None},
+            "gh-twit-user": {"login": "gh-twit-user", "name": "", "bio": "", "blog": "", "twitter_username": "cooltwitter"},
+            "gh-name-user": {"login": "gh-name-user", "name": "Elena Rostova", "bio": "", "blog": "", "twitter_username": None},
+            "gh-fuzzy-win": {"login": "gh-fuzzy-win", "name": "Marcus Vance", "bio": "working on proxies", "blog": "", "twitter_username": None},
+            "gh-fuzzy-low": {"login": "gh-fuzzy-low", "name": "Jordan Kim", "bio": "", "blog": "", "twitter_username": None},
+            "totally-unknown": {"login": "totally-unknown", "name": "Nobody Special", "bio": "", "blog": "", "twitter_username": None},
+        }
+        commits = {
+            6: [{"author": {"login": "gh-fuzzy-win"}, "commit": {"author": {"name": "Marcus Vance", "email": "mvance@example.com"}}}],
+            7: [{"author": {"login": "gh-fuzzy-low"}, "commit": {"author": {"name": "Jordan Kim", "email": "jkim@example.com"}}}],
+        }
+        github_calls = {"users": 0, "commits": 0}
+
+        def fake_gh(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            if "/search/issues" in url:
+                return {"items": gh_items}
+            if "/users/" in url:
+                github_calls["users"] += 1
+                login = url.rsplit("/users/", 1)[1]
+                return profiles.get(login, {"login": login})
+            if "/commits" in url:
+                github_calls["commits"] += 1
+                num = int(url.split("/pulls/")[1].split("/")[0])
+                return commits.get(num, [])
+            return {}
+
+        guild_members = [
+            SimpleNamespace(id=200000000000000002, name="pavel_n", global_name="Pavel N", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000003, name="real_bio_handle", global_name="Bio Person", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000004, name="someone_else", global_name="CoolTwitter", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000005, name="erostova_alt", global_name="Other", nick="Elena Rostova", bot=False),
+            SimpleNamespace(id=200000000000000006, name="mvance", global_name="Marcus V", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000007, name="jkim", global_name="JK", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000099, name="totally-unknown", global_name=None, nick=None, bot=True),
+        ]
+
+        # Empty cache triggers guild.fetch_members().
+        class _FetchGuild:
+            members = []
+
+            async def fetch_members(self, limit=None):
+                for item in guild_members:
+                    yield item
+
+        jev_requests = []
+
+        def fake_jev(body_bytes):
+            payload = json.loads(body_bytes.decode("utf-8"))
+            jev_requests.append(payload)
+            state = json.loads(payload["state"])
+            answers = {}
+            for item in state["candidate_pairs"]:
+                gh_login = item["github"]["login"]
+                if gh_login == "gh-fuzzy-win":
+                    answers[item["pair"]] = {"type": "noul", "noul": 0.91}
+                else:
+                    answers[item["pair"]] = {"type": "noul", "noul": 0.62}
+            return {"model": "jev-1.14.0", "answers": answers, "usage": {"input_tokens": 300, "output_tokens": 20}}
+
+        config = Config(
+            "token", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            typesafe_api_key="ts-key",
+            review_decision_model="jev-latest",
+            discord_members_intent=True,
+        )
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
+                self.assertLogs(level="INFO") as logs:
+            report = build_weekly_report(
+                config,
+                store,
+                now=datetime(2026, 11, 26, tzinfo=timezone.utc),
+                guild=_FetchGuild(),
+                jev_transport=fake_jev,
+            )
+
+        # Single batched Jev call containing both fuzzy pairs; >=0.85 accepted, 0.62 rejected.
+        self.assertEqual(len(jev_requests), 1)
+        self.assertEqual(jev_requests[0]["model"], "jev-latest")
+        self.assertEqual(len(jev_requests[0]["questions"]), 2)
+        for q in jev_requests[0]["questions"].values():
+            self.assertEqual(q["type"], "noul")
+
+        self.assertEqual(report.matched_count, 6)
+        self.assertEqual(report.skipped_count, 2)
+        methods = {d.github_login: (d.discord_id, d.method) for d in report.match_details}
+        self.assertEqual(methods, {
+            "linkedDev": ("100000000000000001", "link_store"),
+            "paveln83": ("200000000000000002", "exact_login"),
+            "gh-bio-user": ("200000000000000003", "bio_discord_handle"),
+            "gh-twit-user": ("200000000000000004", "twitter_match"),
+            "gh-name-user": ("200000000000000005", "exact_name"),
+            "gh-fuzzy-win": ("200000000000000006", "jev"),
+        })
+        body = "\n".join(report.chunks)
+        for uid in ("100000000000000001", "200000000000000002", "200000000000000003", "200000000000000004", "200000000000000005", "200000000000000006"):
+            self.assertIn(f"<@{uid}>", body)
+        self.assertNotIn("200000000000000007", body)
+        self.assertNotIn("gh-fuzzy-low", body)
+        self.assertNotIn("totally-unknown", body)
+        self.assertTrue(any("6 contributors matched in Discord, 2 unmatched skipped" in entry for entry in logs.output))
+
+        # Second run reuses SQLite persisted matches for the 5 auto-matched users:
+        # no GitHub profile/commit calls for already-persisted authors and no Jev call for gh-fuzzy-win.
+        self.assertEqual(len(store.all_confirmed_matches()), 5)
+        github_calls["users"] = 0
+        github_calls["commits"] = 0
+        jev_requests.clear()
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            report2 = build_weekly_report(
+                config,
+                store,
+                now=datetime(2026, 11, 26, tzinfo=timezone.utc),
+                guild=SimpleNamespace(members=guild_members),
+                jev_transport=fake_jev,
+            )
+        self.assertEqual(report2.matched_count, 6)
+        self.assertEqual(report2.skipped_count, 2)
+        # Only the 2 still-unmatched authors hit GitHub /users on rerun.
+        self.assertEqual(github_calls["users"], 2)
+        methods2 = {d.github_login: d.method for d in report2.match_details}
+        self.assertEqual(methods2["paveln83"], "sqlite:exact_login")
+        self.assertEqual(methods2["gh-fuzzy-win"], "sqlite:jev")
+
+        # Haiku fallback when TYPESAFE_API_KEY is absent.
+        store2 = Store(str(Path(directory.name) / "haiku.db"))
+        self.addCleanup(store2.close)
+        cfg_no_ts = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444", typesafe_api_key=None)
+        haiku_calls = []
+
+        def fake_haiku(model, messages):
+            haiku_calls.append((model, messages))
+            data = json.loads(messages[1]["content"])
+            out = {}
+            for item in data["candidate_pairs"]:
+                out[item["pair"]] = 0.89 if item["github"]["login"] == "gh-fuzzy-win" else 0.2
+            return json.dumps(out)
+
+        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": ""}, clear=False), \
+                mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            report_haiku = build_weekly_report(
+                cfg_no_ts,
+                store2,
+                now=datetime(2026, 11, 26, tzinfo=timezone.utc),
+                guild=SimpleNamespace(members=guild_members),
+                haiku_complete=fake_haiku,
+            )
+        self.assertEqual(len(haiku_calls), 1)
+        haiku_methods = {d.github_login: d.method for d in report_haiku.match_details}
+        self.assertEqual(haiku_methods["gh-fuzzy-win"], "haiku")
+        self.assertNotIn("gh-fuzzy-low", haiku_methods)
+
+    def test_ambiguous_collision_goes_to_jev_and_noreply_email_strips_id(self):
+        from contributor_bot.matcher import (
+            DiscordMemberInfo,
+            GitHubAuthorProfile,
+            _extract_email_local,
+            match_community_contributors,
+            score_author_against_members,
+        )
+
+        self.assertEqual(_extract_email_local("123456+AliceDev@users.noreply.github.com"), "AliceDev")
+        self.assertIsNone(_extract_email_local("noreply@github.com"))
+
+        # Two Discord members share the normalized name "alexsmith" -> collision is NOT strong, sent to Jev.
+        members = [
+            DiscordMemberInfo("300000000000000001", username="alex_smith", global_name="Alex Smith"),
+            DiscordMemberInfo("300000000000000002", username="alexsmith99", global_name="Alex Smith"),
+        ]
+        profile = GitHubAuthorProfile(login="alexsmith", name="Alex Smith")
+        strong, candidates = score_author_against_members(profile, members)
+        self.assertIsNone(strong)
+        self.assertEqual(len(candidates), 2)
+
+        # If Jev scores both >=0.85 within 0.05 (ambiguous tie), neither is guessed.
+        cfg = Config("token", "123", "456", typesafe_api_key="ts-key")
+        groups = [{"login": "alexsmith", "user_id": 500, "pulls": [{"number": 1, "title": "x", "url": "https://github.com/BerriAI/litellm/pull/1"}]}]
+
+        def tie_jev(body_bytes):
+            payload = json.loads(body_bytes.decode("utf-8"))
+            return {"answers": {k: {"type": "noul", "noul": 0.88} for k in payload["questions"]}}
+
+        matched, skipped, _details = match_community_contributors(
+            groups,
+            cfg,
+            None,
+            members=members,
+            skip_github_enrichment=True,
+            jev_transport=tie_jev,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
+
+    def test_merged_this_week_defers_suppresses_embeds_and_caps_at_15_lines(self):
         import asyncio
         from types import SimpleNamespace
         from contributor_bot.gateway import _dispatch_command, commands_for_guild
         from contributor_bot.interactions import handle_interaction
-        from contributor_bot.weekly import weekly_chunks
+        from contributor_bot.weekly import SUPPRESS_EMBEDS_FLAG, chunk_mention_user_ids, post_weekly_if_due, reset_org_members_cache, weekly_chunks
 
+        reset_org_members_cache()
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         store = Store(str(Path(directory.name) / "roles.db"))
@@ -180,19 +440,59 @@ class WeeklyTests(unittest.TestCase):
             discord_application_id="444",
             merged_weekly_enabled=True,
             oss_contributors_channel_id="",
+            discord_members_intent=True,
         )
         self.assertIn("merged-this-week", [cmd["name"] for cmd in commands_for_guild(config)])
 
-        # Build >4500 chars of merged PRs across many contributors to force multi-chunk output.
+        # 22 matched external contributors + 3 unmatched external contributors + org/member entries.
         items = [
             {
                 "number": 1000 + i,
-                "title": f"feat(provider-{i}): add streaming tool-call metrics and fallback handling for region {i}",
+                "title": f"feat(provider-{i}): add support",
                 "html_url": f"https://github.com/BerriAI/litellm/pull/{1000 + i}",
                 "user": {"login": f"contrib-{i:02d}", "type": "User", "id": 500 + i},
+                "author_association": "CONTRIBUTOR" if i % 2 == 0 else "FIRST_TIME_CONTRIBUTOR",
             }
-            for i in range(45)
+            for i in range(22)
+        ] + [
+            {
+                "number": 1500 + i,
+                "title": f"unmatched pr {i}",
+                "html_url": f"https://github.com/BerriAI/litellm/pull/{1500 + i}",
+                "user": {"login": f"unmatched-{i:02d}", "type": "User", "id": 700 + i},
+                "author_association": "CONTRIBUTOR",
+            }
+            for i in range(3)
+        ] + [
+            {
+                "number": 2000,
+                "title": "staff pr",
+                "html_url": "https://github.com/BerriAI/litellm/pull/2000",
+                "user": {"login": "staff-org", "type": "User", "id": 900},
+                "author_association": "CONTRIBUTOR",
+            },
+            {
+                "number": 2001,
+                "title": "member pr",
+                "html_url": "https://github.com/BerriAI/litellm/pull/2001",
+                "user": {"login": "core-dev", "type": "User", "id": 901},
+                "author_association": "MEMBER",
+            },
         ]
+
+        fake_guild = SimpleNamespace(
+            members=[
+                SimpleNamespace(
+                    id=100000000000000000 + i,
+                    name=f"contrib-{i:02d}",
+                    global_name=None,
+                    display_name=f"contrib-{i:02d}",
+                    nick=None,
+                    bot=False,
+                )
+                for i in range(22)
+            ]
+        )
 
         edits = []
         followups = []
@@ -230,30 +530,72 @@ class WeeklyTests(unittest.TestCase):
             user=SimpleNamespace(id=111),
             data={"name": "merged-this-week", "options": []},
             channel=SimpleNamespace(id=123, type=SimpleNamespace(value=0), parent_id=None),
-            guild=None,
+            guild=fake_guild,
             message=None,
             extras={},
             response=_FakeResponse(),
             followup=SimpleNamespace(send=None),
         )
 
+        def fake_github(url, _token, **_kwargs):
+            if "/orgs/BerriAI/public_members" in url:
+                return [{"login": "staff-org"}]
+            if "/users/" in url:
+                return {"login": url.rsplit("/users/", 1)[1]}
+            if "/commits" in url:
+                return []
+            return {"items": items}
+
         with mock.patch("contributor_bot.interactions.threading.Thread", _InlineThread), \
-                mock.patch("contributor_bot.weekly.github_get_json", return_value={"items": items}), \
+                mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
                 mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
             asyncio.run(_dispatch_command(None, interaction, config, store))
 
         self.assertEqual(deferred, [True])
         self.assertEqual(len(edits), 1)
-        self.assertGreaterEqual(len(followups), 2)
-        all_chunks = [edits[0][2]["content"]] + [call[2]["content"] for call in followups]
+        self.assertEqual(edits[0][2].get("flags"), 64 | SUPPRESS_EMBEDS_FLAG)
+        first_chunk = edits[0][2]["content"]
+        self.assertEqual(
+            edits[0][2].get("allowed_mentions"),
+            {"parse": [], "users": chunk_mention_user_ids(first_chunk)},
+        )
+        self.assertEqual(len(edits[0][2]["allowed_mentions"]["users"]), 15)
+        all_chunks = [first_chunk] + [call[2]["content"] for call in followups]
+        combined = "\n".join(all_chunks)
         for chunk in all_chunks:
             self.assertLessEqual(len(chunk), 1900)
-            # Never split inside a markdown link.
             self.assertEqual(chunk.count("["), chunk.count("]"))
-        self.assertTrue(all(call[2].get("flags") == 64 for call in followups))
+        self.assertIn("](<https://github.com/BerriAI/litellm/pull/", combined)
+        self.assertNotIn("](https://", combined)
+        self.assertNotIn("contrib-", combined)
+        self.assertNotIn("unmatched-", combined)
+        self.assertNotIn("staff-org", combined)
+        self.assertNotIn("core-dev", combined)
+        contributor_lines = [line for line in combined.splitlines() if line.startswith("- <@")]
+        self.assertEqual(len(contributor_lines), 15)
+        self.assertIn("and 7 more contributors (7 PRs).", combined)
         # Preview must NOT mark the week posted in SQLite.
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", week_key(datetime.now(timezone.utc))))
+
+        # Scheduled weekly post also sets SUPPRESS_EMBEDS flag and allowed_mentions.
+        posted = []
+        moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github):
+            post_weekly_if_due(
+                config,
+                store,
+                moment,
+                post=lambda ch, _tok, msg: posted.append((ch, msg)),
+                guild=fake_guild,
+            )
+        self.assertTrue(posted)
+        self.assertEqual(posted[0][1].get("flags"), SUPPRESS_EMBEDS_FLAG)
+        self.assertEqual(
+            posted[0][1].get("allowed_mentions"),
+            {"parse": [], "users": chunk_mention_user_ids(posted[0][1]["content"])},
+        )
+        self.assertEqual(len(posted[0][1]["allowed_mentions"]["users"]), 15)
 
         # Direct handle_interaction returns type 5 immediately (defer).
         started = []
@@ -271,33 +613,34 @@ class WeeklyTests(unittest.TestCase):
         self.assertEqual(response, {"type": 5, "data": {"flags": 64}})
         self.assertEqual(started, [True])
 
-        # Huge summary capped at max_chunks gets a clean footer under the limit.
+        # Tight limit splits cleanly on line boundaries with overflow footer.
         huge_groups = [
             {
                 "login": f"dev-{i:03d}",
-                "discord_id": None,
-                "pulls": [{"number": i, "title": "fix " + ("x" * 90), "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
+                "discord_id": str(200000000000000000 + i),
+                "pulls": [{"number": i, "title": "fix", "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
             }
-            for i in range(120)
+            for i in range(30)
         ]
         capped = weekly_chunks(
             huge_groups,
             since=datetime(2026, 11, 19, tzinfo=timezone.utc),
-            limit=1900,
-            max_chunks=3,
-            show_maintainer_hint=True,
+            limit=500,
+            max_chunks=2,
+            max_contributors=15,
         )
-        self.assertEqual(len(capped), 3)
+        self.assertLessEqual(len(capped), 2)
         for chunk in capped:
-            self.assertLessEqual(len(chunk), 1900)
+            self.assertLessEqual(len(chunk), 500)
         self.assertIn("more contributors", capped[-1])
-        self.assertIn("MAINTAINER_GITHUB_LOGINS", capped[-1])
 
     def test_merged_this_week_handles_github_rate_limit_and_optional_guild_config(self):
         from contributor_bot.api import TransientAPIError
         from contributor_bot.config import get_config
         from contributor_bot.interactions import _finish_merged_preview
+        from contributor_bot.weekly import reset_org_members_cache
 
+        reset_org_members_cache()
         # Even with roles and PR review off, DISCORD_GUILD_ID / APPLICATION_ID are kept for /merged-this-week.
         cfg = get_config({
             "DISCORD_BOT_TOKEN": "token",
@@ -314,9 +657,15 @@ class WeeklyTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         store = Store(str(Path(directory.name) / "roles.db"))
         self.addCleanup(store.close)
+        store.link_account("777777777777777777", "octocat", 5, "2026-11-20T00:00:00+00:00")
+
+        def fail_search(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            raise TransientAPIError("rate limited")
 
         edits = []
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=TransientAPIError("rate limited")), \
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fail_search), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)):
             _finish_merged_preview(cfg, store, "tokentokentoken", "444")
         self.assertEqual(len(edits), 1)
@@ -331,18 +680,31 @@ class WeeklyTests(unittest.TestCase):
                     "title": f"fix {i}",
                     "html_url": f"https://github.com/BerriAI/litellm/pull/{i}",
                     "user": {"login": "octocat", "type": "User", "id": 5},
+                    "author_association": "CONTRIBUTOR",
                 }
                 for i in range(1, 101)
             ]
         }
         edits.clear()
         followups = []
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=[page1, TransientAPIError("rate limited")]), \
+        search_calls = {"n": 0}
+
+        def page2_rate_limit(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            search_calls["n"] += 1
+            if search_calls["n"] == 1:
+                return page1
+            raise TransientAPIError("rate limited")
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=page2_rate_limit), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
                 mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
             _finish_merged_preview(cfg, store, "tokentokentoken", "444")
         combined = "\n".join([edits[0][2]["content"]] + [call[2]["content"] for call in followups])
-        self.assertIn("**octocat**", combined)
+        self.assertIn("<@777777777777777777>", combined)
+        self.assertNotIn("@octocat", combined)
+        self.assertEqual(edits[0][2].get("allowed_mentions"), {"parse": [], "users": ["777777777777777777"]})
         self.assertIn("rate limit", combined.lower())
 
 

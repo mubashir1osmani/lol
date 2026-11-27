@@ -1,12 +1,17 @@
 """Monday summary of community pull requests merged in the last seven days."""
 
 import logging
+import re
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
-from .reviews import discord_safe
+from .config import is_discord_id
+from .matcher import MatchDetail, match_community_contributors
 from .schedule import UTC, iso
 
 _WEEKDAYS = {
@@ -17,6 +22,34 @@ _WEEKDAYS = {
 WEEKLY_CHUNK_LIMIT = 1900
 WEEKLY_PREVIEW_MAX_CHUNKS = 5
 WEEKLY_POST_MAX_CHUNKS = 10
+WEEKLY_MAX_CONTRIBUTORS = 15
+WEEKLY_MAX_PRS_PER_LINE = 3
+SUPPRESS_EMBEDS_FLAG = 1 << 2  # Discord message flag: SUPPRESS_EMBEDS (4)
+
+COMMUNITY_AUTHOR_ASSOCIATIONS = frozenset({"CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"})
+EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
+
+ORG_MEMBERS_CACHE_TTL_SECONDS = 3600.0
+_org_cache_lock = threading.Lock()
+_org_members_cache: dict[str, tuple[frozenset[str], float]] = {}
+
+_MENTION_ID = re.compile(r"<@([1-9][0-9]{0,19})>")
+
+
+@dataclass(frozen=True)
+class WeeklyReport:
+    chunks: list[str]
+    matched_count: int
+    skipped_count: int
+    since: datetime
+    rate_limited: bool = False
+    match_details: tuple[MatchDetail, ...] = ()
+
+
+def reset_org_members_cache() -> None:
+    """Test helper."""
+    with _org_cache_lock:
+        _org_members_cache.clear()
 
 
 class WeeklyFetchError(RuntimeError):
@@ -56,17 +89,94 @@ def _bot_login(login: str, user_type: str) -> bool:
     return lowered.endswith("[bot]") or lowered.endswith("-bot")
 
 
-def community_groups(items: list[dict], maintainers: tuple[str, ...], links: dict[int, str]) -> list[dict]:
-    """Group merged pull requests by a human who is not on the maintainer list."""
-    skip = {login.lower() for login in maintainers}
+def _org_staff_login(login: str, org: str | None) -> bool:
+    """BerriAI staff accounts often keep org membership private and use -berri handles."""
+    if not org or org.lower() != "berriai":
+        return False
+    lowered = (login or "").lower()
+    return lowered.endswith("-berri") or lowered.endswith("-berriai") or lowered == "berriai"
+
+
+def fetch_org_public_members(
+    org: str,
+    token: str | None,
+    *,
+    ttl_seconds: float = ORG_MEMBERS_CACHE_TTL_SECONDS,
+    clock=time.monotonic,
+) -> frozenset[str]:
+    """Lowercased logins of public GitHub org members, cached with a TTL."""
+    key = (org or "").strip().lower()
+    if not key:
+        return frozenset()
+    now = clock()
+    with _org_cache_lock:
+        cached = _org_members_cache.get(key)
+        if cached is not None and now < cached[1]:
+            return cached[0]
+    members: set[str] = set()
+    page = 1
+    try:
+        while page <= 5:
+            payload = github_get_json(
+                f"{GITHUB_API}/orgs/{org}/public_members?per_page=100&page={page}",
+                token,
+                pace=False,
+            )
+            if not isinstance(payload, list) or not payload:
+                break
+            for item in payload:
+                login = item.get("login") if isinstance(item, dict) else None
+                if isinstance(login, str) and login:
+                    members.add(login.lower())
+            if len(payload) < 100:
+                break
+            page += 1
+    except Exception as error:
+        logging.warning("Could not fetch public members for org %s: %s", org, error)
+        return frozenset()
+    result = frozenset(members)
+    with _org_cache_lock:
+        _org_members_cache[key] = (result, now + ttl_seconds)
+    return result
+
+
+def community_groups(
+    items: list[dict],
+    maintainers: tuple[str, ...],
+    links: dict[int, str],
+    *,
+    org_members: frozenset[str] | set[str] = frozenset(),
+    org: str | None = "BerriAI",
+    require_discord: bool = False,
+) -> list[dict]:
+    """Group merged PRs by external community contributors only.
+
+    Excludes bots, MAINTAINER_GITHUB_LOGINS, GitHub org public members,
+    BerriAI staff handles, and PRs whose author_association is not
+    CONTRIBUTOR or FIRST_TIME_CONTRIBUTOR (such as MEMBER/OWNER/COLLABORATOR).
+    """
+    skip = {login.lower() for login in maintainers} | {login.lower() for login in org_members}
     grouped: dict[str, dict] = {}
     for item in items:
         login = item.get("login") or ""
-        if not login or login.lower() in skip or _bot_login(login, item.get("type") or ""):
+        if (
+            not login
+            or login.lower() in skip
+            or _bot_login(login, item.get("type") or "")
+            or _org_staff_login(login, org)
+        ):
+            continue
+        association = (item.get("author_association") or "").strip().upper()
+        if association not in COMMUNITY_AUTHOR_ASSOCIATIONS:
+            continue
+        user_id = item.get("user_id")
+        discord_id = links.get(user_id)
+        if require_discord and not (discord_id and is_discord_id(str(discord_id))):
             continue
         bucket = grouped.setdefault(login, {
             "login": login,
-            "discord_id": links.get(item.get("user_id")),
+            "user_id": user_id if isinstance(user_id, int) else None,
+            "discord_id": str(discord_id) if discord_id and is_discord_id(str(discord_id)) else None,
             "pulls": [],
         })
         bucket["pulls"].append({
@@ -74,53 +184,78 @@ def community_groups(items: list[dict], maintainers: tuple[str, ...], links: dic
             "title": item.get("title") or f"#{item['number']}",
             "url": item.get("url") or "",
         })
-    return sorted(grouped.values(), key=lambda group: group["login"].lower())
+    return sorted(grouped.values(), key=lambda group: (-len(group["pulls"]), group["login"].lower()))
 
 
 def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _group_lines(group: dict, *, max_line: int) -> list[str]:
-    who = f"**{discord_safe(group['login'])}**"
-    if group.get("discord_id"):
-        who += f" <@{group['discord_id']}>"
-    lines = [who]
-    for pull in group["pulls"]:
+def chunk_mention_user_ids(chunk: str) -> list[str]:
+    """Unique Discord user IDs tagged in a chunk, for explicit allowed_mentions.users."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in _MENTION_ID.finditer(chunk or ""):
+        uid = match.group(1)
+        if uid not in seen and len(ordered) < 100:
+            seen.add(uid)
+            ordered.append(uid)
+    return ordered
+
+
+def _compact_contributor_line(group: dict, *, max_prs: int = WEEKLY_MAX_PRS_PER_LINE) -> str:
+    discord_id = group.get("discord_id")
+    if not discord_id or not is_discord_id(str(discord_id)):
+        raise ValueError("Weekly contributor lines require a resolved Discord user ID")
+    pulls = group["pulls"]
+    count = len(pulls)
+    noun = "PR" if count == 1 else "PRs"
+    shown = pulls[:max_prs]
+    refs = []
+    for pull in shown:
+        number = pull["number"]
         url = pull.get("url") or ""
-        title = discord_safe(pull.get("title") or f"#{pull['number']}")
-        line = f"- [{title}]({url})" if url else f"- {title}"
-        if _utf16_len(line) > max_line:
-            budget = max(20, max_line - _utf16_len(f"- []({url})") - 1)
-            trimmed = title[:budget].rstrip()
-            line = f"- [{trimmed}…]({url})" if url else f"- {trimmed}…"
-        lines.append(line)
-    return lines
+        refs.append(f"[#{number}](<{url}>)" if url else f"#{number}")
+    if count > max_prs:
+        refs.append(f"+{count - max_prs} more")
+    return f"- <@{discord_id}>: {count} {noun} ({', '.join(refs)})"
 
 
-def render_weekly(groups: list[dict], *, since: datetime) -> str:
+def render_weekly(
+    groups: list[dict],
+    *,
+    since: datetime,
+    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+) -> str:
     start = since.date().isoformat()
-    if not groups:
-        return f"no community pull requests merged since {start}."
+    matched = [group for group in groups if group.get("discord_id") and is_discord_id(str(group["discord_id"]))]
+    if not matched:
+        return f"no Discord-matched community pull requests merged since {start}."
     lines = [
-        f"thanks for what landed in litellm since {start}.",
+        f"thanks to the community for what landed in litellm since {start}:",
         "",
     ]
-    for group in groups:
-        lines.extend(_group_lines(group, max_line=WEEKLY_CHUNK_LIMIT))
-        lines.append("")
+    shown = matched[:max_contributors]
+    for group in shown:
+        lines.append(_compact_contributor_line(group))
+    extra = matched[max_contributors:]
+    if extra:
+        extra_prs = sum(len(group["pulls"]) for group in extra)
+        noun = "contributor" if len(extra) == 1 else "contributors"
+        pr_noun = "PR" if extra_prs == 1 else "PRs"
+        lines.append(f"and {len(extra)} more {noun} ({extra_prs} {pr_noun}).")
     return "\n".join(lines).strip()
 
 
 def _trim_chunk_for_footer(chunk: str, footer: str, limit: int) -> str:
     lines = chunk.split("\n")
-    while lines and _utf16_len("\n".join(lines) + "\n\n" + footer) > limit:
+    while lines and _utf16_len("\n".join(lines) + "\n" + footer) > limit:
         lines.pop()
     while lines and not lines[-1].strip():
         lines.pop()
     if not lines:
         return footer[:limit]
-    return "\n".join(lines) + "\n\n" + footer
+    return "\n".join(lines) + "\n" + footer
 
 
 def weekly_chunks(
@@ -129,70 +264,58 @@ def weekly_chunks(
     since: datetime,
     limit: int = WEEKLY_CHUNK_LIMIT,
     max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
+    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
     note: str = "",
-    show_maintainer_hint: bool = False,
 ) -> list[str]:
-    """Split the weekly summary cleanly on line boundaries under Discord's 2000-char limit."""
+    """Render compact one-line-per-Discord-contributor summary under 2000 chars."""
     start = since.date().isoformat()
-    if not groups:
-        empty = f"no community pull requests merged since {start}."
+    matched = [group for group in groups if group.get("discord_id") and is_discord_id(str(group["discord_id"]))]
+    if not matched:
+        empty = f"no Discord-matched community pull requests merged since {start}."
         if note:
             empty = f"{empty}\n\n{note}"
         return [empty[:limit]]
 
-    chunks: list[str] = []
-    current = f"thanks for what landed in litellm since {start}.\n"
-    remaining_groups = 0
-    remaining_prs = 0
+    shown = matched[:max_contributors]
+    overflow_groups = matched[max_contributors:]
+    header = f"thanks to the community for what landed in litellm since {start}:\n"
 
-    for index, group in enumerate(groups):
-        block = "\n".join(_group_lines(group, max_line=limit - 4))
-        separator = "\n\n" if current.strip() else ""
-        candidate = f"{current.rstrip()}{separator}{block}"
+    chunks: list[str] = []
+    current = header
+    dropped_from_shown: list[dict] = []
+
+    for index, group in enumerate(shown):
+        line = _compact_contributor_line(group)
+        if _utf16_len(line) > limit - 4:
+            line = _compact_contributor_line(group, max_prs=2)[: limit - 4]
+        separator = "\n\n" if current == header else "\n"
+        candidate = f"{current.rstrip()}{separator}{line}"
         if _utf16_len(candidate) <= limit:
             current = candidate
             continue
-        # Block does not fit as a whole in current chunk. Try starting a new chunk.
-        if current.strip():
-            if len(chunks) + 1 >= max_chunks:
-                remaining_groups = len(groups) - index
-                remaining_prs = sum(len(item["pulls"]) for item in groups[index:])
-                break
-            chunks.append(current.rstrip())
-            current = ""
-        # Place the group into the fresh chunk, splitting by line if one contributor has many PRs.
-        for line_index, line in enumerate(_group_lines(group, max_line=limit - 4)):
-            piece = f"{current}\n{line}" if current else line
-            if _utf16_len(piece) <= limit:
-                current = piece
-                continue
-            if len(chunks) + 1 >= max_chunks:
-                remaining_groups = len(groups) - index
-                remaining_prs = len(group["pulls"]) - max(0, line_index - 1) + sum(
-                    len(item["pulls"]) for item in groups[index + 1:]
-                )
-                break
-            if current.strip():
-                chunks.append(current.rstrip())
-            current = line
-        if remaining_groups:
+        if len(chunks) + 1 >= max_chunks:
+            dropped_from_shown = shown[index:]
             break
+        if current.strip():
+            chunks.append(current.rstrip())
+        current = line
 
     if current.strip():
         chunks.append(current.rstrip())
 
+    all_extra = dropped_from_shown + overflow_groups
     footers = []
-    if remaining_groups:
-        hint = " set MAINTAINER_GITHUB_LOGINS to exclude maintainers." if show_maintainer_hint else ""
-        footers.append(
-            f"…and {remaining_groups} more contributors ({remaining_prs} more PRs) not shown.{hint}"
-        )
+    if all_extra:
+        extra_prs = sum(len(group["pulls"]) for group in all_extra)
+        noun = "contributor" if len(all_extra) == 1 else "contributors"
+        pr_noun = "PR" if extra_prs == 1 else "PRs"
+        footers.append(f"and {len(all_extra)} more {noun} ({extra_prs} {pr_noun}).")
     if note:
         footers.append(note)
     if footers:
-        footer = " ".join(footers)
-        if _utf16_len(chunks[-1] + "\n\n" + footer) <= limit:
-            chunks[-1] = chunks[-1] + "\n\n" + footer
+        footer = "\n".join(footers)
+        if _utf16_len(chunks[-1] + "\n" + footer) <= limit:
+            chunks[-1] = chunks[-1] + "\n" + footer
         elif len(chunks) < max_chunks:
             chunks.append(footer[:limit])
         else:
@@ -261,6 +384,8 @@ def _search_merged_pages(
                 "login": user.get("login") if isinstance(user.get("login"), str) else "",
                 "type": user.get("type") if isinstance(user.get("type"), str) else "",
                 "user_id": user.get("id") if isinstance(user.get("id"), int) else None,
+                "author_association": item.get("author_association")
+                if isinstance(item.get("author_association"), str) else "",
             })
         if len(items) < 100:
             break
@@ -281,33 +406,75 @@ def fetch_merged_community(
     return rows
 
 
-def _weekly_groups(
+def build_weekly_report(
     config,
     store,
     now: datetime | None = None,
     *,
+    guild=None,
+    loop=None,
     pace: bool = False,
-) -> tuple[list[dict], datetime, bool]:
+    max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
+    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+    limit: int = WEEKLY_CHUNK_LIMIT,
+    members=None,
+    jev_transport=None,
+    haiku_complete=None,
+) -> WeeklyReport:
     moment = now or datetime.now(UTC)
     since = moment - timedelta(days=7)
     token = config.github_token or getattr(config, "github_actor_token", None)
+    org = config.github_repository.split("/", 1)[0] if "/" in config.github_repository else ""
+    org_members = fetch_org_public_members(org, token) if org else frozenset()
     rows, rate_limited = _search_merged_pages(config.github_repository, since, token, pace=pace)
-    links = {}
-    if store is not None:
-        for row in rows:
-            user_id = row.get("user_id")
-            if not isinstance(user_id, int):
-                continue
-            link = store.link_for_github_user(user_id)
-            if link:
-                links[user_id] = link["discord_id"]
-    groups = community_groups(rows, config.maintainer_logins, links)
-    return groups, since, rate_limited
+    raw_groups = community_groups(
+        rows,
+        config.maintainer_logins,
+        {},
+        org_members=org_members,
+        org=org,
+    )
+    matched, skipped, details = match_community_contributors(
+        raw_groups,
+        config,
+        store,
+        guild=guild,
+        loop=loop,
+        now=moment,
+        members=members,
+        github_getter=github_get_json,
+        jev_transport=jev_transport,
+        haiku_complete=haiku_complete,
+    )
+    logging.info(
+        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped",
+        len(matched),
+        skipped,
+    )
+    note = ""
+    if rate_limited:
+        note = "(stopped early because of GitHub search rate limits; set GITHUB_TOKEN for higher limits.)"
+    chunks = weekly_chunks(
+        matched,
+        since=since,
+        limit=limit,
+        max_chunks=max_chunks,
+        max_contributors=max_contributors,
+        note=note,
+    )
+    return WeeklyReport(
+        chunks=chunks,
+        matched_count=len(matched),
+        skipped_count=skipped,
+        since=since,
+        rate_limited=rate_limited,
+        match_details=tuple(details),
+    )
 
 
-def build_weekly(config, store, now: datetime | None = None) -> str:
-    groups, since, _rate_limited = _weekly_groups(config, store, now, pace=False)
-    return render_weekly(groups, since=since)
+def build_weekly(config, store, now: datetime | None = None, *, guild=None, loop=None) -> str:
+    report = build_weekly_report(config, store, now, guild=guild, loop=loop, pace=False)
+    return "\n\n".join(report.chunks)
 
 
 def build_weekly_chunks(
@@ -315,25 +482,36 @@ def build_weekly_chunks(
     store,
     now: datetime | None = None,
     *,
+    guild=None,
+    loop=None,
     pace: bool = False,
     max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
+    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
     limit: int = WEEKLY_CHUNK_LIMIT,
 ) -> list[str]:
-    groups, since, rate_limited = _weekly_groups(config, store, now, pace=pace)
-    note = ""
-    if rate_limited:
-        note = "(stopped early because of GitHub search rate limits; set GITHUB_TOKEN for higher limits.)"
-    return weekly_chunks(
-        groups,
-        since=since,
-        limit=limit,
+    report = build_weekly_report(
+        config,
+        store,
+        now,
+        guild=guild,
+        loop=loop,
+        pace=pace,
         max_chunks=max_chunks,
-        note=note,
-        show_maintainer_hint=not bool(config.maintainer_logins),
+        max_contributors=max_contributors,
+        limit=limit,
     )
+    return report.chunks
 
 
-def post_weekly_if_due(config, store, now: datetime | None = None, *, post=None) -> str | None:
+def post_weekly_if_due(
+    config,
+    store,
+    now: datetime | None = None,
+    *,
+    post=None,
+    guild=None,
+    loop=None,
+) -> str | None:
     """Post this week's summary once. Return the text when a new post is made."""
     if not config.merged_weekly_enabled:
         return None
@@ -349,10 +527,23 @@ def post_weekly_if_due(config, store, now: datetime | None = None, *, post=None)
     if not channel:
         logging.warning("Weekly merge summary skipped: no destination channel configured")
         return None
-    chunks = build_weekly_chunks(config, store, moment, pace=True, max_chunks=WEEKLY_POST_MAX_CHUNKS)
+    report = build_weekly_report(
+        config,
+        store,
+        moment,
+        guild=guild,
+        loop=loop,
+        pace=True,
+        max_chunks=WEEKLY_POST_MAX_CHUNKS,
+    )
     sender = post or post_message
-    for chunk in chunks:
-        sender(channel, config.discord_token, {"content": chunk, "allowed_mentions": {"parse": []}})
+    for chunk in report.chunks:
+        users = chunk_mention_user_ids(chunk)
+        sender(channel, config.discord_token, {
+            "content": chunk,
+            "flags": SUPPRESS_EMBEDS_FLAG,
+            "allowed_mentions": {"parse": [], "users": users},
+        })
     if not store.mark_merged_week(config.github_repository, key, iso(moment)):
         logging.info("Weekly merge summary for %s was already recorded", key)
-    return "\n\n".join(chunks)
+    return "\n\n".join(report.chunks)
