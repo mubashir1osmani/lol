@@ -98,6 +98,7 @@ class NetworkBoundaryTests(unittest.TestCase):
             "https://api.github.com/repos/BerriAI/litellm/pulls/1/files?per_page=100",
             "https://api.github.com/repos/BerriAI/litellm/pulls/1/reviews",
             "https://api.github.com/repos/BerriAI/litellm/pulls?state=closed",
+            "https://api.github.com/orgs/BerriAI/public_members?per_page=100&page=1",
             "https://api.github.com/user",
         ]
         with mock.patch.object(api, "_open_request", return_value=response) as request:

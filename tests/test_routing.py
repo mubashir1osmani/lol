@@ -140,17 +140,42 @@ class TriggerTests(unittest.TestCase):
 
 
 class WeeklyTests(unittest.TestCase):
-    def test_groups_skip_maintainers_and_a_week_posts_once(self):
+    def tearDown(self):
+        from contributor_bot.weekly import reset_org_members_cache
+        reset_org_members_cache()
+
+    def test_groups_filter_org_members_staff_associations_and_bots(self):
+        from contributor_bot.weekly import fetch_org_public_members, reset_org_members_cache
+        reset_org_members_cache()
+
         groups = community_groups([
-            {"login": "octocat", "type": "User", "user_id": 5, "number": 12, "title": "add a timeout", "url": "https://github.com/BerriAI/litellm/pull/12"},
-            {"login": "ishaan-berri", "type": "User", "user_id": 9, "number": 13, "title": "internal", "url": "https://github.com/BerriAI/litellm/pull/13"},
-            {"login": "cursor[bot]", "type": "Bot", "user_id": 1, "number": 14, "title": "bot", "url": "https://github.com/BerriAI/litellm/pull/14"},
-        ], ("ishaan-berri",), {5: "111"})
+            {"login": "octocat", "type": "User", "user_id": 5, "number": 12, "title": "add a timeout", "url": "https://github.com/BerriAI/litellm/pull/12", "author_association": "CONTRIBUTOR"},
+            {"login": "octocat", "type": "User", "user_id": 5, "number": 19, "title": "fix docs", "url": "https://github.com/BerriAI/litellm/pull/19", "author_association": "CONTRIBUTOR"},
+            {"login": "newbie", "type": "User", "user_id": 6, "number": 18, "title": "first pr", "url": "https://github.com/BerriAI/litellm/pull/18", "author_association": "FIRST_TIME_CONTRIBUTOR"},
+            {"login": "public-org-member", "type": "User", "user_id": 7, "number": 15, "title": "org", "url": "https://github.com/BerriAI/litellm/pull/15", "author_association": "CONTRIBUTOR"},
+            {"login": "core-member", "type": "User", "user_id": 8, "number": 16, "title": "member", "url": "https://github.com/BerriAI/litellm/pull/16", "author_association": "MEMBER"},
+            {"login": "repo-owner", "type": "User", "user_id": 10, "number": 20, "title": "owner", "url": "https://github.com/BerriAI/litellm/pull/20", "author_association": "OWNER"},
+            {"login": "collab", "type": "User", "user_id": 11, "number": 21, "title": "collab", "url": "https://github.com/BerriAI/litellm/pull/21", "author_association": "COLLABORATOR"},
+            {"login": "yuneng-berri", "type": "User", "user_id": 12, "number": 22, "title": "berri staff", "url": "https://github.com/BerriAI/litellm/pull/22", "author_association": "CONTRIBUTOR"},
+            {"login": "ishaan", "type": "User", "user_id": 9, "number": 13, "title": "internal", "url": "https://github.com/BerriAI/litellm/pull/13", "author_association": "CONTRIBUTOR"},
+            {"login": "cursor[bot]", "type": "Bot", "user_id": 1, "number": 14, "title": "bot", "url": "https://github.com/BerriAI/litellm/pull/14", "author_association": "CONTRIBUTOR"},
+        ], ("ishaan",), {5: "111"}, org_members={"public-org-member"}, org="BerriAI")
+        self.assertEqual([g["login"] for g in groups], ["octocat", "newbie"])
+
         text = render_weekly(groups, since=datetime(2026, 11, 19, tzinfo=timezone.utc))
-        self.assertIn("**octocat** <@111>", text)
-        self.assertIn("add a timeout", text)
-        self.assertNotIn("ishaan-berri", text)
-        self.assertNotIn("cursor[bot]", text)
+        self.assertIn("- @octocat (<@111>): 2 PRs ([#12](<https://github.com/BerriAI/litellm/pull/12>), [#19](<https://github.com/BerriAI/litellm/pull/19>))", text)
+        self.assertIn("- @newbie: 1 PR ([#18](<https://github.com/BerriAI/litellm/pull/18>))", text)
+        for excluded in ("public-org-member", "core-member", "repo-owner", "collab", "yuneng-berri", "ishaan", "cursor[bot]"):
+            self.assertNotIn(excluded, text)
+
+        # Public org members lookup caches with TTL.
+        with mock.patch("contributor_bot.weekly.github_get_json", return_value=[{"login": "AliceStaff"}, {"login": "BobStaff"}]) as getter:
+            first = fetch_org_public_members("BerriAI", None)
+            second = fetch_org_public_members("BerriAI", None)
+        self.assertEqual(first, frozenset({"alicestaff", "bobstaff"}))
+        self.assertEqual(second, first)
+        self.assertEqual(getter.call_count, 1)
+
         from zoneinfo import ZoneInfo
         moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)  # Monday 10:00 in Toronto
         local = moment.astimezone(ZoneInfo("America/Toronto"))
@@ -163,13 +188,14 @@ class WeeklyTests(unittest.TestCase):
         self.assertTrue(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
         self.assertFalse(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
 
-    def test_merged_this_week_defers_and_splits_long_summary_without_marking_posted(self):
+    def test_merged_this_week_defers_suppresses_embeds_and_caps_at_15_lines(self):
         import asyncio
         from types import SimpleNamespace
         from contributor_bot.gateway import _dispatch_command, commands_for_guild
         from contributor_bot.interactions import handle_interaction
-        from contributor_bot.weekly import weekly_chunks
+        from contributor_bot.weekly import SUPPRESS_EMBEDS_FLAG, post_weekly_if_due, reset_org_members_cache, weekly_chunks
 
+        reset_org_members_cache()
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         store = Store(str(Path(directory.name) / "roles.db"))
@@ -183,15 +209,31 @@ class WeeklyTests(unittest.TestCase):
         )
         self.assertIn("merged-this-week", [cmd["name"] for cmd in commands_for_guild(config)])
 
-        # Build >4500 chars of merged PRs across many contributors to force multi-chunk output.
+        # 22 external contributors plus org/member/bot entries to verify filtering + 15-line cap.
         items = [
             {
                 "number": 1000 + i,
-                "title": f"feat(provider-{i}): add streaming tool-call metrics and fallback handling for region {i}",
+                "title": f"feat(provider-{i}): add support",
                 "html_url": f"https://github.com/BerriAI/litellm/pull/{1000 + i}",
                 "user": {"login": f"contrib-{i:02d}", "type": "User", "id": 500 + i},
+                "author_association": "CONTRIBUTOR" if i % 2 == 0 else "FIRST_TIME_CONTRIBUTOR",
             }
-            for i in range(45)
+            for i in range(22)
+        ] + [
+            {
+                "number": 2000,
+                "title": "staff pr",
+                "html_url": "https://github.com/BerriAI/litellm/pull/2000",
+                "user": {"login": "staff-org", "type": "User", "id": 900},
+                "author_association": "CONTRIBUTOR",
+            },
+            {
+                "number": 2001,
+                "title": "member pr",
+                "html_url": "https://github.com/BerriAI/litellm/pull/2001",
+                "user": {"login": "core-dev", "type": "User", "id": 901},
+                "author_association": "MEMBER",
+            },
         ]
 
         edits = []
@@ -237,23 +279,42 @@ class WeeklyTests(unittest.TestCase):
             followup=SimpleNamespace(send=None),
         )
 
+        def fake_github(url, _token, **_kwargs):
+            if "/orgs/BerriAI/public_members" in url:
+                return [{"login": "staff-org"}]
+            return {"items": items}
+
         with mock.patch("contributor_bot.interactions.threading.Thread", _InlineThread), \
-                mock.patch("contributor_bot.weekly.github_get_json", return_value={"items": items}), \
+                mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
                 mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
             asyncio.run(_dispatch_command(None, interaction, config, store))
 
         self.assertEqual(deferred, [True])
         self.assertEqual(len(edits), 1)
-        self.assertGreaterEqual(len(followups), 2)
+        self.assertEqual(edits[0][2].get("flags"), 64 | SUPPRESS_EMBEDS_FLAG)
         all_chunks = [edits[0][2]["content"]] + [call[2]["content"] for call in followups]
+        combined = "\n".join(all_chunks)
         for chunk in all_chunks:
             self.assertLessEqual(len(chunk), 1900)
-            # Never split inside a markdown link.
             self.assertEqual(chunk.count("["), chunk.count("]"))
-        self.assertTrue(all(call[2].get("flags") == 64 for call in followups))
+        self.assertIn("](<https://github.com/BerriAI/litellm/pull/", combined)
+        self.assertNotIn("](https://", combined)
+        self.assertNotIn("staff-org", combined)
+        self.assertNotIn("core-dev", combined)
+        contributor_lines = [line for line in combined.splitlines() if line.startswith("- @")]
+        self.assertEqual(len(contributor_lines), 15)
+        self.assertIn("and 7 more contributors (7 PRs).", combined)
         # Preview must NOT mark the week posted in SQLite.
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", week_key(datetime.now(timezone.utc))))
+
+        # Scheduled weekly post also sets SUPPRESS_EMBEDS flag.
+        posted = []
+        moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github):
+            post_weekly_if_due(config, store, moment, post=lambda ch, _tok, msg: posted.append((ch, msg)))
+        self.assertTrue(posted)
+        self.assertEqual(posted[0][1].get("flags"), SUPPRESS_EMBEDS_FLAG)
 
         # Direct handle_interaction returns type 5 immediately (defer).
         started = []
@@ -271,33 +332,34 @@ class WeeklyTests(unittest.TestCase):
         self.assertEqual(response, {"type": 5, "data": {"flags": 64}})
         self.assertEqual(started, [True])
 
-        # Huge summary capped at max_chunks gets a clean footer under the limit.
+        # Tight limit splits cleanly on line boundaries with overflow footer.
         huge_groups = [
             {
                 "login": f"dev-{i:03d}",
                 "discord_id": None,
-                "pulls": [{"number": i, "title": "fix " + ("x" * 90), "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
+                "pulls": [{"number": i, "title": "fix", "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
             }
-            for i in range(120)
+            for i in range(30)
         ]
         capped = weekly_chunks(
             huge_groups,
             since=datetime(2026, 11, 19, tzinfo=timezone.utc),
-            limit=1900,
-            max_chunks=3,
-            show_maintainer_hint=True,
+            limit=500,
+            max_chunks=2,
+            max_contributors=15,
         )
-        self.assertEqual(len(capped), 3)
+        self.assertLessEqual(len(capped), 2)
         for chunk in capped:
-            self.assertLessEqual(len(chunk), 1900)
+            self.assertLessEqual(len(chunk), 500)
         self.assertIn("more contributors", capped[-1])
-        self.assertIn("MAINTAINER_GITHUB_LOGINS", capped[-1])
 
     def test_merged_this_week_handles_github_rate_limit_and_optional_guild_config(self):
         from contributor_bot.api import TransientAPIError
         from contributor_bot.config import get_config
         from contributor_bot.interactions import _finish_merged_preview
+        from contributor_bot.weekly import reset_org_members_cache
 
+        reset_org_members_cache()
         # Even with roles and PR review off, DISCORD_GUILD_ID / APPLICATION_ID are kept for /merged-this-week.
         cfg = get_config({
             "DISCORD_BOT_TOKEN": "token",
@@ -315,8 +377,13 @@ class WeeklyTests(unittest.TestCase):
         store = Store(str(Path(directory.name) / "roles.db"))
         self.addCleanup(store.close)
 
+        def fail_search(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            raise TransientAPIError("rate limited")
+
         edits = []
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=TransientAPIError("rate limited")), \
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fail_search), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)):
             _finish_merged_preview(cfg, store, "tokentokentoken", "444")
         self.assertEqual(len(edits), 1)
@@ -331,18 +398,29 @@ class WeeklyTests(unittest.TestCase):
                     "title": f"fix {i}",
                     "html_url": f"https://github.com/BerriAI/litellm/pull/{i}",
                     "user": {"login": "octocat", "type": "User", "id": 5},
+                    "author_association": "CONTRIBUTOR",
                 }
                 for i in range(1, 101)
             ]
         }
         edits.clear()
         followups = []
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=[page1, TransientAPIError("rate limited")]), \
+        search_calls = {"n": 0}
+
+        def page2_rate_limit(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            search_calls["n"] += 1
+            if search_calls["n"] == 1:
+                return page1
+            raise TransientAPIError("rate limited")
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=page2_rate_limit), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
                 mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
             _finish_merged_preview(cfg, store, "tokentokentoken", "444")
         combined = "\n".join([edits[0][2]["content"]] + [call[2]["content"] for call in followups])
-        self.assertIn("**octocat**", combined)
+        self.assertIn("@octocat", combined)
         self.assertIn("rate limit", combined.lower())
 
 

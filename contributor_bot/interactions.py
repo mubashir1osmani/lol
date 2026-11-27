@@ -76,6 +76,7 @@ REVIEW_SLASH_COMMANDS = [
 ]
 
 _EPHEMERAL = 64
+_SUPPRESS_EMBEDS = 4
 
 
 def _ephemeral(content: str) -> dict:
@@ -162,12 +163,13 @@ def _finish_merged_preview(config: Config, store: Store, interaction_token: str,
     try:
         edit_original_interaction(application_id, interaction_token, {
             "content": chunks[0],
+            "flags": _EPHEMERAL | _SUPPRESS_EMBEDS,
             "allowed_mentions": {"parse": []},
         })
         for chunk in chunks[1:]:
             post_interaction_followup(application_id, interaction_token, {
                 "content": chunk,
-                "flags": _EPHEMERAL,
+                "flags": _EPHEMERAL | _SUPPRESS_EMBEDS,
                 "allowed_mentions": {"parse": []},
             })
     except Exception:
