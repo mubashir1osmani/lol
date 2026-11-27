@@ -587,12 +587,26 @@ class Store:
             self._conn.commit()
 
     def merged_week_posted(self, repository: str, week_key: str) -> bool:
+        return self.merged_week_info(repository, week_key) is not None
+
+    def merged_week_info(self, repository: str, week_key: str) -> dict | None:
+        """Return ``{"week_key", "posted_at"}`` if this week was already recorded."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM merged_weeks WHERE repository = ? AND week_key = ?",
+                "SELECT week_key, posted_at FROM merged_weeks WHERE repository = ? AND week_key = ?",
                 (repository, week_key),
             ).fetchone()
-        return row is not None
+        return dict(row) if row else None
+
+    def clear_merged_week(self, repository: str, week_key: str) -> bool:
+        """Delete a recorded week entry so a forced manual catch-up can repost cleanly."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM merged_weeks WHERE repository = ? AND week_key = ?",
+                (repository, week_key),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def last_merged_week(self, repository: str) -> dict | None:
         """Return the most recent posted weekly summary for ``repository``."""

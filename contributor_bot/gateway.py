@@ -50,6 +50,8 @@ class Gateway:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.client = None
         self._commands_synced = False
+        self._weekly_task = None
+        self._status_task = None
 
     def start(self, config: Config, store: Store | None) -> None:
         self._thread = threading.Thread(
@@ -59,6 +61,21 @@ class Gateway:
             daemon=True,
         )
         self._thread.start()
+
+    def current_guild_and_loop(self, config: Config):
+        """Return ``(guild, loop)`` when the gateway is connected, else ``(None, None)``."""
+        if not self.connected.is_set():
+            return None, None
+        client, loop = self.client, self.loop
+        if client is None or loop is None or not loop.is_running():
+            return None, None
+        guild = None
+        if config.discord_guild_id and hasattr(client, "get_guild"):
+            try:
+                guild = client.get_guild(int(config.discord_guild_id))
+            except (TypeError, ValueError):
+                guild = None
+        return guild, loop
 
     def stop(self) -> None:
         self._stop.set()
@@ -81,22 +98,44 @@ class Gateway:
                 "pip install -r requirements.txt to show it online."
             )
             return
-        try:
-            asyncio.run(self._serve(discord, config, store))
-        except Exception:
-            logging.exception("Discord gateway stopped")
-        finally:
-            self.connected.clear()
+        backoff = 5.0
+        while not self._stop.is_set():
+            had_connected = False
+            try:
+                had_connected = asyncio.run(self._serve(discord, config, store))
+            except Exception:
+                logging.exception("Discord gateway stopped unexpectedly")
+            finally:
+                self.connected.clear()
+                self.client = None
+                self.loop = None
+                self._weekly_task = None
+                self._status_task = None
+            if self._stop.is_set():
+                return
+            if had_connected:
+                backoff = 5.0
+            logging.warning(
+                "Discord gateway session ended unexpectedly; reconnecting in %.0fs",
+                backoff,
+            )
+            if self._stop.wait(backoff):
+                return
+            backoff = min(backoff * 2.0, 60.0)
 
-    async def _serve(self, discord, config: Config, store: Store | None) -> None:
+    async def _serve(self, discord, config: Config, store: Store | None) -> bool:
         install_gateway_patches(discord)
         intents = build_intents(discord, members=config.discord_members_intent)
         client = discord.Client(intents=intents)
         self.client = client
+        self._commands_synced = False
+        had_connected = False
         tree = _bind_command_tree(discord, client, config, store)
 
         @client.event
         async def on_ready():
+            nonlocal had_connected
+            had_connected = True
             text = status_texts(config)[0]
             await client.change_presence(
                 status=discord.Status.online,
@@ -123,6 +162,10 @@ class Gateway:
                 config.discord_members_intent,
                 guild_info,
             )
+            if self._weekly_task is None or not self._weekly_task.is_running():
+                self._weekly_task = _start_weekly_task(discord, client, config, store)
+            if self._status_task is None or not self._status_task.is_running():
+                self._status_task = _start_status_rotation_task(discord, client, config)
             if self._commands_synced or self._stop.is_set():
                 return
 
@@ -187,11 +230,15 @@ class Gateway:
             await _dispatch_command(discord, interaction, config, store, client=client)
 
         self.loop = asyncio.get_running_loop()
-        _start_weekly_task(discord, client, config, store)
-        _start_status_rotation_task(discord, client, config)
         if self._stop.is_set():
-            return
-        await client.start(config.discord_token)
+            return had_connected
+        try:
+            await client.start(config.discord_token)
+        finally:
+            for task in (self._weekly_task, self._status_task):
+                if task is not None and task.is_running():
+                    task.cancel()
+        return had_connected
 
 
 def status_texts(config: Config) -> tuple[str, ...]:
@@ -213,23 +260,26 @@ def status_activity(discord, text: str):
     return discord.CustomActivity(name=text)
 
 
-def _start_status_rotation_task(discord, client, config: Config) -> None:
+def _start_status_rotation_task(discord, client, config: Config):
     """Optionally rotate through fun custom statuses when BOT_STATUS_ROTATE=true."""
     statuses = status_texts(config)
     if len(statuses) <= 1:
-        return
+        return None
     from discord.ext import tasks
 
     index = {"value": 0}
 
     @tasks.loop(minutes=BOT_STATUS_ROTATE_MINUTES)
     async def rotate_status():
-        index["value"] = (index["value"] + 1) % len(statuses)
-        text = statuses[index["value"]]
-        await client.change_presence(
-            status=discord.Status.online,
-            activity=status_activity(discord, text),
-        )
+        try:
+            index["value"] = (index["value"] + 1) % len(statuses)
+            text = statuses[index["value"]]
+            await client.change_presence(
+                status=discord.Status.online,
+                activity=status_activity(discord, text),
+            )
+        except Exception:
+            logging.exception("Discord status rotation tick failed")
 
     @rotate_status.before_loop
     async def wait_until_ready():
@@ -237,30 +287,29 @@ def _start_status_rotation_task(discord, client, config: Config) -> None:
 
     try:
         rotate_status.start()
+        return rotate_status
     except Exception:
         logging.exception("Could not start Discord status rotation")
+        return None
 
 
-def _start_weekly_task(discord, client, config, store) -> None:
+def _start_weekly_task(discord, client, config, store):
     """Check every 60s so Render restarts before or after the scheduled minute never miss or double-post."""
     if store is None or not config.merged_weekly_enabled:
-        return
+        return None
     from discord.ext import tasks
-    from .weekly import post_weekly_if_due
-
-    weekday_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-    day_label = weekday_names[config.merged_weekday] if 0 <= config.merged_weekday <= 6 else str(config.merged_weekday)
+    from .weekly import post_weekly_if_due, weekly_schedule_status
 
     @tasks.loop(seconds=60)
     async def merged_weekly_post():
-        guild = None
-        if config.discord_guild_id and hasattr(client, "get_guild"):
-            try:
-                guild = client.get_guild(int(config.discord_guild_id))
-            except (TypeError, ValueError):
-                guild = None
-        loop = asyncio.get_running_loop()
         try:
+            guild = None
+            if config.discord_guild_id and hasattr(client, "get_guild"):
+                try:
+                    guild = client.get_guild(int(config.discord_guild_id))
+                except (TypeError, ValueError):
+                    guild = None
+            loop = asyncio.get_running_loop()
             await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
         except Exception:
             logging.exception("Weekly merge summary check failed; will retry on next tick")
@@ -268,19 +317,33 @@ def _start_weekly_task(discord, client, config, store) -> None:
     @merged_weekly_post.before_loop
     async def wait_until_ready():
         await client.wait_until_ready()
-        dest = (config.announcements_channel_id or "").strip() or "#announcements"
         logging.info(
-            "Weekly contributor summary scheduler active: %s %s %s, destination %s",
-            day_label,
-            config.merged_time,
-            config.merged_timezone,
-            dest,
+            "Weekly contributor summary scheduler active: %s",
+            weekly_schedule_status(config, store),
         )
+
+    @merged_weekly_post.error
+    async def on_weekly_error(error):
+        logging.error(
+            "Weekly merge summary task hit an unhandled error: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+    @merged_weekly_post.after_loop
+    async def on_weekly_after_loop():
+        if not merged_weekly_post.is_being_cancelled():
+            logging.warning(
+                "Weekly merge summary gateway loop stopped unexpectedly; "
+                "main loop fallback watchdog remains active"
+            )
 
     try:
         merged_weekly_post.start()
+        return merged_weekly_post
     except Exception:
         logging.exception("Could not start the weekly merge summary")
+        return None
 
 
 def _load_discord():
