@@ -228,7 +228,14 @@ def _start_weekly_task(discord, client, config, store) -> None:
 
     @tasks.loop(time=when)
     async def merged_weekly_post():
-        await asyncio.to_thread(post_weekly_if_due, config, store)
+        guild = None
+        if config.discord_guild_id and hasattr(client, "get_guild"):
+            try:
+                guild = client.get_guild(int(config.discord_guild_id))
+            except (TypeError, ValueError):
+                guild = None
+        loop = asyncio.get_running_loop()
+        await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
 
     @merged_weekly_post.before_loop
     async def wait_until_ready():

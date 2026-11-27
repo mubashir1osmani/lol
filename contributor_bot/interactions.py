@@ -112,6 +112,8 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
             store,
             payload.get("token"),
             application_id=str(payload.get("application_id") or config.discord_application_id or ""),
+            guild=payload.get("_guild"),
+            loop=payload.get("_loop"),
         )
     if name in {"review-pr", "recheck"}:
         if not config.pr_review_enabled:
@@ -126,6 +128,8 @@ def _merged_preview(
     interaction_token: object,
     *,
     application_id: str = "",
+    guild=None,
+    loop=None,
 ) -> dict:
     """Defer immediately, then send the weekly summary without marking the week posted."""
     if not isinstance(interaction_token, str) or not interaction_token:
@@ -134,17 +138,26 @@ def _merged_preview(
     threading.Thread(
         target=_finish_merged_preview,
         args=(config, store, interaction_token, app_id),
+        kwargs={"guild": guild, "loop": loop},
         name="merged-this-week",
         daemon=True,
     ).start()
     return {"type": 5, "data": {"flags": _EPHEMERAL}}
 
 
-def _finish_merged_preview(config: Config, store: Store, interaction_token: str, application_id: str) -> None:
-    from .weekly import WeeklyFetchError, build_weekly_chunks
+def _finish_merged_preview(
+    config: Config,
+    store: Store,
+    interaction_token: str,
+    application_id: str,
+    *,
+    guild=None,
+    loop=None,
+) -> None:
+    from .weekly import WeeklyFetchError, build_weekly_chunks, chunk_mention_user_ids
 
     try:
-        chunks = build_weekly_chunks(config, store, pace=False)
+        chunks = build_weekly_chunks(config, store, guild=guild, loop=loop, pace=False)
     except WeeklyFetchError as error:
         logging.warning("Weekly merge preview GitHub fetch failed: %s", error)
         if error.rate_limited:
@@ -159,18 +172,18 @@ def _finish_merged_preview(config: Config, store: Store, interaction_token: str,
         chunks = ["couldn't load this week's merges. try again in a minute."]
 
     if not chunks:
-        chunks = ["no community pull requests merged in the last 7 days."]
+        chunks = ["no Discord-matched community pull requests merged in the last 7 days."]
     try:
         edit_original_interaction(application_id, interaction_token, {
             "content": chunks[0],
             "flags": _EPHEMERAL | _SUPPRESS_EMBEDS,
-            "allowed_mentions": {"parse": []},
+            "allowed_mentions": {"parse": [], "users": chunk_mention_user_ids(chunks[0])},
         })
         for chunk in chunks[1:]:
             post_interaction_followup(application_id, interaction_token, {
                 "content": chunk,
                 "flags": _EPHEMERAL | _SUPPRESS_EMBEDS,
-                "allowed_mentions": {"parse": []},
+                "allowed_mentions": {"parse": [], "users": chunk_mention_user_ids(chunk)},
             })
     except Exception:
         logging.exception("Could not send the /merged-this-week follow-up")

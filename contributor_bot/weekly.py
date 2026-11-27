@@ -1,14 +1,18 @@
 """Monday summary of community pull requests merged in the last seven days."""
 
+import asyncio
+import inspect
 import logging
+import re
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
-from .reviews import discord_safe
+from .api import GITHUB_API, TransientAPIError, github_get_json, post_message, search_guild_members
+from .config import is_discord_id
 from .schedule import UTC, iso
 
 _WEEKDAYS = {
@@ -29,6 +33,17 @@ EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
 ORG_MEMBERS_CACHE_TTL_SECONDS = 3600.0
 _org_cache_lock = threading.Lock()
 _org_members_cache: dict[str, tuple[frozenset[str], float]] = {}
+
+_MENTION_ID = re.compile(r"<@([1-9][0-9]{0,19})>")
+
+
+@dataclass(frozen=True)
+class WeeklyReport:
+    chunks: list[str]
+    matched_count: int
+    skipped_count: int
+    since: datetime
+    rate_limited: bool = False
 
 
 def reset_org_members_cache() -> None:
@@ -125,6 +140,186 @@ def fetch_org_public_members(
     return result
 
 
+def member_name_index(members) -> dict[str, str]:
+    """Case-insensitive map of Discord username / global_name / display_name -> user id."""
+    index: dict[str, str] = {}
+    for member in members or ():
+        if isinstance(member, dict):
+            user = member.get("user") if isinstance(member.get("user"), dict) else {}
+            if user.get("bot"):
+                continue
+            member_id = user.get("id") or member.get("id")
+            candidates = (
+                user.get("username"),
+                user.get("global_name"),
+                member.get("nick"),
+                member.get("display_name"),
+            )
+        else:
+            if getattr(member, "bot", False):
+                continue
+            member_id = getattr(member, "id", None)
+            candidates = (
+                getattr(member, "name", None),
+                getattr(member, "global_name", None),
+                getattr(member, "display_name", None),
+                getattr(member, "nick", None),
+            )
+        if member_id is None or not is_discord_id(str(member_id)):
+            continue
+        uid = str(member_id)
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                key = candidate.strip().casefold()
+                if key and key not in index:
+                    index[key] = uid
+    return index
+
+
+async def _collect_async_members(result) -> list:
+    if hasattr(result, "__aiter__"):
+        found = []
+        async for member in result:
+            found.append(member)
+        return found
+    if inspect.isawaitable(result):
+        resolved = await result
+        return list(resolved) if resolved is not None else []
+    return list(result) if result is not None else []
+
+
+def _run_guild_coro(coro, loop):
+    if loop is not None and loop.is_running():
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=15)
+    return asyncio.run(coro)
+
+
+def _fetch_all_guild_members(guild, loop) -> list | None:
+    fetcher = getattr(guild, "fetch_members", None)
+    if not callable(fetcher):
+        return None
+    try:
+        async def run():
+            return await _collect_async_members(fetcher(limit=None))
+
+        return _run_guild_coro(run(), loop)
+    except Exception as error:
+        logging.warning("guild.fetch_members failed; falling back to member search: %s", error)
+        return None
+
+
+def _search_guild_member_login(guild, login: str, loop, *, guild_id: str | None, token: str | None) -> list:
+    if guild is not None:
+        for method_name in ("search_members", "query_members"):
+            method = getattr(guild, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                async def run(fn=method):
+                    return await _collect_async_members(fn(query=login, limit=10))
+
+                return _run_guild_coro(run(), loop)
+            except TypeError:
+                try:
+                    async def run_pos(fn=method):
+                        return await _collect_async_members(fn(login))
+
+                    return _run_guild_coro(run_pos(), loop)
+                except Exception as error:
+                    logging.warning("guild.%s failed for %s: %s", method_name, login, error)
+            except Exception as error:
+                logging.warning("guild.%s failed for %s: %s", method_name, login, error)
+    if guild_id and is_discord_id(str(guild_id)) and token:
+        try:
+            return search_guild_members(str(guild_id), login, token, limit=10)
+        except Exception as error:
+            logging.warning("Discord REST member search failed for %s: %s", login, error)
+    return []
+
+
+def resolve_discord_ids_for_groups(
+    groups: list[dict],
+    store,
+    *,
+    guild=None,
+    loop=None,
+    guild_id: str | None = None,
+    discord_token: str | None = None,
+    members_intent_enabled: bool = False,
+) -> tuple[list[dict], int]:
+    """Map community groups to Discord user IDs and drop unmatched contributors.
+
+    Order:
+    1. Existing /link-github store.
+    2. Case-insensitive match against guild members' username, global_name, or
+       display_name (cached guild.members when populated with members intent,
+       otherwise falling back to guild.fetch_members or search_members/query_members/REST).
+    """
+    matched: list[dict] = []
+    unmatched: list[dict] = []
+    for group in groups:
+        discord_id = group.get("discord_id")
+        if not discord_id and store is not None and isinstance(group.get("user_id"), int):
+            link = store.link_for_github_user(group["user_id"])
+            if link and is_discord_id(link.get("discord_id")):
+                discord_id = str(link["discord_id"])
+        if discord_id and is_discord_id(str(discord_id)):
+            matched.append({**group, "discord_id": str(discord_id)})
+        else:
+            unmatched.append(group)
+
+    if not unmatched:
+        return matched, 0
+
+    cached_map = member_name_index(getattr(guild, "members", ())) if guild is not None else {}
+    still_unmatched: list[dict] = []
+    for group in unmatched:
+        key = group["login"].strip().casefold()
+        found_id = cached_map.get(key)
+        if found_id:
+            matched.append({**group, "discord_id": found_id})
+        else:
+            still_unmatched.append(group)
+
+    if not still_unmatched:
+        matched.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
+        return matched, 0
+
+    # When members intent is enabled and guild.members is already populated, the cache is complete.
+    if members_intent_enabled and cached_map:
+        matched.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
+        return matched, len(still_unmatched)
+
+    fetched_map: dict[str, str] | None = None
+    if guild is not None:
+        fetched = _fetch_all_guild_members(guild, loop)
+        if fetched is not None:
+            fetched_map = member_name_index(fetched)
+
+    skipped = 0
+    for group in still_unmatched:
+        login = group["login"]
+        key = login.strip().casefold()
+        if fetched_map is not None:
+            found_id = fetched_map.get(key)
+        else:
+            candidates = _search_guild_member_login(
+                guild,
+                login,
+                loop,
+                guild_id=guild_id,
+                token=discord_token,
+            )
+            found_id = member_name_index(candidates).get(key)
+        if found_id:
+            matched.append({**group, "discord_id": found_id})
+        else:
+            skipped += 1
+
+    matched.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
+    return matched, skipped
+
+
 def community_groups(
     items: list[dict],
     maintainers: tuple[str, ...],
@@ -132,6 +327,7 @@ def community_groups(
     *,
     org_members: frozenset[str] | set[str] = frozenset(),
     org: str | None = "BerriAI",
+    require_discord: bool = False,
 ) -> list[dict]:
     """Group merged PRs by external community contributors only.
 
@@ -153,9 +349,14 @@ def community_groups(
         association = (item.get("author_association") or "").strip().upper()
         if association not in COMMUNITY_AUTHOR_ASSOCIATIONS:
             continue
+        user_id = item.get("user_id")
+        discord_id = links.get(user_id)
+        if require_discord and not (discord_id and is_discord_id(str(discord_id))):
+            continue
         bucket = grouped.setdefault(login, {
             "login": login,
-            "discord_id": links.get(item.get("user_id")),
+            "user_id": user_id if isinstance(user_id, int) else None,
+            "discord_id": str(discord_id) if discord_id and is_discord_id(str(discord_id)) else None,
             "pulls": [],
         })
         bucket["pulls"].append({
@@ -170,10 +371,22 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+def chunk_mention_user_ids(chunk: str) -> list[str]:
+    """Unique Discord user IDs tagged in a chunk, for explicit allowed_mentions.users."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in _MENTION_ID.finditer(chunk or ""):
+        uid = match.group(1)
+        if uid not in seen and len(ordered) < 100:
+            seen.add(uid)
+            ordered.append(uid)
+    return ordered
+
+
 def _compact_contributor_line(group: dict, *, max_prs: int = WEEKLY_MAX_PRS_PER_LINE) -> str:
-    handle = f"@{discord_safe(group['login'])}"
-    if group.get("discord_id"):
-        handle = f"{handle} (<@{group['discord_id']}>)"
+    discord_id = group.get("discord_id")
+    if not discord_id or not is_discord_id(str(discord_id)):
+        raise ValueError("Weekly contributor lines require a resolved Discord user ID")
     pulls = group["pulls"]
     count = len(pulls)
     noun = "PR" if count == 1 else "PRs"
@@ -185,7 +398,7 @@ def _compact_contributor_line(group: dict, *, max_prs: int = WEEKLY_MAX_PRS_PER_
         refs.append(f"[#{number}](<{url}>)" if url else f"#{number}")
     if count > max_prs:
         refs.append(f"+{count - max_prs} more")
-    return f"- {handle}: {count} {noun} ({', '.join(refs)})"
+    return f"- <@{discord_id}>: {count} {noun} ({', '.join(refs)})"
 
 
 def render_weekly(
@@ -195,16 +408,17 @@ def render_weekly(
     max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
 ) -> str:
     start = since.date().isoformat()
-    if not groups:
-        return f"no community pull requests merged since {start}."
+    matched = [group for group in groups if group.get("discord_id") and is_discord_id(str(group["discord_id"]))]
+    if not matched:
+        return f"no Discord-matched community pull requests merged since {start}."
     lines = [
         f"thanks to the community for what landed in litellm since {start}:",
         "",
     ]
-    shown = groups[:max_contributors]
+    shown = matched[:max_contributors]
     for group in shown:
         lines.append(_compact_contributor_line(group))
-    extra = groups[max_contributors:]
+    extra = matched[max_contributors:]
     if extra:
         extra_prs = sum(len(group["pulls"]) for group in extra)
         noun = "contributor" if len(extra) == 1 else "contributors"
@@ -233,16 +447,17 @@ def weekly_chunks(
     max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
     note: str = "",
 ) -> list[str]:
-    """Render compact one-line-per-contributor summary and split cleanly under 2000 chars."""
+    """Render compact one-line-per-Discord-contributor summary under 2000 chars."""
     start = since.date().isoformat()
-    if not groups:
-        empty = f"no community pull requests merged since {start}."
+    matched = [group for group in groups if group.get("discord_id") and is_discord_id(str(group["discord_id"]))]
+    if not matched:
+        empty = f"no Discord-matched community pull requests merged since {start}."
         if note:
             empty = f"{empty}\n\n{note}"
         return [empty[:limit]]
 
-    shown = groups[:max_contributors]
-    overflow_groups = groups[max_contributors:]
+    shown = matched[:max_contributors]
+    overflow_groups = matched[max_contributors:]
     header = f"thanks to the community for what landed in litellm since {start}:\n"
 
     chunks: list[str] = []
@@ -252,7 +467,7 @@ def weekly_chunks(
     for index, group in enumerate(shown):
         line = _compact_contributor_line(group)
         if _utf16_len(line) > limit - 4:
-            line = _compact_contributor_line(group, max_prs=3)[: limit - 4]
+            line = _compact_contributor_line(group, max_prs=2)[: limit - 4]
         separator = "\n\n" if current == header else "\n"
         candidate = f"{current.rstrip()}{separator}{line}"
         if _utf16_len(candidate) <= limit:
@@ -371,41 +586,68 @@ def fetch_merged_community(
     return rows
 
 
-def _weekly_groups(
+def build_weekly_report(
     config,
     store,
     now: datetime | None = None,
     *,
+    guild=None,
+    loop=None,
     pace: bool = False,
-) -> tuple[list[dict], datetime, bool]:
+    max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
+    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+    limit: int = WEEKLY_CHUNK_LIMIT,
+) -> WeeklyReport:
     moment = now or datetime.now(UTC)
     since = moment - timedelta(days=7)
     token = config.github_token or getattr(config, "github_actor_token", None)
     org = config.github_repository.split("/", 1)[0] if "/" in config.github_repository else ""
     org_members = fetch_org_public_members(org, token) if org else frozenset()
     rows, rate_limited = _search_merged_pages(config.github_repository, since, token, pace=pace)
-    links = {}
-    if store is not None:
-        for row in rows:
-            user_id = row.get("user_id")
-            if not isinstance(user_id, int):
-                continue
-            link = store.link_for_github_user(user_id)
-            if link:
-                links[user_id] = link["discord_id"]
-    groups = community_groups(
+    raw_groups = community_groups(
         rows,
         config.maintainer_logins,
-        links,
+        {},
         org_members=org_members,
         org=org,
     )
-    return groups, since, rate_limited
+    matched, skipped = resolve_discord_ids_for_groups(
+        raw_groups,
+        store,
+        guild=guild,
+        loop=loop,
+        guild_id=config.discord_guild_id,
+        discord_token=config.discord_token,
+        members_intent_enabled=bool(getattr(config, "discord_members_intent", False)),
+    )
+    logging.info(
+        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped",
+        len(matched),
+        skipped,
+    )
+    note = ""
+    if rate_limited:
+        note = "(stopped early because of GitHub search rate limits; set GITHUB_TOKEN for higher limits.)"
+    chunks = weekly_chunks(
+        matched,
+        since=since,
+        limit=limit,
+        max_chunks=max_chunks,
+        max_contributors=max_contributors,
+        note=note,
+    )
+    return WeeklyReport(
+        chunks=chunks,
+        matched_count=len(matched),
+        skipped_count=skipped,
+        since=since,
+        rate_limited=rate_limited,
+    )
 
 
-def build_weekly(config, store, now: datetime | None = None) -> str:
-    groups, since, _rate_limited = _weekly_groups(config, store, now, pace=False)
-    return render_weekly(groups, since=since)
+def build_weekly(config, store, now: datetime | None = None, *, guild=None, loop=None) -> str:
+    report = build_weekly_report(config, store, now, guild=guild, loop=loop, pace=False)
+    return "\n\n".join(report.chunks)
 
 
 def build_weekly_chunks(
@@ -413,26 +655,36 @@ def build_weekly_chunks(
     store,
     now: datetime | None = None,
     *,
+    guild=None,
+    loop=None,
     pace: bool = False,
     max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
     max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
     limit: int = WEEKLY_CHUNK_LIMIT,
 ) -> list[str]:
-    groups, since, rate_limited = _weekly_groups(config, store, now, pace=pace)
-    note = ""
-    if rate_limited:
-        note = "(stopped early because of GitHub search rate limits; set GITHUB_TOKEN for higher limits.)"
-    return weekly_chunks(
-        groups,
-        since=since,
-        limit=limit,
+    report = build_weekly_report(
+        config,
+        store,
+        now,
+        guild=guild,
+        loop=loop,
+        pace=pace,
         max_chunks=max_chunks,
         max_contributors=max_contributors,
-        note=note,
+        limit=limit,
     )
+    return report.chunks
 
 
-def post_weekly_if_due(config, store, now: datetime | None = None, *, post=None) -> str | None:
+def post_weekly_if_due(
+    config,
+    store,
+    now: datetime | None = None,
+    *,
+    post=None,
+    guild=None,
+    loop=None,
+) -> str | None:
     """Post this week's summary once. Return the text when a new post is made."""
     if not config.merged_weekly_enabled:
         return None
@@ -448,14 +700,23 @@ def post_weekly_if_due(config, store, now: datetime | None = None, *, post=None)
     if not channel:
         logging.warning("Weekly merge summary skipped: no destination channel configured")
         return None
-    chunks = build_weekly_chunks(config, store, moment, pace=True, max_chunks=WEEKLY_POST_MAX_CHUNKS)
+    report = build_weekly_report(
+        config,
+        store,
+        moment,
+        guild=guild,
+        loop=loop,
+        pace=True,
+        max_chunks=WEEKLY_POST_MAX_CHUNKS,
+    )
     sender = post or post_message
-    for chunk in chunks:
+    for chunk in report.chunks:
+        users = chunk_mention_user_ids(chunk)
         sender(channel, config.discord_token, {
             "content": chunk,
             "flags": SUPPRESS_EMBEDS_FLAG,
-            "allowed_mentions": {"parse": []},
+            "allowed_mentions": {"parse": [], "users": users},
         })
     if not store.mark_merged_week(config.github_repository, key, iso(moment)):
         logging.info("Weekly merge summary for %s was already recorded", key)
-    return "\n\n".join(chunks)
+    return "\n\n".join(report.chunks)

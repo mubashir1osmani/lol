@@ -150,6 +150,7 @@ class NetworkBoundaryTests(unittest.TestCase):
             "https://api.github.com/repos/BerriAI/litellm/check-runs/99/annotations",
             "https://discord.com/api/v10/channels/321/messages/654",
             "https://discord.com/api/v10/guilds/333/channels",
+            "https://discord.com/api/v10/guilds/333/members/search?query=octocat&limit=10",
         ]
         query = json.dumps({"query": "query ReviewThreads($n: Int!) { repository { pullRequest { id } } }"}).encode()
         mutation = json.dumps({"query": "mutation { addReaction(input: {subjectId: \"x\"}) { clientMutationId } }"}).encode()
