@@ -15,6 +15,7 @@ from .api import (
 )
 from .config import Config, is_discord_id
 from .oauth import authorize_url
+from .pr_board import format_pr_board_summary
 from .present import my_prs_text, review_status
 from .review_job import handle_review_command
 from .roles import DEFAULT_ROLE_NAMES, MergedPull, earned_role_keys
@@ -58,6 +59,17 @@ MERGED_SLASH_COMMANDS = [
     {
         "name": "merged-this-week",
         "description": "Preview community pull requests merged in the last 7 days",
+        "type": 1,
+        "dm_permission": False,
+        "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
+    },
+]
+
+# Registered whenever PR_BOARD_PROJECT_ID (or PR_BOARD_OWNER + PR_BOARD_NUMBER) and DISCORD_GUILD_ID are set.
+PR_BOARD_SLASH_COMMANDS = [
+    {
+        "name": "pr-board",
+        "description": "Show the contributor PR backlog board link and counts per status",
         "type": 1,
         "dm_permission": False,
         "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
@@ -145,6 +157,10 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
             guild=payload.get("_guild"),
             loop=payload.get("_loop"),
         )
+    if name == "pr-board":
+        if not is_server_moderator(payload):
+            return _ephemeral("only mods can run this")
+        return _ephemeral(format_pr_board_summary(config, store))
     if name in {"review-pr", "recheck"}:
         if not config.pr_review_enabled:
             return _ephemeral("pr pre-review is off on this bot.")

@@ -15,7 +15,13 @@ import logging
 import threading
 
 from .config import Config
-from .interactions import MERGED_SLASH_COMMANDS, REVIEW_SLASH_COMMANDS, SLASH_COMMANDS, handle_interaction
+from .interactions import (
+    MERGED_SLASH_COMMANDS,
+    PR_BOARD_SLASH_COMMANDS,
+    REVIEW_SLASH_COMMANDS,
+    SLASH_COMMANDS,
+    handle_interaction,
+)
 from .review_job import handle_channel_message, handle_thread_message
 from .store import Store
 
@@ -451,6 +457,8 @@ def commands_for_guild(config: Config) -> list[dict]:
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
         commands.extend(MERGED_SLASH_COMMANDS)
+    if config.pr_board_enabled and config.discord_guild_id:
+        commands.extend(PR_BOARD_SLASH_COMMANDS)
     return commands
 
 
@@ -725,6 +733,14 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
 
         restricted = app.default_permissions(manage_messages=True)(merged_this_week)
         add(spec, restricted)
+    if config.pr_board_enabled and config.discord_guild_id:
+        spec = PR_BOARD_SLASH_COMMANDS[0]
+
+        async def pr_board(interaction):
+            await _dispatch_command(discord, interaction, config, store, client=client)
+
+        restricted_board = app.default_permissions(manage_messages=True)(pr_board)
+        add(spec, restricted_board)
     return tree
 
 

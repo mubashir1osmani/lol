@@ -129,6 +129,24 @@ CREATE TABLE IF NOT EXISTS github_users_cache (
     email_local TEXT NOT NULL DEFAULT '',
     fetched_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pr_board_items (
+    project_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    pr_node_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT '',
+    pr_updated_at TEXT NOT NULL DEFAULT '',
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, repository, pr_number)
+);
+
+CREATE TABLE IF NOT EXISTS pr_board_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -790,6 +808,82 @@ class Store:
                 WHERE repository = ? AND number = ?
                 """,
                 (reviewed_at, head_sha or None, repository, number),
+            )
+            self._conn.commit()
+
+    def get_pr_board_item(self, project_id: str, repository: str, pr_number: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT project_id, repository, pr_number, pr_node_id, item_id, status, pr_updated_at, synced_at
+                FROM pr_board_items
+                WHERE project_id = ? AND repository = ? AND pr_number = ?
+                """,
+                (project_id, repository, pr_number),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_pr_board_item(
+        self,
+        project_id: str,
+        repository: str,
+        pr_number: int,
+        pr_node_id: str,
+        item_id: str,
+        status: str,
+        pr_updated_at: str,
+        synced_at: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pr_board_items (
+                    project_id, repository, pr_number, pr_node_id, item_id, status, pr_updated_at, synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, repository, pr_number) DO UPDATE SET
+                    pr_node_id = excluded.pr_node_id,
+                    item_id = excluded.item_id,
+                    status = excluded.status,
+                    pr_updated_at = excluded.pr_updated_at,
+                    synced_at = excluded.synced_at
+                """,
+                (project_id, repository, pr_number, pr_node_id, item_id, status, pr_updated_at, synced_at),
+            )
+            self._conn.commit()
+
+    def pr_board_status_counts(self, project_id: str, repository: str) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM pr_board_items
+                WHERE project_id = ? AND repository = ?
+                GROUP BY status
+                """,
+                (project_id, repository),
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def get_pr_board_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM pr_board_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_pr_board_meta(self, key: str, value: str, updated_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO pr_board_meta (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, updated_at),
             )
             self._conn.commit()
 
