@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import threading
+import time
 import uuid
 from datetime import datetime
 
@@ -16,8 +17,14 @@ from .api import (
 from .backfill import backfill_merged_pulls
 from .config import get_config, is_discord_id, load_dotenv
 from .gateway import start_gateway, stop_gateway
-from .interactions import MERGED_SLASH_COMMANDS, REVIEW_SLASH_COMMANDS, SLASH_COMMANDS
+from .interactions import (
+    MERGED_SLASH_COMMANDS,
+    PR_BOARD_SLASH_COMMANDS,
+    REVIEW_SLASH_COMMANDS,
+    SLASH_COMMANDS,
+)
 from .poller import poll_once, preview_roundup
+from .pr_board import sync_pr_board
 from .review_job import poll_review_channels
 from .store import Store
 from .schedule import UTC, parse_time
@@ -149,10 +156,13 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.once:
         poll_once(config)
-        if config.pr_review_enabled:
+        if config.pr_review_enabled or config.pr_board_enabled:
             store = Store(config.roles_db_path)
             try:
-                poll_review_channels(config, store)
+                if config.pr_review_enabled:
+                    poll_review_channels(config, store)
+                if config.pr_board_enabled:
+                    sync_pr_board(config, store)
             finally:
                 store.close()
         return
@@ -195,8 +205,11 @@ def start_contributor_roles(config):
     A Render web service sets PORT, so /health is served even while features are off.
     A failure here does not stop the weekly summary loop.
     """
-    features = config.contributor_roles_enabled or config.pr_review_enabled or (
-        config.merged_weekly_enabled and bool(config.discord_guild_id)
+    features = (
+        config.contributor_roles_enabled
+        or config.pr_review_enabled
+        or config.pr_board_enabled
+        or (config.merged_weekly_enabled and bool(config.discord_guild_id))
     )
     if not features and not os.environ.get("PORT", "").strip():
         return None
@@ -212,6 +225,8 @@ def start_contributor_roles(config):
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
         commands.extend(MERGED_SLASH_COMMANDS)
+    if config.pr_board_enabled and config.discord_guild_id:
+        commands.extend(PR_BOARD_SLASH_COMMANDS)
     # When discord.py is installed, gateway.py syncs guild commands via CommandTree on
     # connect. Skip the duplicate REST PUT here so startup does not trigger a Discord 429.
     if features and commands and config.discord_application_id and config.discord_guild_id and not _gateway_available():
@@ -258,6 +273,29 @@ def start_contributor_roles(config):
 def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
     reviews = bool(config.pr_review_enabled and store is not None)
     weekly_watchdog = bool(config.merged_weekly_enabled and store is not None)
+    pr_board_sync = False
+    if not config.pr_board_enabled:
+        logging.info(
+            "Contributor PR board is disabled "
+            "(set PR_BOARD_PROJECT_ID or PR_BOARD_OWNER + PR_BOARD_NUMBER to enable)."
+        )
+    elif not config.github_actor_token:
+        logging.warning(
+            "Contributor PR board is enabled but GITHUB_ACTOR_TOKEN is unset "
+            "(requires 'project' scope); board sync is paused."
+        )
+    elif store is None:
+        logging.error(
+            "Contributor PR board is enabled but the HTTP server did not start, "
+            "so board sync will not run"
+        )
+    else:
+        pr_board_sync = True
+        logging.info(
+            "Contributor PR board sync active for %s (every %ds).",
+            config.github_repository,
+            config.pr_board_sync_seconds,
+        )
     if config.merged_weekly_enabled:
         logging.info("Weekly contributor summary: %s", weekly_schedule_status(config, store))
     if config.announcements_enabled:
@@ -266,7 +304,7 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             "weekly posts run only via the Friday %s %s summary scheduler.",
             config.merged_time, config.merged_timezone,
         )
-    if not reviews and not weekly_watchdog:
+    if not reviews and not weekly_watchdog and not pr_board_sync:
         if not config.announcements_enabled:
             logging.info("Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false).")
         stop_event.wait()
@@ -274,8 +312,8 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
     if config.pr_review_enabled and not reviews:
         logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
     first_tick = True
+    next_board_sync = 0.0
     while not stop_event.is_set():
-        delay = min(config.poll_interval_seconds, 60.0) if weekly_watchdog else config.poll_interval_seconds
         gateway_live = gateway is not None and gateway.connected.is_set()
         if reviews and not gateway_live:
             try:
@@ -295,5 +333,16 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                 post_weekly_if_due(config, store, guild=guild, loop=loop)
             except Exception:
                 logging.exception("Weekly merge summary watchdog check failed")
+        if pr_board_sync and time.monotonic() >= next_board_sync:
+            next_board_sync = time.monotonic() + float(config.pr_board_sync_seconds)
+            try:
+                sync_pr_board(config, store)
+            except Exception:
+                logging.exception("Contributor PR board sync failed")
+        delay = float(config.poll_interval_seconds)
+        if weekly_watchdog:
+            delay = min(delay, 60.0)
+        if pr_board_sync:
+            delay = min(delay, max(1.0, next_board_sync - time.monotonic()))
         first_tick = False
         stop_event.wait(delay)

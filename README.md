@@ -437,6 +437,57 @@ Set the provider key the model expects (`OPENAI_API_KEY`, and so on).
 `PR_REVIEW_ENABLED=false` leaves the Friday roundup and role commands as they
 were. The gateway still connects so the bot shows online.
 
+## Contributor PR backlog board
+
+The bot can keep a GitHub Projects (v2) board synced with community contributor
+PRs on `BerriAI/litellm` (excluding bots, org members/staff, and
+`MAINTAINER_GITHUB_LOGINS`). It stays off with a single `INFO` log until you set
+`PR_BOARD_PROJECT_ID` (or `PR_BOARD_OWNER` + `PR_BOARD_NUMBER`).
+
+### 1. Create the GitHub Project (v2)
+
+1. Create a new GitHub Project (v2) under your user or organization (for
+   example, `BerriAI` or your personal GitHub account). Note either:
+   - the owner login + project number from the URL
+     (`https://github.com/orgs/<owner>/projects/<number>` or
+     `https://github.com/users/<owner>/projects/<number>`), **or**
+   - the GraphQL Project node ID (`PVT_...`).
+2. Configure the built-in single-select **`Status`** field (or a custom
+   single-select field named in `PR_BOARD_STATUS_FIELD`) with these exact
+   options:
+   - `Open`
+   - `In review` (has a review or a Bugbot / Greptile / Veria comment)
+   - `Changes requested`
+   - `Approved`
+   - `Merged`
+   - `Closed`
+
+### 2. Token scope (`GITHUB_ACTOR_TOKEN`)
+
+The sync uses the GitHub GraphQL API with `GITHUB_ACTOR_TOKEN`:
+
+- **Classic personal access token:** enable the **`project`** scope (plus
+  `public_repo` if you also use `GITHUB_ACTOR_TOKEN` for review trigger
+  comments).
+- **Fine-grained personal access token:** grant **Projects: Read and write** on
+  the project's owner (user or organization) and public repository read access.
+
+### 3. Render environment variables
+
+- `GITHUB_ACTOR_TOKEN` — token with `project` scope.
+- `PR_BOARD_PROJECT_ID` (e.g. `PVT_kwDO...`) **or** both `PR_BOARD_OWNER` and
+  `PR_BOARD_NUMBER` (e.g. `BerriAI` and `12`).
+- Optional: `PR_BOARD_SYNC_SECONDS` (default `600`, ~10 minutes),
+  `PR_BOARD_STATUS_FIELD` (default `Status`), `MAINTAINER_GITHUB_LOGINS`
+  (comma-separated logins to exclude alongside org members).
+
+Every ~10 minutes, the bot fetches open and recently updated community PRs,
+adds missing ones (`addProjectV2ItemById`), caches their project item IDs and
+last-set status in SQLite (`ROLES_DB_PATH`) so repeat runs make zero mutations
+for unchanged PRs, and updates `Status` when a PR changes state. Moderators can
+run `/pr-board` in Discord for an ephemeral reply with the board link and PR
+counts per status.
+
 ## Checks
 
 Offline tests never post or use real credentials:

@@ -39,8 +39,101 @@ _PR_NUMBER = r"[1-9][0-9]*"
 _INTERACTION_TOKEN = r"[A-Za-z0-9._~=-]{10,256}"
 
 
+_ALLOWED_PROJECT_V2_MUTATIONS = frozenset({
+    "addProjectV2ItemById",
+    "updateProjectV2ItemFieldValue",
+})
+
+
+def _allowed_project_v2_mutation(folded: str) -> bool:
+    """Allow only single-operation GitHub Projects v2 board add/update mutations."""
+    if not re.match(r"^mutation\b", folded, re.I):
+        return False
+    # Reject multiple operations, subscriptions, or comments/strings hiding other fields.
+    if re.search(r"\b(subscription|fragment)\b", folded, re.I):
+        return False
+    if len(re.findall(r"\bmutation\b", folded, re.I)) != 1:
+        return False
+    open_brace = folded.find("{")
+    if open_brace < 0 or not folded.endswith("}"):
+        return False
+    # Walk the top-level selection set (brace depth 1, paren depth 0) and inspect every field name.
+    brace_depth = 0
+    paren_depth = 0
+    in_string = False
+    escaped = False
+    top_tokens: list[str] = []
+    token_chars: list[str] = []
+    for ch in folded[open_brace:]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if brace_depth == 1 and paren_depth == 0 and token_chars:
+                top_tokens.append("".join(token_chars))
+                token_chars = []
+            brace_depth += 1
+            continue
+        if ch == "}":
+            if brace_depth == 1 and paren_depth == 0 and token_chars:
+                top_tokens.append("".join(token_chars))
+                token_chars = []
+            brace_depth -= 1
+            if brace_depth < 0:
+                return False
+            continue
+        if brace_depth == 1:
+            if ch == "(":
+                if paren_depth == 0 and token_chars:
+                    top_tokens.append("".join(token_chars))
+                    token_chars = []
+                paren_depth += 1
+                continue
+            if ch == ")":
+                paren_depth -= 1
+                if paren_depth < 0:
+                    return False
+                continue
+            if paren_depth == 0:
+                if ch.isalnum() or ch in "_:":
+                    token_chars.append(ch)
+                elif token_chars:
+                    top_tokens.append("".join(token_chars))
+                    token_chars = []
+    if brace_depth != 0 or paren_depth != 0 or in_string:
+        return False
+    # Resolve optional GraphQL aliases (e.g. "item: addProjectV2ItemById" -> "addProjectV2ItemById").
+    fields: list[str] = []
+    skip_alias = False
+    for tok in top_tokens:
+        if tok == ":":
+            skip_alias = True
+            continue
+        if tok.endswith(":"):
+            skip_alias = True
+            continue
+        if ":" in tok:
+            fields.append(tok.split(":", 1)[1])
+            skip_alias = False
+            continue
+        if skip_alias:
+            fields.append(tok)
+            skip_alias = False
+            continue
+        fields.append(tok)
+    return bool(fields) and all(field in _ALLOWED_PROJECT_V2_MUTATIONS for field in fields)
+
+
 def _graphql_query_allowed(request: Request) -> bool:
-    """Read-only GraphQL. Review-thread resolution has no REST field."""
+    """Allow read-only GraphQL queries plus the two Projects v2 board mutations."""
     if request.get_method() != "POST" or urlsplit(request.full_url).query:
         return False
     data = request.data
@@ -59,8 +152,10 @@ def _graphql_query_allowed(request: Request) -> bool:
     if variables is not None and not isinstance(variables, dict):
         return False
     folded = " ".join(query.split())
-    if re.search(r"\b(mutation|subscription)\b", folded, re.I):
+    if re.search(r"\bsubscription\b", folded, re.I):
         return False
+    if re.search(r"\bmutation\b", folded, re.I):
+        return _allowed_project_v2_mutation(folded)
     lowered = folded.lower()
     return lowered.startswith("query ") or lowered.startswith("{")
 
@@ -503,14 +598,27 @@ def fetch_pull_diff(repository: str, number: int, token: str | None) -> str:
     return text
 
 
-def github_graphql(token: str | None, query: str, variables: dict[str, Any]) -> Any:
-    """One read-only GraphQL query. Mutations are rejected before the request is sent."""
-    payload = _request_json(Request(
-        f"{GITHUB_API}/graphql",
-        data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
-        method="POST",
-        headers={**github_headers(token), "Content-Type": "application/json"},
-    ))
+def github_graphql(
+    token: str | None,
+    query: str,
+    variables: dict[str, Any],
+    *,
+    timeout: float = 15.0,
+    attempts: int = 2,
+    max_retry_delay: float = 5.0,
+) -> Any:
+    """One GraphQL call (read-only queries or Projects v2 board mutations)."""
+    payload = _request_json(
+        Request(
+            f"{GITHUB_API}/graphql",
+            data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+            method="POST",
+            headers={**github_headers(token), "Content-Type": "application/json"},
+        ),
+        attempts=attempts,
+        timeout=timeout,
+        max_retry_delay=max_retry_delay,
+    )
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub returned an unexpected GraphQL response")
     return payload

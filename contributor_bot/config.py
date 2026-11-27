@@ -122,6 +122,17 @@ class Config:
     discord_members_intent: bool = False
     bot_status_text: str = "skedaddling 🏃‍♂️"
     bot_status_rotate: bool = False
+    pr_board_project_id: str | None = None
+    pr_board_owner: str | None = None
+    pr_board_number: int | None = None
+    pr_board_sync_seconds: int = 600
+    pr_board_status_field: str = "Status"
+
+    @property
+    def pr_board_enabled(self) -> bool:
+        return bool(self.pr_board_project_id) or (
+            bool(self.pr_board_owner) and self.pr_board_number is not None
+        )
 
     @property
     def effective_github_token(self) -> str | None:
@@ -192,6 +203,10 @@ def get_config(env: dict[str, str] | None = None) -> Config:
 
     actor_token = values.get("GITHUB_ACTOR_TOKEN", "").strip() or None
     github_token = values.get("GITHUB_TOKEN", "").strip() or actor_token
+    board_project_id, board_owner, board_number = _pr_board_target(values)
+    board_status_field = values.get("PR_BOARD_STATUS_FIELD", "").strip() or "Status"
+    if len(board_status_field) > 80 or any(ch in board_status_field for ch in "\r\n"):
+        raise ValueError("PR_BOARD_STATUS_FIELD must be a single-line field name")
 
     return Config(
         discord_token=token,
@@ -261,7 +276,32 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         discord_members_intent=members_intent,
         bot_status_text=(values.get("BOT_STATUS_TEXT", "").strip() or "skedaddling 🏃‍♂️")[:128],
         bot_status_rotate=_flag(values, "BOT_STATUS_ROTATE", False),
+        pr_board_project_id=board_project_id,
+        pr_board_owner=board_owner,
+        pr_board_number=board_number,
+        pr_board_sync_seconds=_bounded_int(values, "PR_BOARD_SYNC_SECONDS", 600, 60, 86400),
+        pr_board_status_field=board_status_field,
     )
+
+
+def _pr_board_target(values: dict[str, str]) -> tuple[str | None, str | None, int | None]:
+    project_id = values.get("PR_BOARD_PROJECT_ID", "").strip() or None
+    owner = values.get("PR_BOARD_OWNER", "").strip() or None
+    number_raw = values.get("PR_BOARD_NUMBER", "").strip()
+    number: int | None = None
+    if project_id is not None and not re.fullmatch(r"[A-Za-z0-9_=-]{4,120}", project_id):
+        raise ValueError("PR_BOARD_PROJECT_ID must be a GitHub ProjectV2 node ID (e.g. PVT_...)")
+    if owner is not None and not re.fullmatch(r"[A-Za-z0-9-]+", owner):
+        raise ValueError("PR_BOARD_OWNER must be a GitHub organization or user login")
+    if number_raw:
+        if not re.fullmatch(r"[1-9][0-9]*", number_raw):
+            raise ValueError("PR_BOARD_NUMBER must be a positive integer")
+        number = int(number_raw)
+        if number > 100000:
+            raise ValueError("PR_BOARD_NUMBER must be between 1 and 100000")
+    if project_id is None and bool(owner) != (number is not None):
+        raise ValueError("PR_BOARD_OWNER and PR_BOARD_NUMBER must both be set (or set PR_BOARD_PROJECT_ID)")
+    return project_id, owner, number
 
 
 def _optional_cap(values: dict[str, str], name: str) -> int:
