@@ -189,108 +189,238 @@ class WeeklyTests(unittest.TestCase):
         self.assertTrue(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
         self.assertFalse(store.mark_merged_week("BerriAI/litellm", "2026-W48", "2026-11-23T15:00:00+00:00"))
 
-    def test_discord_mapping_order_fallbacks_and_skipped_logging(self):
-        import asyncio
+    def test_automatic_matcher_signals_jev_batch_haiku_fallback_and_sqlite_cache(self):
         from types import SimpleNamespace
-        from contributor_bot.weekly import build_weekly_report, resolve_discord_ids_for_groups
+        from contributor_bot.matcher import (
+            extract_discord_handles_from_text,
+            extract_discord_ids_from_text,
+            normalize_base,
+            normalize_strict,
+        )
+        from contributor_bot.weekly import build_weekly_report, reset_org_members_cache
+
+        reset_org_members_cache()
+        self.assertEqual(normalize_strict("Pavel.N_83"), "paveln83")
+        self.assertEqual(normalize_base("Pavel.N_83"), "paveln")
+        self.assertEqual(extract_discord_handles_from_text("Join discord.gg/litellm | Discord: @izzy_dev"), ["izzy_dev"])
+        self.assertEqual(extract_discord_ids_from_text("https://discord.com/users/900000000000000009"), ["900000000000000009"])
 
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         store = Store(str(Path(directory.name) / "roles.db"))
         self.addCleanup(store.close)
-        # /link-github store maps github user_id=101 -> discord_id="100000000000000001"
+        # No /link-github entries needed at all; optional link_store still works if present.
         store.link_account("100000000000000001", "linkedDev", 101, "2026-11-20T00:00:00+00:00")
 
-        base_groups = [
-            {"login": "linkedDev", "user_id": 101, "discord_id": None, "pulls": [{"number": 1, "title": "a", "url": "https://github.com/BerriAI/litellm/pull/1"}]},
-            {"login": "NameMatch", "user_id": 102, "discord_id": None, "pulls": [{"number": 2, "title": "b", "url": "https://github.com/BerriAI/litellm/pull/2"}]},
-            {"login": "GlobalMatch", "user_id": 103, "discord_id": None, "pulls": [{"number": 3, "title": "c", "url": "https://github.com/BerriAI/litellm/pull/3"}]},
-            {"login": "DisplayMatch", "user_id": 104, "discord_id": None, "pulls": [{"number": 4, "title": "d", "url": "https://github.com/BerriAI/litellm/pull/4"}]},
-            {"login": "ghostUser", "user_id": 105, "discord_id": None, "pulls": [{"number": 5, "title": "e", "url": "https://github.com/BerriAI/litellm/pull/5"}]},
+        gh_items = [
+            {"number": 1, "title": "a", "html_url": "https://github.com/BerriAI/litellm/pull/1", "user": {"login": "linkedDev", "type": "User", "id": 101}, "author_association": "CONTRIBUTOR"},
+            {"number": 2, "title": "b", "html_url": "https://github.com/BerriAI/litellm/pull/2", "user": {"login": "paveln83", "type": "User", "id": 102}, "author_association": "CONTRIBUTOR"},
+            {"number": 3, "title": "c", "html_url": "https://github.com/BerriAI/litellm/pull/3", "user": {"login": "gh-bio-user", "type": "User", "id": 103}, "author_association": "CONTRIBUTOR"},
+            {"number": 4, "title": "d", "html_url": "https://github.com/BerriAI/litellm/pull/4", "user": {"login": "gh-twit-user", "type": "User", "id": 104}, "author_association": "CONTRIBUTOR"},
+            {"number": 5, "title": "e", "html_url": "https://github.com/BerriAI/litellm/pull/5", "user": {"login": "gh-name-user", "type": "User", "id": 105}, "author_association": "CONTRIBUTOR"},
+            {"number": 6, "title": "f", "html_url": "https://github.com/BerriAI/litellm/pull/6", "user": {"login": "gh-fuzzy-win", "type": "User", "id": 106}, "author_association": "CONTRIBUTOR"},
+            {"number": 7, "title": "g", "html_url": "https://github.com/BerriAI/litellm/pull/7", "user": {"login": "gh-fuzzy-low", "type": "User", "id": 107}, "author_association": "CONTRIBUTOR"},
+            {"number": 8, "title": "h", "html_url": "https://github.com/BerriAI/litellm/pull/8", "user": {"login": "totally-unknown", "type": "User", "id": 108}, "author_association": "CONTRIBUTOR"},
         ]
 
-        # 1. Store wins over guild member with colliding name; guild.members matches username, global_name, display_name case-insensitively and ignores bots.
-        guild_cached = SimpleNamespace(members=[
-            SimpleNamespace(id=999999999999999999, name="linkeddev", global_name=None, display_name="linkeddev", nick=None, bot=False),
-            SimpleNamespace(id=200000000000000002, name="namematch", global_name="Someone", display_name="Someone", nick=None, bot=False),
-            SimpleNamespace(id=300000000000000003, name="other_user", global_name="globalmatch", display_name="Other", nick=None, bot=False),
-            SimpleNamespace(id=400000000000000004, name="nick_user", global_name="Nick", display_name="displaymatch", nick="displaymatch", bot=False),
-            SimpleNamespace(id=500000000000000005, name="ghostuser", global_name=None, display_name="ghostuser", nick=None, bot=True),
-        ])
-        matched, skipped = resolve_discord_ids_for_groups(
-            base_groups, store, guild=guild_cached, members_intent_enabled=True,
-        )
-        by_login = {g["login"]: g["discord_id"] for g in matched}
-        self.assertEqual(by_login, {
-            "linkedDev": "100000000000000001",
-            "NameMatch": "200000000000000002",
-            "GlobalMatch": "300000000000000003",
-            "DisplayMatch": "400000000000000004",
-        })
-        self.assertEqual(skipped, 1)
+        profiles = {
+            "paveln83": {"login": "paveln83", "name": "Pavel", "bio": "", "blog": "", "twitter_username": None},
+            "gh-bio-user": {"login": "gh-bio-user", "name": "", "bio": "ML eng | Discord: @real_bio_handle", "blog": "", "twitter_username": None},
+            "gh-twit-user": {"login": "gh-twit-user", "name": "", "bio": "", "blog": "", "twitter_username": "cooltwitter"},
+            "gh-name-user": {"login": "gh-name-user", "name": "Elena Rostova", "bio": "", "blog": "", "twitter_username": None},
+            "gh-fuzzy-win": {"login": "gh-fuzzy-win", "name": "Marcus Vance", "bio": "working on proxies", "blog": "", "twitter_username": None},
+            "gh-fuzzy-low": {"login": "gh-fuzzy-low", "name": "Jordan Kim", "bio": "", "blog": "", "twitter_username": None},
+            "totally-unknown": {"login": "totally-unknown", "name": "Nobody Special", "bio": "", "blog": "", "twitter_username": None},
+        }
+        commits = {
+            6: [{"author": {"login": "gh-fuzzy-win"}, "commit": {"author": {"name": "Marcus Vance", "email": "mvance@example.com"}}}],
+            7: [{"author": {"login": "gh-fuzzy-low"}, "commit": {"author": {"name": "Jordan Kim", "email": "jkim@example.com"}}}],
+        }
+        github_calls = {"users": 0, "commits": 0}
 
-        # 2. When members intent is off and guild.members is empty/partial, falls back to guild.fetch_members().
+        def fake_gh(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            if "/search/issues" in url:
+                return {"items": gh_items}
+            if "/users/" in url:
+                github_calls["users"] += 1
+                login = url.rsplit("/users/", 1)[1]
+                return profiles.get(login, {"login": login})
+            if "/commits" in url:
+                github_calls["commits"] += 1
+                num = int(url.split("/pulls/")[1].split("/")[0])
+                return commits.get(num, [])
+            return {}
+
+        guild_members = [
+            SimpleNamespace(id=200000000000000002, name="pavel_n", global_name="Pavel N", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000003, name="real_bio_handle", global_name="Bio Person", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000004, name="someone_else", global_name="CoolTwitter", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000005, name="erostova_alt", global_name="Other", nick="Elena Rostova", bot=False),
+            SimpleNamespace(id=200000000000000006, name="mvance", global_name="Marcus V", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000007, name="jkim", global_name="JK", nick=None, bot=False),
+            SimpleNamespace(id=200000000000000099, name="totally-unknown", global_name=None, nick=None, bot=True),
+        ]
+
+        # Empty cache triggers guild.fetch_members().
         class _FetchGuild:
             members = []
 
             async def fetch_members(self, limit=None):
-                for item in guild_cached.members:
+                for item in guild_members:
                     yield item
 
-        matched_fetch, skipped_fetch = resolve_discord_ids_for_groups(
-            base_groups, store, guild=_FetchGuild(), members_intent_enabled=False,
+        jev_requests = []
+
+        def fake_jev(body_bytes):
+            payload = json.loads(body_bytes.decode("utf-8"))
+            jev_requests.append(payload)
+            state = json.loads(payload["state"])
+            answers = {}
+            for item in state["candidate_pairs"]:
+                gh_login = item["github"]["login"]
+                if gh_login == "gh-fuzzy-win":
+                    answers[item["pair"]] = {"type": "noul", "noul": 0.91}
+                else:
+                    answers[item["pair"]] = {"type": "noul", "noul": 0.62}
+            return {"model": "jev-1.14.0", "answers": answers, "usage": {"input_tokens": 300, "output_tokens": 20}}
+
+        config = Config(
+            "token", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            typesafe_api_key="ts-key",
+            review_decision_model="jev-latest",
+            discord_members_intent=True,
         )
-        self.assertEqual(len(matched_fetch), 4)
-        self.assertEqual(skipped_fetch, 1)
-
-        # 3. When fetch_members fails (intent disabled on server), falls back to guild.search_members().
-        class _SearchGuild:
-            members = []
-
-            async def fetch_members(self, limit=None):
-                raise RuntimeError("missing members intent")
-                yield  # pragma: no cover
-
-            async def search_members(self, query, limit=10):
-                q = query.casefold()
-                return [m for m in guild_cached.members if q in (m.name or "").casefold() or q in (m.global_name or "").casefold() or q in (m.display_name or "").casefold()]
-
-        matched_search, skipped_search = resolve_discord_ids_for_groups(
-            base_groups, store, guild=_SearchGuild(), members_intent_enabled=False,
-        )
-        self.assertEqual(len(matched_search), 4)
-        self.assertEqual(skipped_search, 1)
-
-        # 4. When guild has neither cache nor methods, falls back to REST search_guild_members and logs matched/skipped counts.
-        config = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444")
-        gh_items = [
-            {"number": 1, "title": "a", "html_url": "https://github.com/BerriAI/litellm/pull/1", "user": {"login": "linkedDev", "type": "User", "id": 101}, "author_association": "CONTRIBUTOR"},
-            {"number": 2, "title": "b", "html_url": "https://github.com/BerriAI/litellm/pull/2", "user": {"login": "restUser", "type": "User", "id": 106}, "author_association": "CONTRIBUTOR"},
-            {"number": 3, "title": "c", "html_url": "https://github.com/BerriAI/litellm/pull/3", "user": {"login": "notInDiscord", "type": "User", "id": 107}, "author_association": "CONTRIBUTOR"},
-        ]
-
-        def fake_gh(url, _token, **_kwargs):
-            return [] if "/orgs/" in url else {"items": gh_items}
-
-        def fake_rest_search(_gid, query, _tok, **_kwargs):
-            if query.casefold() == "restuser":
-                return [{"user": {"id": "600000000000000006", "username": "restUser", "global_name": "Rest User", "bot": False}, "nick": None}]
-            return []
 
         with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
-                mock.patch("contributor_bot.weekly.search_guild_members", side_effect=fake_rest_search), \
                 self.assertLogs(level="INFO") as logs:
-            report = build_weekly_report(config, store, now=datetime(2026, 11, 26, tzinfo=timezone.utc))
+            report = build_weekly_report(
+                config,
+                store,
+                now=datetime(2026, 11, 26, tzinfo=timezone.utc),
+                guild=_FetchGuild(),
+                jev_transport=fake_jev,
+            )
 
-        self.assertEqual(report.matched_count, 2)
-        self.assertEqual(report.skipped_count, 1)
+        # Single batched Jev call containing both fuzzy pairs; >=0.85 accepted, 0.62 rejected.
+        self.assertEqual(len(jev_requests), 1)
+        self.assertEqual(jev_requests[0]["model"], "jev-latest")
+        self.assertEqual(len(jev_requests[0]["questions"]), 2)
+        for q in jev_requests[0]["questions"].values():
+            self.assertEqual(q["type"], "noul")
+
+        self.assertEqual(report.matched_count, 6)
+        self.assertEqual(report.skipped_count, 2)
+        methods = {d.github_login: (d.discord_id, d.method) for d in report.match_details}
+        self.assertEqual(methods, {
+            "linkedDev": ("100000000000000001", "link_store"),
+            "paveln83": ("200000000000000002", "exact_login"),
+            "gh-bio-user": ("200000000000000003", "bio_discord_handle"),
+            "gh-twit-user": ("200000000000000004", "twitter_match"),
+            "gh-name-user": ("200000000000000005", "exact_name"),
+            "gh-fuzzy-win": ("200000000000000006", "jev"),
+        })
         body = "\n".join(report.chunks)
-        self.assertIn("<@100000000000000001>", body)
-        self.assertIn("<@600000000000000006>", body)
-        self.assertNotIn("linkedDev", body)
-        self.assertNotIn("restUser", body)
-        self.assertNotIn("notInDiscord", body)
-        self.assertTrue(any("2 contributors matched in Discord, 1 unmatched skipped" in entry for entry in logs.output))
+        for uid in ("100000000000000001", "200000000000000002", "200000000000000003", "200000000000000004", "200000000000000005", "200000000000000006"):
+            self.assertIn(f"<@{uid}>", body)
+        self.assertNotIn("200000000000000007", body)
+        self.assertNotIn("gh-fuzzy-low", body)
+        self.assertNotIn("totally-unknown", body)
+        self.assertTrue(any("6 contributors matched in Discord, 2 unmatched skipped" in entry for entry in logs.output))
+
+        # Second run reuses SQLite persisted matches for the 5 auto-matched users:
+        # no GitHub profile/commit calls for already-persisted authors and no Jev call for gh-fuzzy-win.
+        self.assertEqual(len(store.all_confirmed_matches()), 5)
+        github_calls["users"] = 0
+        github_calls["commits"] = 0
+        jev_requests.clear()
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            report2 = build_weekly_report(
+                config,
+                store,
+                now=datetime(2026, 11, 26, tzinfo=timezone.utc),
+                guild=SimpleNamespace(members=guild_members),
+                jev_transport=fake_jev,
+            )
+        self.assertEqual(report2.matched_count, 6)
+        self.assertEqual(report2.skipped_count, 2)
+        # Only the 2 still-unmatched authors hit GitHub /users on rerun.
+        self.assertEqual(github_calls["users"], 2)
+        methods2 = {d.github_login: d.method for d in report2.match_details}
+        self.assertEqual(methods2["paveln83"], "sqlite:exact_login")
+        self.assertEqual(methods2["gh-fuzzy-win"], "sqlite:jev")
+
+        # Haiku fallback when TYPESAFE_API_KEY is absent.
+        store2 = Store(str(Path(directory.name) / "haiku.db"))
+        self.addCleanup(store2.close)
+        cfg_no_ts = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444", typesafe_api_key=None)
+        haiku_calls = []
+
+        def fake_haiku(model, messages):
+            haiku_calls.append((model, messages))
+            data = json.loads(messages[1]["content"])
+            out = {}
+            for item in data["candidate_pairs"]:
+                out[item["pair"]] = 0.89 if item["github"]["login"] == "gh-fuzzy-win" else 0.2
+            return json.dumps(out)
+
+        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": ""}, clear=False), \
+                mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            report_haiku = build_weekly_report(
+                cfg_no_ts,
+                store2,
+                now=datetime(2026, 11, 26, tzinfo=timezone.utc),
+                guild=SimpleNamespace(members=guild_members),
+                haiku_complete=fake_haiku,
+            )
+        self.assertEqual(len(haiku_calls), 1)
+        haiku_methods = {d.github_login: d.method for d in report_haiku.match_details}
+        self.assertEqual(haiku_methods["gh-fuzzy-win"], "haiku")
+        self.assertNotIn("gh-fuzzy-low", haiku_methods)
+
+    def test_ambiguous_collision_goes_to_jev_and_noreply_email_strips_id(self):
+        from contributor_bot.matcher import (
+            DiscordMemberInfo,
+            GitHubAuthorProfile,
+            _extract_email_local,
+            match_community_contributors,
+            score_author_against_members,
+        )
+
+        self.assertEqual(_extract_email_local("123456+AliceDev@users.noreply.github.com"), "AliceDev")
+        self.assertIsNone(_extract_email_local("noreply@github.com"))
+
+        # Two Discord members share the normalized name "alexsmith" -> collision is NOT strong, sent to Jev.
+        members = [
+            DiscordMemberInfo("300000000000000001", username="alex_smith", global_name="Alex Smith"),
+            DiscordMemberInfo("300000000000000002", username="alexsmith99", global_name="Alex Smith"),
+        ]
+        profile = GitHubAuthorProfile(login="alexsmith", name="Alex Smith")
+        strong, candidates = score_author_against_members(profile, members)
+        self.assertIsNone(strong)
+        self.assertEqual(len(candidates), 2)
+
+        # If Jev scores both >=0.85 within 0.05 (ambiguous tie), neither is guessed.
+        cfg = Config("token", "123", "456", typesafe_api_key="ts-key")
+        groups = [{"login": "alexsmith", "user_id": 500, "pulls": [{"number": 1, "title": "x", "url": "https://github.com/BerriAI/litellm/pull/1"}]}]
+
+        def tie_jev(body_bytes):
+            payload = json.loads(body_bytes.decode("utf-8"))
+            return {"answers": {k: {"type": "noul", "noul": 0.88} for k in payload["questions"]}}
+
+        matched, skipped, _details = match_community_contributors(
+            groups,
+            cfg,
+            None,
+            members=members,
+            skip_github_enrichment=True,
+            jev_transport=tie_jev,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
 
     def test_merged_this_week_defers_suppresses_embeds_and_caps_at_15_lines(self):
         import asyncio
@@ -410,6 +540,10 @@ class WeeklyTests(unittest.TestCase):
         def fake_github(url, _token, **_kwargs):
             if "/orgs/BerriAI/public_members" in url:
                 return [{"login": "staff-org"}]
+            if "/users/" in url:
+                return {"login": url.rsplit("/users/", 1)[1]}
+            if "/commits" in url:
+                return []
             return {"items": items}
 
         with mock.patch("contributor_bot.interactions.threading.Thread", _InlineThread), \

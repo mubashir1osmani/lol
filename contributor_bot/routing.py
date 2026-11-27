@@ -144,8 +144,14 @@ def _from_jev(payload: dict, threshold: float) -> Decision:
     )
 
 
-def call_jev(model: str, state: str, api_key: str, transport=None) -> dict:
-    body = json.dumps({"model": model, "state": state, "questions": _questions()}).encode()
+def call_jev_questions(
+    model: str,
+    state: str,
+    questions: dict,
+    api_key: str,
+    transport=None,
+) -> dict:
+    body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
     if transport is not None:
         return transport(body)
     from urllib.request import Request
@@ -160,6 +166,10 @@ def call_jev(model: str, state: str, api_key: str, transport=None) -> dict:
             "User-Agent": "litellm-contributor-discord-bot",
         },
     ))
+
+
+def call_jev(model: str, state: str, api_key: str, transport=None) -> dict:
+    return call_jev_questions(model, state, _questions(), api_key, transport=transport)
 
 
 def decide(config, text: str, *, channel: str = "", context: str = "", transport=None) -> Decision:

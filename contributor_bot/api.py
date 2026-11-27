@@ -71,6 +71,7 @@ def _github_request_allowed(method: str, path: str) -> bool:
     if method == "GET" and (
         re.fullmatch(pull, path)
         or re.fullmatch(pull + r"/files", path)
+        or re.fullmatch(pull + r"/commits", path)
         or re.fullmatch(pull + r"/reviews", path)
         or re.fullmatch(pull + r"/comments", path)
         or re.fullmatch(commit + r"/check-runs", path)
@@ -80,6 +81,7 @@ def _github_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/contents(?:/[^/]+)+", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/pulls", path)
         or re.fullmatch(r"/orgs/[A-Za-z0-9._-]+/public_members", path)
+        or re.fullmatch(r"/users/[A-Za-z0-9-]+", path)
         or path in {"/search/issues", "/search/code", "/user"}
     ):
         return True
@@ -108,10 +110,7 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}", path
     ):
         return True
-    if method == "GET" and (
-        re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/channels", path)
-        or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/members/search", path)
-    ):
+    if method == "GET" and re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/channels", path):
         return True
     # Add an existing role to a member. Creating roles, editing members, and
     # removing roles stay blocked.
@@ -773,24 +772,6 @@ def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
     if not isinstance(channel, dict) or channel.get("id") != channel_id:
         raise RuntimeError("Discord returned an unexpected channel response")
     return channel
-
-
-def search_guild_members(guild_id: str, query: str, token: str, *, limit: int = 10) -> list[dict[str, Any]]:
-    """Search guild members by username/nickname prefix over REST (no members intent needed)."""
-    if not is_discord_id(guild_id):
-        raise ValueError("Unexpected Discord guild ID")
-    cleaned = (query or "").strip()
-    if not cleaned:
-        return []
-    bounded = max(1, min(int(limit), 100))
-    params = urlencode({"query": cleaned[:32], "limit": bounded})
-    payload = _request_json(Request(
-        f"{DISCORD_API}/guilds/{guild_id}/members/search?{params}",
-        headers=_discord_headers(token),
-    ))
-    if not isinstance(payload, list):
-        return []
-    return [item for item in payload if isinstance(item, dict)]
 
 
 def add_reaction(channel_id: str, message_id: str, emoji: str, token: str) -> None:

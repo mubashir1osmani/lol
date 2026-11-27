@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS merged_weeks (
     posted_at TEXT NOT NULL,
     PRIMARY KEY (repository, week_key)
 );
+
+CREATE TABLE IF NOT EXISTS github_discord_matches (
+    github_login TEXT PRIMARY KEY,
+    github_user_id INTEGER,
+    discord_id TEXT NOT NULL,
+    method TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    matched_at TEXT NOT NULL
+);
 """
 
 
@@ -588,6 +597,63 @@ class Store:
             )
             self._conn.commit()
             return cursor.rowcount == 1
+
+    def get_confirmed_match(self, github_login: str) -> dict | None:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                FROM github_discord_matches
+                WHERE github_login = ?
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_confirmed_match(
+        self,
+        github_login: str,
+        discord_id: str,
+        *,
+        method: str,
+        confidence: float,
+        matched_at: str,
+        github_user_id: int | None = None,
+    ) -> None:
+        key = (github_login or "").strip().lower()
+        if not key or not _LOGIN.fullmatch(key) or not is_discord_id(discord_id):
+            raise ValueError("Invalid GitHub login or Discord id")
+        uid = github_user_id if isinstance(github_user_id, int) and github_user_id > 0 else None
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO github_discord_matches (
+                    github_login, github_user_id, discord_id, method, confidence, matched_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(github_login) DO UPDATE SET
+                    github_user_id = COALESCE(excluded.github_user_id, github_discord_matches.github_user_id),
+                    discord_id = excluded.discord_id,
+                    method = excluded.method,
+                    confidence = excluded.confidence,
+                    matched_at = excluded.matched_at
+                """,
+                (key, uid, discord_id, str(method), float(confidence), matched_at),
+            )
+            self._conn.commit()
+
+    def all_confirmed_matches(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                FROM github_discord_matches
+                ORDER BY github_login
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def mark_review_done(self, repository: str, number: int, reviewed_at: str, head_sha: str) -> None:
         self._review_key(repository, number)

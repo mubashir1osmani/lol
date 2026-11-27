@@ -148,9 +148,11 @@ class NetworkBoundaryTests(unittest.TestCase):
             "https://api.github.com/repos/BerriAI/litellm/contents/litellm/proxy/server.py?ref=" + sha,
             "https://api.github.com/search/code?q=repo%3ABerriAI%2Flitellm+timeout",
             "https://api.github.com/repos/BerriAI/litellm/check-runs/99/annotations",
+            "https://api.github.com/repos/BerriAI/litellm/pulls/12/commits?per_page=30",
+            "https://api.github.com/orgs/BerriAI/public_members?per_page=100&page=1",
+            "https://api.github.com/users/octocat",
             "https://discord.com/api/v10/channels/321/messages/654",
             "https://discord.com/api/v10/guilds/333/channels",
-            "https://discord.com/api/v10/guilds/333/members/search?query=octocat&limit=10",
         ]
         query = json.dumps({"query": "query ReviewThreads($n: Int!) { repository { pullRequest { id } } }"}).encode()
         mutation = json.dumps({"query": "mutation { addReaction(input: {subjectId: \"x\"}) { clientMutationId } }"}).encode()

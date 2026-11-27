@@ -1,7 +1,5 @@
 """Monday summary of community pull requests merged in the last seven days."""
 
-import asyncio
-import inspect
 import logging
 import re
 import threading
@@ -11,8 +9,9 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from .api import GITHUB_API, TransientAPIError, github_get_json, post_message, search_guild_members
+from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
 from .config import is_discord_id
+from .matcher import MatchDetail, match_community_contributors
 from .schedule import UTC, iso
 
 _WEEKDAYS = {
@@ -44,6 +43,7 @@ class WeeklyReport:
     skipped_count: int
     since: datetime
     rate_limited: bool = False
+    match_details: tuple[MatchDetail, ...] = ()
 
 
 def reset_org_members_cache() -> None:
@@ -138,186 +138,6 @@ def fetch_org_public_members(
     with _org_cache_lock:
         _org_members_cache[key] = (result, now + ttl_seconds)
     return result
-
-
-def member_name_index(members) -> dict[str, str]:
-    """Case-insensitive map of Discord username / global_name / display_name -> user id."""
-    index: dict[str, str] = {}
-    for member in members or ():
-        if isinstance(member, dict):
-            user = member.get("user") if isinstance(member.get("user"), dict) else {}
-            if user.get("bot"):
-                continue
-            member_id = user.get("id") or member.get("id")
-            candidates = (
-                user.get("username"),
-                user.get("global_name"),
-                member.get("nick"),
-                member.get("display_name"),
-            )
-        else:
-            if getattr(member, "bot", False):
-                continue
-            member_id = getattr(member, "id", None)
-            candidates = (
-                getattr(member, "name", None),
-                getattr(member, "global_name", None),
-                getattr(member, "display_name", None),
-                getattr(member, "nick", None),
-            )
-        if member_id is None or not is_discord_id(str(member_id)):
-            continue
-        uid = str(member_id)
-        for candidate in candidates:
-            if isinstance(candidate, str):
-                key = candidate.strip().casefold()
-                if key and key not in index:
-                    index[key] = uid
-    return index
-
-
-async def _collect_async_members(result) -> list:
-    if hasattr(result, "__aiter__"):
-        found = []
-        async for member in result:
-            found.append(member)
-        return found
-    if inspect.isawaitable(result):
-        resolved = await result
-        return list(resolved) if resolved is not None else []
-    return list(result) if result is not None else []
-
-
-def _run_guild_coro(coro, loop):
-    if loop is not None and loop.is_running():
-        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=15)
-    return asyncio.run(coro)
-
-
-def _fetch_all_guild_members(guild, loop) -> list | None:
-    fetcher = getattr(guild, "fetch_members", None)
-    if not callable(fetcher):
-        return None
-    try:
-        async def run():
-            return await _collect_async_members(fetcher(limit=None))
-
-        return _run_guild_coro(run(), loop)
-    except Exception as error:
-        logging.warning("guild.fetch_members failed; falling back to member search: %s", error)
-        return None
-
-
-def _search_guild_member_login(guild, login: str, loop, *, guild_id: str | None, token: str | None) -> list:
-    if guild is not None:
-        for method_name in ("search_members", "query_members"):
-            method = getattr(guild, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                async def run(fn=method):
-                    return await _collect_async_members(fn(query=login, limit=10))
-
-                return _run_guild_coro(run(), loop)
-            except TypeError:
-                try:
-                    async def run_pos(fn=method):
-                        return await _collect_async_members(fn(login))
-
-                    return _run_guild_coro(run_pos(), loop)
-                except Exception as error:
-                    logging.warning("guild.%s failed for %s: %s", method_name, login, error)
-            except Exception as error:
-                logging.warning("guild.%s failed for %s: %s", method_name, login, error)
-    if guild_id and is_discord_id(str(guild_id)) and token:
-        try:
-            return search_guild_members(str(guild_id), login, token, limit=10)
-        except Exception as error:
-            logging.warning("Discord REST member search failed for %s: %s", login, error)
-    return []
-
-
-def resolve_discord_ids_for_groups(
-    groups: list[dict],
-    store,
-    *,
-    guild=None,
-    loop=None,
-    guild_id: str | None = None,
-    discord_token: str | None = None,
-    members_intent_enabled: bool = False,
-) -> tuple[list[dict], int]:
-    """Map community groups to Discord user IDs and drop unmatched contributors.
-
-    Order:
-    1. Existing /link-github store.
-    2. Case-insensitive match against guild members' username, global_name, or
-       display_name (cached guild.members when populated with members intent,
-       otherwise falling back to guild.fetch_members or search_members/query_members/REST).
-    """
-    matched: list[dict] = []
-    unmatched: list[dict] = []
-    for group in groups:
-        discord_id = group.get("discord_id")
-        if not discord_id and store is not None and isinstance(group.get("user_id"), int):
-            link = store.link_for_github_user(group["user_id"])
-            if link and is_discord_id(link.get("discord_id")):
-                discord_id = str(link["discord_id"])
-        if discord_id and is_discord_id(str(discord_id)):
-            matched.append({**group, "discord_id": str(discord_id)})
-        else:
-            unmatched.append(group)
-
-    if not unmatched:
-        return matched, 0
-
-    cached_map = member_name_index(getattr(guild, "members", ())) if guild is not None else {}
-    still_unmatched: list[dict] = []
-    for group in unmatched:
-        key = group["login"].strip().casefold()
-        found_id = cached_map.get(key)
-        if found_id:
-            matched.append({**group, "discord_id": found_id})
-        else:
-            still_unmatched.append(group)
-
-    if not still_unmatched:
-        matched.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
-        return matched, 0
-
-    # When members intent is enabled and guild.members is already populated, the cache is complete.
-    if members_intent_enabled and cached_map:
-        matched.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
-        return matched, len(still_unmatched)
-
-    fetched_map: dict[str, str] | None = None
-    if guild is not None:
-        fetched = _fetch_all_guild_members(guild, loop)
-        if fetched is not None:
-            fetched_map = member_name_index(fetched)
-
-    skipped = 0
-    for group in still_unmatched:
-        login = group["login"]
-        key = login.strip().casefold()
-        if fetched_map is not None:
-            found_id = fetched_map.get(key)
-        else:
-            candidates = _search_guild_member_login(
-                guild,
-                login,
-                loop,
-                guild_id=guild_id,
-                token=discord_token,
-            )
-            found_id = member_name_index(candidates).get(key)
-        if found_id:
-            matched.append({**group, "discord_id": found_id})
-        else:
-            skipped += 1
-
-    matched.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
-    return matched, skipped
 
 
 def community_groups(
@@ -597,6 +417,9 @@ def build_weekly_report(
     max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
     max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
     limit: int = WEEKLY_CHUNK_LIMIT,
+    members=None,
+    jev_transport=None,
+    haiku_complete=None,
 ) -> WeeklyReport:
     moment = now or datetime.now(UTC)
     since = moment - timedelta(days=7)
@@ -611,14 +434,17 @@ def build_weekly_report(
         org_members=org_members,
         org=org,
     )
-    matched, skipped = resolve_discord_ids_for_groups(
+    matched, skipped, details = match_community_contributors(
         raw_groups,
+        config,
         store,
         guild=guild,
         loop=loop,
-        guild_id=config.discord_guild_id,
-        discord_token=config.discord_token,
-        members_intent_enabled=bool(getattr(config, "discord_members_intent", False)),
+        now=moment,
+        members=members,
+        github_getter=github_get_json,
+        jev_transport=jev_transport,
+        haiku_complete=haiku_complete,
     )
     logging.info(
         "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped",
@@ -642,6 +468,7 @@ def build_weekly_report(
         skipped_count=skipped,
         since=since,
         rate_limited=rate_limited,
+        match_details=tuple(details),
     )
 
 
