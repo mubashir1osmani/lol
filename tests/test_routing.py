@@ -1904,6 +1904,152 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
             self.assertEqual(resp, {"type": 5, "data": {"flags": 64}})
             thread_cls.assert_called_once()
 
+    def test_weekly_report_fast_path_deadline_fallback_progress_logs_and_no_loop_deadlock(self):
+        import asyncio
+        import tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from types import SimpleNamespace
+        from contributor_bot.matcher import (
+            DiscordMemberInfo,
+            GitHubAuthorProfile,
+            _MemberIndex,
+            _run_guild_coro,
+            score_author_against_members,
+        )
+        from contributor_bot.store import Store
+        from contributor_bot.weekly import build_weekly_report, post_weekly_if_due
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "tok", "123", "456",
+            discord_guild_id="333",
+            merged_weekly_enabled=True,
+            typesafe_api_key="ts-key",
+        )
+        guild = self._make_guild()
+        fri = datetime(2026, 11, 27, 19, 56, tzinfo=timezone.utc)
+
+        # 1) post_weekly_if_due uses pace=False everywhere (never sleeps 90s) and emits progress INFO logs.
+        pace_seen = []
+        fake_gh_inner = self._make_fake_github(include_match=True)
+
+        def recording_github(url, token=None, **kwargs):
+            pace_seen.append((url, kwargs.get("pace", False)))
+            return fake_gh_inner(url, token, **kwargs)
+
+        posted = []
+        send = lambda ch, _tok, msg: posted.append((ch, msg))
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=recording_github), \
+                self.assertLogs(level="INFO") as logs:
+            result = post_weekly_if_due(cfg, store, fri, post=send, guild=guild)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(all(pace is False for _url, pace in pace_seen), f"unexpected pace=True: {pace_seen}")
+        joined = "\n".join(logs.output)
+        self.assertIn("Weekly report: fetched", joined)
+        self.assertIn("Weekly report: loaded", joined)
+        self.assertIn("Weekly merge summary:", joined)
+        self.assertIn("Weekly report: built", joined)
+
+        # 2) Overall deadline expired falls back to deterministic matching + deterministic title cleanup (no LLM calls).
+        jev_called = []
+        haiku_called = []
+        title_llm_called = []
+
+        def fail_jev(_body):
+            jev_called.append(True)
+            raise AssertionError("Jev should not be called once deadline is reached")
+
+        def fail_haiku(_model, _messages):
+            haiku_called.append(True)
+            raise AssertionError("Haiku should not be called once deadline is reached")
+
+        def fail_summarizer(_model, _messages):
+            title_llm_called.append(True)
+            raise AssertionError("Title summarizer should not be called once deadline is reached")
+
+        # Include one fuzzy-only author ("alice-devx") so candidate disambiguation is exercised under deadline.
+        def fuzzy_github(url, _token=None, **_kwargs):
+            if "/public_members" in url:
+                return []
+            if "/search/issues" in url:
+                return {
+                    "items": [
+                        {
+                            "number": 901,
+                            "title": "feat: add anthropic prompt cache helper",
+                            "html_url": "https://github.com/BerriAI/litellm/pull/901",
+                            "user": {"login": "alice-dev", "type": "User", "id": 9001},
+                            "author_association": "FIRST_TIME_CONTRIBUTOR",
+                        },
+                        {
+                            "number": 902,
+                            "title": "fix: fuzzy author pr",
+                            "html_url": "https://github.com/BerriAI/litellm/pull/902",
+                            "user": {"login": "alice-devx", "type": "User", "id": 9002},
+                            "author_association": "CONTRIBUTOR",
+                        },
+                    ]
+                }
+            raise AssertionError(f"Unexpected enrichment call after deadline: {url}")
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fuzzy_github):
+            report = build_weekly_report(
+                cfg,
+                store,
+                fri,
+                guild=guild,
+                pace=False,
+                jev_transport=fail_jev,
+                haiku_complete=fail_haiku,
+                title_summarizer=fail_summarizer,
+                deadline_seconds=0.0,
+            )
+        self.assertEqual(report.matched_count, 1)  # exact login still matched deterministically
+        self.assertEqual(jev_called, [])
+        self.assertEqual(haiku_called, [])
+        self.assertEqual(title_llm_called, [])
+
+        # 3) _run_guild_coro must never self-deadlock when called from the gateway event loop thread itself.
+        async def check_no_self_deadlock():
+            loop = asyncio.get_running_loop()
+
+            async def noop():
+                return []
+
+            with self.assertRaises(RuntimeError):
+                _run_guild_coro(noop(), loop)
+
+        asyncio.run(check_no_self_deadlock())
+
+        # 4) Bigram-indexed fuzzy matching finds close candidates quickly across thousands of members.
+        big_members = [
+            DiscordMemberInfo(discord_id=str(100000000000000000 + i), username=f"member_{i}", display_name=f"User {i}")
+            for i in range(2000)
+        ]
+        big_members.append(DiscordMemberInfo(discord_id="999999999999999999", username="alex_rivera", display_name="Alex Rivera"))
+        idx = _MemberIndex(big_members)
+        strong, cands = score_author_against_members(
+            GitHubAuthorProfile(login="alexrivera99"),
+            big_members,
+            member_index=idx,
+        )
+        # Either exact base match or top fuzzy candidate must find alex_rivera.
+        found_ids = ([strong[0].discord_id] if strong else []) + [c.member.discord_id for c in cands]
+        self.assertIn("999999999999999999", found_ids)
+
+        # 5) Unexpected build failure in post_weekly_if_due logs an exception clearly.
+        store.clear_merged_week("BerriAI/litellm", "2026-W48")
+        with mock.patch("contributor_bot.weekly.build_weekly_report", side_effect=RuntimeError("boom")), \
+                self.assertLogs(level="ERROR") as err_logs:
+            with self.assertRaises(RuntimeError):
+                post_weekly_if_due(cfg, store, fri, post=send, guild=guild)
+        self.assertTrue(any("Weekly merge summary report build failed" in line for line in err_logs.output))
+
 
 class SampleRoutingTests(unittest.TestCase):
     def test_sample_table_uses_the_mock(self):

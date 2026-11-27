@@ -247,11 +247,17 @@ def _rate_limit_delay(error: HTTPError, details: str, *, now: float | None = Non
     return None
 
 
-def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
+def _http(
+    request: Request,
+    attempts: int = 2,
+    *,
+    timeout: float = 15.0,
+    max_retry_delay: float = 60.0,
+) -> tuple[int, Any, bytes]:
     _validate_request(request)
     for attempt in range(attempts):
         try:
-            with _open_request(request, timeout=15) as response:
+            with _open_request(request, timeout=timeout) as response:
                 body = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(body) > MAX_RESPONSE_BYTES:
                     raise RuntimeError("API response exceeds the size limit")
@@ -275,7 +281,7 @@ def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
             if error.code == 429 or github_rate_limited:
                 delay = _rate_limit_delay(error, details)
             if (
-                delay is not None and math.isfinite(delay) and 0 <= delay <= 60
+                delay is not None and math.isfinite(delay) and 0 <= delay <= max_retry_delay
                 and attempt + 1 < attempts
             ):
                 time.sleep(delay)
@@ -292,8 +298,19 @@ def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
     raise AssertionError("unreachable")
 
 
-def _request_json(request: Request) -> Any:
-    _status, _headers, body = _http(request)
+def _request_json(
+    request: Request,
+    *,
+    attempts: int = 2,
+    timeout: float = 15.0,
+    max_retry_delay: float = 60.0,
+) -> Any:
+    _status, _headers, body = _http(
+        request,
+        attempts=attempts,
+        timeout=timeout,
+        max_retry_delay=max_retry_delay,
+    )
     return json.loads(body) if body else None
 
 
@@ -420,8 +437,21 @@ def wait_for_github_budget(headers, *, now: float | None = None, sleep=time.slee
     sleep(delay)
 
 
-def github_get_json(url: str, token: str | None, *, pace: bool = False):
-    status, headers, body = _http(Request(url, headers=github_headers(token)))
+def github_get_json(
+    url: str,
+    token: str | None,
+    *,
+    pace: bool = False,
+    attempts: int = 2,
+    timeout: float = 15.0,
+    max_retry_delay: float = 60.0,
+):
+    status, headers, body = _http(
+        Request(url, headers=github_headers(token)),
+        attempts=attempts,
+        timeout=timeout,
+        max_retry_delay=max_retry_delay,
+    )
     if status != 200:
         raise RuntimeError(f"GitHub returned HTTP {status}")
     if pace:

@@ -117,13 +117,19 @@ def parse_review_json(text: str) -> dict:
     }
 
 
-def complete_litellm(model: str, messages: list[dict]) -> str:
+def complete_litellm(model: str, messages: list[dict], *, timeout: float = 60.0) -> str:
     """One ``litellm.completion`` call. Provider keys come from the process environment."""
     try:
         import litellm
     except ImportError as error:
         raise RuntimeError("litellm is not installed") from error
-    response = litellm.completion(model=model, messages=messages, temperature=0.2, max_tokens=700, timeout=60)
+    response = litellm.completion(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=700,
+        timeout=timeout,
+    )
     choices = getattr(response, "choices", None)
     if choices is None and isinstance(response, dict):
         choices = response.get("choices")

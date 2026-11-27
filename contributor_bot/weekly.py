@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from .api import GITHUB_API, TransientAPIError, fetch_guild_channels, github_get_json, post_message
+from .api import github_get_json as _real_github_get_json
 from .config import is_discord_id
 from .matcher import MatchDetail, MatchDiagnostics, match_community_contributors_with_diagnostics
 from .routing import FAST_MODEL
@@ -31,6 +32,7 @@ DEFAULT_WEEKLY_CHANNEL_NAME = "announcements"
 _POSTABLE_CHANNEL_TYPES = frozenset({0, 5})  # GUILD_TEXT, GUILD_ANNOUNCEMENT
 WEEKLY_LOOKBACK_MAX_DAYS = 14
 WEEKLY_ZERO_MATCH_RETRY_SECONDS = 900.0
+WEEKLY_BUILD_DEADLINE_SECONDS = 90.0
 
 COMMUNITY_AUTHOR_ASSOCIATIONS = frozenset({"CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"})
 EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
@@ -351,11 +353,17 @@ def _has_llm_credentials() -> bool:
     return any(os.environ.get(name, "").strip() for name in _LLM_API_KEY_ENVS)
 
 
-def summarize_pr_titles(config, groups: list[dict], *, summarizer=None) -> dict[int, str]:
+def summarize_pr_titles(
+    config,
+    groups: list[dict],
+    *,
+    summarizer=None,
+    deadline: float | None = None,
+) -> dict[int, str]:
     """Rewrite matched PR titles into short lowercase plain-English summaries (~8 words).
 
     Uses one batched fast-tier (Haiku) call when configured, falling back to
-    deterministic cleanup cleanly when offline or on any model error.
+    deterministic cleanup cleanly when offline, past deadline, or on any model error.
     """
     pulls_by_num: dict[int, str] = {}
     for group in groups:
@@ -370,6 +378,15 @@ def summarize_pr_titles(config, groups: list[dict], *, summarizer=None) -> dict[
 
     if summarizer is None and not _has_llm_credentials():
         return fallbacks
+
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 3.0:
+            logging.info("PR title summarization skipped (deadline reached); using deterministic cleanup")
+            return fallbacks
+        llm_timeout = min(20.0, max(3.0, remaining))
+    else:
+        llm_timeout = 20.0
 
     model = (
         getattr(config, "review_classifier_model", None)
@@ -394,7 +411,7 @@ def summarize_pr_titles(config, groups: list[dict], *, summarizer=None) -> dict[
             raw = summarizer(model, messages)
         else:
             from .review_llm import complete_litellm
-            raw = complete_litellm(model, messages)
+            raw = complete_litellm(model, messages, timeout=llm_timeout)
         start = raw.find("{")
         end = raw.rfind("}")
         parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}
@@ -621,6 +638,27 @@ def _is_rate_limit_error(error: Exception) -> bool:
     return "HTTP 403" in text or "HTTP 429" in text or "rate limit" in text.lower()
 
 
+def _github_get(
+    url: str,
+    token: str | None,
+    *,
+    pace: bool = False,
+    attempts: int = 2,
+    timeout: float = 15.0,
+    max_retry_delay: float = 5.0,
+):
+    if github_get_json is _real_github_get_json:
+        return github_get_json(
+            url,
+            token,
+            pace=pace,
+            attempts=attempts,
+            timeout=timeout,
+            max_retry_delay=max_retry_delay,
+        )
+    return github_get_json(url, token, pace=pace)
+
+
 def _search_merged_pages(
     repository: str,
     since: datetime,
@@ -628,6 +666,7 @@ def _search_merged_pages(
     *,
     pace: bool = False,
     max_pages: int = 5,
+    deadline: float | None = None,
 ) -> tuple[list[dict], bool]:
     cutoff = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     found = []
@@ -635,6 +674,13 @@ def _search_merged_pages(
     rate_limited = False
     page = 1
     while page <= max_pages:
+        if deadline is not None and found and time.monotonic() >= deadline:
+            logging.warning(
+                "Weekly report search deadline reached on page %d; returning %d rows",
+                page,
+                len(found),
+            )
+            break
         params = urlencode({
             "q": f"repo:{repository} is:pr is:merged merged:>={cutoff}",
             "sort": "updated",
@@ -643,10 +689,13 @@ def _search_merged_pages(
             "page": page,
         })
         try:
-            payload = github_get_json(
+            payload = _github_get(
                 f"{GITHUB_API}/search/issues?{params}",
                 token,
                 pace=pace,
+                attempts=2,
+                timeout=15.0,
+                max_retry_delay=5.0,
             )
         except Exception as error:
             if _is_rate_limit_error(error):
@@ -702,6 +751,8 @@ def _mark_first_time_contributors(
     matched: list[dict],
     repository: str,
     token: str | None,
+    *,
+    deadline: float | None = None,
 ) -> list[dict]:
     """Detect first-time contributors whose author_association flipped to CONTRIBUTOR after merge.
 
@@ -717,6 +768,11 @@ def _mark_first_time_contributors(
         if group.get("first_time") or rate_limited:
             updated.append(group)
             continue
+        if deadline is not None and time.monotonic() >= deadline:
+            logging.info("First-time contributor badge check stopped at deadline; keeping remaining groups as-is")
+            rate_limited = True
+            updated.append(group)
+            continue
         login = group.get("login") or ""
         if not login or not re.fullmatch(r"[A-Za-z0-9-]+", login):
             updated.append(group)
@@ -727,10 +783,14 @@ def _mark_first_time_contributors(
                 "q": f"repo:{repository} is:pr is:merged author:{login}",
                 "per_page": 1,
             })
-            payload = github_get_json(
+            req_timeout = min(8.0, max(2.0, deadline - time.monotonic())) if deadline is not None else 8.0
+            payload = _github_get(
                 f"{GITHUB_API}/search/issues?{params}",
                 token,
                 pace=False,
+                attempts=1,
+                timeout=req_timeout,
+                max_retry_delay=0.0,
             )
             total = payload.get("total_count") if isinstance(payload, dict) else None
             if isinstance(total, int) and total > 0 and total <= len(group.get("pulls", ())):
@@ -760,13 +820,23 @@ def build_weekly_report(
     title_summarizer=None,
     rest_fetcher=None,
     rest_searcher=None,
+    deadline_seconds: float | None = WEEKLY_BUILD_DEADLINE_SECONDS,
 ) -> WeeklyReport:
+    t_start = time.monotonic()
+    deadline = (t_start + deadline_seconds) if deadline_seconds is not None else None
     moment = now or datetime.now(UTC)
     window_since = since if since is not None else weekly_lookback_since(store, config.github_repository, moment)
     token = config.github_token or getattr(config, "github_actor_token", None)
     org = config.github_repository.split("/", 1)[0] if "/" in config.github_repository else ""
     org_members = fetch_org_public_members(org, token) if org else frozenset()
-    rows, rate_limited = _search_merged_pages(config.github_repository, window_since, token, pace=pace)
+    t_fetch = time.monotonic()
+    rows, rate_limited = _search_merged_pages(
+        config.github_repository,
+        window_since,
+        token,
+        pace=pace,
+        deadline=(deadline - 45.0) if deadline is not None else None,
+    )
     raw_groups = community_groups(
         rows,
         config.maintainer_logins,
@@ -774,6 +844,14 @@ def build_weekly_report(
         org_members=org_members,
         org=org,
     )
+    logging.info(
+        "Weekly report: fetched %d merged PRs across %d community authors in %.2fs (rate_limited=%s)",
+        len(rows),
+        len(raw_groups),
+        time.monotonic() - t_fetch,
+        rate_limited,
+    )
+    t_match = time.monotonic()
     matched, skipped, details, diagnostics = match_community_contributors_with_diagnostics(
         raw_groups,
         config,
@@ -787,17 +865,32 @@ def build_weekly_report(
         haiku_complete=haiku_complete,
         rest_fetcher=rest_fetcher,
         rest_searcher=rest_searcher,
+        deadline=deadline,
     )
     if matched and not rate_limited:
-        matched = _mark_first_time_contributors(matched, config.github_repository, token)
+        matched = _mark_first_time_contributors(
+            matched,
+            config.github_repository,
+            token,
+            deadline=(deadline - 10.0) if deadline is not None else None,
+        )
     logging.info(
-        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped (members=%d source=%s)",
+        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped "
+        "(matched=%d/%d, elapsed=%.2fs, members=%d, source=%s, llm=%s)",
         len(matched),
         skipped,
+        len(matched),
+        len(raw_groups),
+        time.monotonic() - t_match,
         diagnostics.member_count,
         diagnostics.members_source,
+        diagnostics.llm_source,
     )
-    summaries = summarize_pr_titles(config, matched, summarizer=title_summarizer) if matched else {}
+    summaries = (
+        summarize_pr_titles(config, matched, summarizer=title_summarizer, deadline=deadline)
+        if matched
+        else {}
+    )
     issues_url = good_first_issue_url(config.github_repository, token) if matched else ""
     note = ""
     if rate_limited:
@@ -810,6 +903,12 @@ def build_weekly_report(
         note=note,
         summaries=summaries,
         issues_url=issues_url,
+    )
+    logging.info(
+        "Weekly report: built %d chunks (%d contributors) in %.2fs total",
+        len(chunks),
+        len(matched),
+        time.monotonic() - t_start,
     )
     return WeeklyReport(
         chunks=chunks,
@@ -1044,7 +1143,8 @@ def post_weekly_if_due(
                 moment,
                 guild=guild,
                 loop=loop,
-                pace=True,
+                pace=False,
+                deadline_seconds=WEEKLY_BUILD_DEADLINE_SECONDS,
             )
         except WeeklyFetchError as error:
             if error.rate_limited:
@@ -1060,6 +1160,10 @@ def post_weekly_if_due(
                     error,
                 )
                 return None
+            logging.exception("Weekly merge summary GitHub fetch failed for %s", key)
+            raise
+        except Exception:
+            logging.exception("Weekly merge summary report build failed for %s", key)
             raise
 
         if report.matched_count == 0:
@@ -1081,17 +1185,21 @@ def post_weekly_if_due(
 
         sender = post or post_message
         recorded = False
-        for chunk in report.chunks:
-            users = chunk_mention_user_ids(chunk)
-            sender(channel, config.discord_token, {
-                "content": chunk,
-                "flags": SUPPRESS_EMBEDS_FLAG,
-                "allowed_mentions": {"parse": [], "users": users},
-            })
-            if not recorded:
-                recorded = True
-                if not store.mark_merged_week(repo, key, iso(moment)):
-                    logging.info("Weekly merge summary for %s was already recorded in SQLite", key)
+        try:
+            for chunk in report.chunks:
+                users = chunk_mention_user_ids(chunk)
+                sender(channel, config.discord_token, {
+                    "content": chunk,
+                    "flags": SUPPRESS_EMBEDS_FLAG,
+                    "allowed_mentions": {"parse": [], "users": users},
+                })
+                if not recorded:
+                    recorded = True
+                    if not store.mark_merged_week(repo, key, iso(moment)):
+                        logging.info("Weekly merge summary for %s was already recorded in SQLite", key)
+        except Exception:
+            logging.exception("Weekly merge summary failed while posting to channel %s for %s", channel, key)
+            raise
         logging.info(
             "Posted weekly merge summary for %s to channel %s (%d contributors, %d chunks)",
             key,
