@@ -162,11 +162,7 @@ def _merged_preview(
     guild=None,
     loop=None,
 ) -> dict:
-    """Defer immediately, then send the weekly summary.
-
-    Marks ``merged_weeks`` only when run in the weekly destination channel
-    on the scheduled weekday at or after the scheduled time.
-    """
+    """Defer immediately, then send an ephemeral preview without marking the week posted."""
     if not isinstance(interaction_token, str) or not interaction_token:
         return _ephemeral("couldn't open that reply. try /merged-this-week again.")
     app_id = application_id or (config.discord_application_id or "")
@@ -180,33 +176,6 @@ def _merged_preview(
     return {"type": 5, "data": {"flags": _EPHEMERAL}}
 
 
-def _should_mark_manual_weekly_post(
-    config: Config,
-    channel_id: str,
-    moment: datetime,
-    *,
-    guild=None,
-) -> bool:
-    """True when /merged-this-week ran in the weekly destination channel on/after the scheduled Friday slot."""
-    from .weekly import resolve_weekly_channel_id, weekly_is_due
-
-    cleaned_channel = (channel_id or "").strip()
-    if not cleaned_channel:
-        return False
-    destination = (config.announcements_channel_id or "").strip()
-    if not destination:
-        destination = resolve_weekly_channel_id(config, guild=guild) or ""
-    if cleaned_channel != destination:
-        return False
-    return weekly_is_due(
-        moment,
-        config.merged_weekday,
-        config.merged_time,
-        config.merged_timezone,
-        None,
-    )
-
-
 def _finish_merged_preview(
     config: Config,
     store: Store,
@@ -218,14 +187,11 @@ def _finish_merged_preview(
     loop=None,
     now: datetime | None = None,
 ) -> None:
-    from zoneinfo import ZoneInfo
-    from .weekly import WeeklyFetchError, build_weekly_report, chunk_mention_user_ids, week_key
+    from .weekly import WeeklyFetchError, build_weekly_report, chunk_mention_user_ids
 
     moment = now or datetime.now(UTC)
-    matched_count = 0
     try:
         report = build_weekly_report(config, store, moment, guild=guild, loop=loop, pace=False)
-        matched_count = report.matched_count
         chunks = list(report.chunks)
         if report.matched_count == 0 and report.diagnostics is not None and chunks:
             diag_line = report.diagnostics.summary_line()
@@ -259,19 +225,6 @@ def _finish_merged_preview(
                 "flags": _EPHEMERAL | _SUPPRESS_EMBEDS,
                 "allowed_mentions": {"parse": [], "users": chunk_mention_user_ids(chunk)},
             })
-        if (
-            matched_count > 0
-            and store is not None
-            and _should_mark_manual_weekly_post(config, channel_id, moment, guild=guild)
-        ):
-            local = moment.astimezone(ZoneInfo(config.merged_timezone))
-            key = week_key(local)
-            if store.mark_merged_week(config.github_repository, key, iso(moment)):
-                logging.info(
-                    "Marked weekly merge summary %s as posted via /merged-this-week in destination channel %s",
-                    key,
-                    channel_id,
-                )
     except Exception:
         logging.exception("Could not send the /merged-this-week follow-up")
 

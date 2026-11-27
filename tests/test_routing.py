@@ -2050,7 +2050,8 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
                 post_weekly_if_due(cfg, store, fri, post=send, guild=guild)
         self.assertTrue(any("Weekly merge summary report build failed" in line for line in err_logs.output))
 
-    def test_manual_merged_in_announcements_on_friday_marks_week_other_runs_do_not(self):
+    def test_ephemeral_merged_preview_never_marks_week_and_boot_clears_bogus_w48_preview_mark(self):
+        import sqlite3
         import tempfile
         from datetime import datetime, timezone
         from pathlib import Path
@@ -2060,8 +2061,30 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
 
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
-        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        db_path = str(Path(temp_dir.name) / "roles.db")
+
+        # 1) Simulate existing production SQLite DB (before `via` column) containing the bogus
+        # ephemeral-preview row for 2026-W48 at 2026-11-27T20:34:06+00:00.
+        raw_conn = sqlite3.connect(db_path)
+        raw_conn.execute(
+            "CREATE TABLE merged_weeks ("
+            "repository TEXT NOT NULL, week_key TEXT NOT NULL, posted_at TEXT NOT NULL, "
+            "PRIMARY KEY (repository, week_key))"
+        )
+        raw_conn.execute(
+            "INSERT INTO merged_weeks (repository, week_key, posted_at) VALUES (?, ?, ?)",
+            ("BerriAI/litellm", "2026-W48", "2026-11-27T20:34:06+00:00"),
+        )
+        raw_conn.commit()
+        raw_conn.close()
+
+        # Opening Store migrates `via` and clears the bogus 2026-W48 preview row once.
+        with self.assertLogs(level="INFO") as boot_logs:
+            store = Store(db_path)
         self.addCleanup(store.close)
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+        self.assertTrue(any("Cleared bogus ephemeral-preview merged_weeks entry" in l for l in boot_logs.output))
+
         cfg = Config(
             "tok", "123", "456",
             discord_guild_id="333",
@@ -2073,47 +2096,48 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
         )
         guild = self._make_guild()
         fake_gh = self._make_fake_github(include_match=True)
-        fri_after = datetime(2026, 11, 27, 19, 30, tzinfo=timezone.utc)   # Fri 2:30 PM Toronto
-        fri_before = datetime(2026, 11, 27, 14, 55, tzinfo=timezone.utc)  # Fri 9:55 AM Toronto
-        thu_evening = datetime(2026, 11, 27, 1, 0, tzinfo=timezone.utc)   # Thu 8:00 PM Toronto
+        fri_after = datetime(2026, 11, 27, 20, 36, tzinfo=timezone.utc)  # Fri 3:36 PM Toronto
 
+        # 2) Running ephemeral /merged-this-week preview in #announcements on Friday >= 10:00
+        # must NEVER mark merged_weeks (nothing was posted publicly).
         with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction"), \
                 mock.patch("contributor_bot.interactions.post_interaction_followup"):
-            # 1) Non-destination channel on Friday afternoon -> does NOT mark merged_weeks.
-            _finish_merged_preview(cfg, store, "tok", "444", channel_id="123", guild=guild, now=fri_after)
-            self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
-
-            # 2) Destination channel on Thursday evening or Friday before 10:00 -> does NOT mark merged_weeks.
-            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=thu_evening)
-            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=fri_before)
-            self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
-
-        # 3) Destination channel on Friday afternoon with 0 matches -> does NOT mark merged_weeks.
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=self._make_fake_github(include_match=False)), \
-                mock.patch("contributor_bot.interactions.edit_original_interaction"), \
-                mock.patch("contributor_bot.interactions.post_interaction_followup"):
             _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=fri_after)
-            self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
 
-        # 4) Destination channel (#announcements = "456") on Friday >= 10:00 with matches -> marks 2026-W48!
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh), \
-                mock.patch("contributor_bot.interactions.edit_original_interaction"), \
-                mock.patch("contributor_bot.interactions.post_interaction_followup"), \
-                self.assertLogs(level="INFO") as logs:
-            _finish_merged_preview(cfg, store, "tok", "444", channel_id="456", guild=guild, now=fri_after)
-        self.assertTrue(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
-        self.assertTrue(any("Marked weekly merge summary 2026-W48 as posted via /merged-this-week" in l for l in logs.output))
-
-        # Scheduled post afterwards must NOT duplicate it!
+        # 3) Scheduler catch-up posts publicly to #announcements and marks 2026-W48 via='scheduler'.
         posted = []
         with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
             res = post_weekly_if_due(
-                cfg, store, datetime(2026, 11, 27, 19, 35, tzinfo=timezone.utc),
-                post=lambda ch, _t, m: posted.append((ch, m)), guild=guild,
+                cfg,
+                store,
+                fri_after,
+                post=lambda ch, _t, m: posted.append((ch, m)),
+                guild=guild,
             )
-        self.assertIsNone(res)
-        self.assertEqual(posted, [])
+        self.assertIsNotNone(res)
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0][0], "456")
+        info = store.merged_week_info("BerriAI/litellm", "2026-W48")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["via"], "scheduler")
+        self.assertEqual(info["posted_at"], "2026-11-27T20:36:00+00:00")
+
+        # 4) Reopening Store on a subsequent restart preserves the real scheduler mark and never double-posts.
+        restarted = Store(db_path)
+        self.addCleanup(restarted.close)
+        self.assertTrue(restarted.merged_week_posted("BerriAI/litellm", "2026-W48"))
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
+            again = post_weekly_if_due(
+                cfg,
+                restarted,
+                datetime(2026, 11, 27, 20, 40, tzinfo=timezone.utc),
+                post=lambda ch, _t, m: posted.append((ch, m)),
+                guild=guild,
+            )
+        self.assertIsNone(again)
+        self.assertEqual(len(posted), 1)
 
 
 class SampleRoutingTests(unittest.TestCase):
