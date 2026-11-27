@@ -171,11 +171,28 @@ class RoleConfigTests(unittest.TestCase):
     def test_enabled_roles_require_their_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             env = roles_env(directory)
-            for key in ("GITHUB_WEBHOOK_SECRET", "ROLE_PROVIDER_WIZARD_ID", "DISCORD_PUBLIC_KEY", "GITHUB_OAUTH_REDIRECT_URI"):
+            for key in ("DISCORD_GUILD_ID", "ROLE_PROVIDER_WIZARD_ID", "GITHUB_OAUTH_REDIRECT_URI"):
                 with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                     broken = dict(env)
                     broken.pop(key)
                     get_config(broken)
+            # Without any OAuth, webhook secret, public key, or application id,
+            # contributor roles still validate cleanly for auto-matched polling.
+            minimal = dict(env)
+            for optional_key in (
+                "DISCORD_APPLICATION_ID",
+                "DISCORD_PUBLIC_KEY",
+                "GITHUB_WEBHOOK_SECRET",
+                "GITHUB_OAUTH_CLIENT_ID",
+                "GITHUB_OAUTH_CLIENT_SECRET",
+                "GITHUB_OAUTH_REDIRECT_URI",
+            ):
+                minimal.pop(optional_key, None)
+            minimal_cfg = get_config(minimal)
+            self.assertTrue(minimal_cfg.contributor_roles_enabled)
+            self.assertFalse(minimal_cfg.github_oauth_enabled)
+            self.assertEqual(minimal_cfg.roles_poll_seconds, 600)
+            self.assertFalse(minimal_cfg.roles_backfill_on_boot)
             with self.assertRaisesRegex(ValueError, "distinct"):
                 get_config(env | {"ROLE_PROVIDER_WIZARD_ID": "1001"})
             with self.assertRaisesRegex(ValueError, "DISCORD_INVITE_URL"):

@@ -127,6 +127,16 @@ class Config:
     pr_board_number: int | None = None
     pr_board_sync_seconds: int = 600
     pr_board_status_field: str = "Status"
+    roles_poll_seconds: int = 600
+    roles_backfill_on_boot: bool = False
+
+    @property
+    def github_oauth_enabled(self) -> bool:
+        return bool(
+            self.github_oauth_client_id
+            and self.github_oauth_client_secret
+            and self.github_oauth_redirect_uri
+        )
 
     @property
     def pr_board_enabled(self) -> bool:
@@ -194,12 +204,25 @@ def get_config(env: dict[str, str] | None = None) -> Config:
     bind_host, bind_port = _http_bind(values)
     role_settings = _role_settings(values) if roles_enabled else None
     review_settings = _review_settings(values) if review_enabled else None
-    shared = role_settings or review_settings
-    webhook_secret = None
-    if role_settings is not None:
-        webhook_secret = role_settings["github_webhook_secret"]
-    elif review_settings is not None:
-        webhook_secret = review_settings.get("github_webhook_secret")
+    discord_guild_id = (
+        (role_settings or {}).get("discord_guild_id")
+        or (review_settings or {}).get("discord_guild_id")
+        or _optional_discord_id(values, "DISCORD_GUILD_ID")
+    )
+    discord_application_id = (
+        (review_settings or {}).get("discord_application_id")
+        or (role_settings or {}).get("discord_application_id")
+        or _optional_discord_id(values, "DISCORD_APPLICATION_ID")
+    )
+    discord_public_key = (
+        (review_settings or {}).get("discord_public_key")
+        or (role_settings or {}).get("discord_public_key")
+        or (values.get("DISCORD_PUBLIC_KEY", "").strip() or None)
+    )
+    webhook_secret = (
+        (review_settings or {}).get("github_webhook_secret")
+        or (role_settings or {}).get("github_webhook_secret")
+    )
 
     actor_token = values.get("GITHUB_ACTOR_TOKEN", "").strip() or None
     github_token = values.get("GITHUB_TOKEN", "").strip() or actor_token
@@ -221,9 +244,9 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         roundup_timezone=timezone,
         roundup_time=roundup_time,
         contributor_roles_enabled=roles_enabled,
-        discord_guild_id=_optional_discord_id(values, "DISCORD_GUILD_ID") if shared is None else shared["discord_guild_id"],
-        discord_application_id=_optional_discord_id(values, "DISCORD_APPLICATION_ID") if shared is None else shared["discord_application_id"],
-        discord_public_key=(values.get("DISCORD_PUBLIC_KEY", "").strip() or None) if shared is None else shared["discord_public_key"],
+        discord_guild_id=discord_guild_id,
+        discord_application_id=discord_application_id,
+        discord_public_key=discord_public_key,
         github_oauth_client_id=None if role_settings is None else role_settings["github_oauth_client_id"],
         github_oauth_client_secret=None if role_settings is None else role_settings["github_oauth_client_secret"],
         github_webhook_secret=webhook_secret,
@@ -281,6 +304,8 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         pr_board_number=board_number,
         pr_board_sync_seconds=_bounded_int(values, "PR_BOARD_SYNC_SECONDS", 600, 60, 86400),
         pr_board_status_field=board_status_field,
+        roles_poll_seconds=600 if role_settings is None else role_settings["roles_poll_seconds"],
+        roles_backfill_on_boot=False if role_settings is None else role_settings["roles_backfill_on_boot"],
     )
 
 
@@ -547,7 +572,36 @@ def _review_settings(values: dict[str, str]) -> dict:
 
 
 def _role_settings(values: dict[str, str]) -> dict:
-    app = _discord_application(values)
+    guild_id = values.get("DISCORD_GUILD_ID", "").strip()
+    if not is_discord_id(guild_id):
+        raise ValueError("DISCORD_GUILD_ID must be a Discord guild ID")
+    application_id = _optional_discord_id(values, "DISCORD_APPLICATION_ID")
+    raw_public_key = values.get("DISCORD_PUBLIC_KEY", "").strip().lower()
+    if raw_public_key and not re.fullmatch(r"[0-9a-f]{64}", raw_public_key):
+        raise ValueError("DISCORD_PUBLIC_KEY must be a 64-character hex Ed25519 public key")
+    public_key = raw_public_key or None
+
+    raw_oauth = (
+        values.get("GITHUB_OAUTH_CLIENT_ID", "").strip(),
+        values.get("GITHUB_OAUTH_CLIENT_SECRET", "").strip(),
+        values.get("GITHUB_OAUTH_REDIRECT_URI", "").strip(),
+    )
+    if any(raw_oauth):
+        oauth_client_id = _secret("GITHUB_OAUTH_CLIENT_ID", values, minimum=8)
+        oauth_client_secret = _secret("GITHUB_OAUTH_CLIENT_SECRET", values, minimum=8)
+        oauth_redirect_uri = _https_url(
+            "GITHUB_OAUTH_REDIRECT_URI",
+            raw_oauth[2],
+            localhost_http=True,
+        )
+    else:
+        oauth_client_id = None
+        oauth_client_secret = None
+        oauth_redirect_uri = None
+
+    raw_webhook = values.get("GITHUB_WEBHOOK_SECRET", "").strip()
+    webhook_secret = _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8) if raw_webhook else None
+
     host, port = _http_bind(values)
     channel = values.get("ROLE_ANNOUNCEMENTS_CHANNEL_ID", "").strip()
     if channel and not is_discord_id(channel):
@@ -578,15 +632,13 @@ def _role_settings(values: dict[str, str]) -> dict:
     if db_path == ":memory:" or "\x00" in db_path:
         raise ValueError("ROLES_DB_PATH must be a file path")
     return {
-        **app,
-        "github_oauth_client_id": _secret("GITHUB_OAUTH_CLIENT_ID", values, minimum=8),
-        "github_oauth_client_secret": _secret("GITHUB_OAUTH_CLIENT_SECRET", values, minimum=8),
-        "github_webhook_secret": _secret("GITHUB_WEBHOOK_SECRET", values, minimum=8),
-        "github_oauth_redirect_uri": _https_url(
-            "GITHUB_OAUTH_REDIRECT_URI",
-            values.get("GITHUB_OAUTH_REDIRECT_URI", "").strip(),
-            localhost_http=True,
-        ),
+        "discord_guild_id": guild_id,
+        "discord_application_id": application_id,
+        "discord_public_key": public_key,
+        "github_oauth_client_id": oauth_client_id,
+        "github_oauth_client_secret": oauth_client_secret,
+        "github_webhook_secret": webhook_secret,
+        "github_oauth_redirect_uri": oauth_redirect_uri,
         "role_announcements_channel_id": channel or None,
         "discord_invite_url": invite_url or None,
         "pr_comment_invites_enabled": invites,
@@ -599,4 +651,6 @@ def _role_settings(values: dict[str, str]) -> dict:
             "BACKFILL_SINCE",
             values.get("BACKFILL_SINCE", "").strip() or "2023-01-01T00:00:00+00:00",
         ),
+        "roles_poll_seconds": _bounded_int(values, "ROLES_POLL_SECONDS", 600, 60, 86400),
+        "roles_backfill_on_boot": _flag(values, "ROLES_BACKFILL_ON_BOOT", False),
     }

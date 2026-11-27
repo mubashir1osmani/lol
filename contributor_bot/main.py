@@ -21,11 +21,12 @@ from .interactions import (
     MERGED_SLASH_COMMANDS,
     PR_BOARD_SLASH_COMMANDS,
     REVIEW_SLASH_COMMANDS,
-    SLASH_COMMANDS,
+    role_slash_commands,
 )
 from .poller import poll_once, preview_roundup
 from .pr_board import sync_pr_board
 from .review_job import poll_review_channels
+from .roles_sync import poll_merged_prs_for_roles, run_roles_backfill, should_run_boot_backfill
 from .store import Store
 from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
@@ -156,13 +157,15 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.once:
         poll_once(config)
-        if config.pr_review_enabled or config.pr_board_enabled:
+        if config.pr_review_enabled or config.pr_board_enabled or config.contributor_roles_enabled:
             store = Store(config.roles_db_path)
             try:
                 if config.pr_review_enabled:
                     poll_review_channels(config, store)
                 if config.pr_board_enabled:
                     sync_pr_board(config, store)
+                if config.contributor_roles_enabled:
+                    poll_merged_prs_for_roles(config, store)
             finally:
                 store.close()
         return
@@ -186,8 +189,8 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def run_backfill(config) -> None:
-    if not config.github_token:
-        raise SystemExit("GITHUB_TOKEN is required for --backfill-merged-prs")
+    if not config.effective_github_token:
+        raise SystemExit("GITHUB_TOKEN or GITHUB_ACTOR_TOKEN is required for --backfill-merged-prs")
     backfill_merged_pulls(config)
 
 
@@ -220,7 +223,7 @@ def start_contributor_roles(config):
         logging.error("Contributor HTTP server failed to start: %s", error)
     commands = []
     if config.contributor_roles_enabled:
-        commands.extend(SLASH_COMMANDS)
+        commands.extend(role_slash_commands(config))
     if config.pr_review_enabled:
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
@@ -247,11 +250,11 @@ def start_contributor_roles(config):
                 "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
                 "that the bot invite includes applications.commands, and that the bot is in the server."
             )
-    elif features and commands and not (config.discord_application_id and config.discord_guild_id):
+    elif features and commands and not (config.discord_application_id and config.discord_guild_id) and not _gateway_available():
         logging.warning(
             "Skipping REST slash-command registration: DISCORD_APPLICATION_ID or DISCORD_GUILD_ID is unset"
         )
-    if features and not ed25519_public_key_ok(config.discord_public_key or ""):
+    if features and config.discord_public_key and not ed25519_public_key_ok(config.discord_public_key):
         logging.error(
             "DISCORD_PUBLIC_KEY is not a valid Ed25519 point. "
             "Discord interactions will be rejected until it is corrected."
@@ -273,6 +276,7 @@ def start_contributor_roles(config):
 def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
     reviews = bool(config.pr_review_enabled and store is not None)
     weekly_watchdog = bool(config.merged_weekly_enabled and store is not None)
+    roles_poll = bool(config.contributor_roles_enabled and store is not None)
     pr_board_sync = False
     if not config.pr_board_enabled:
         logging.info(
@@ -296,6 +300,21 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             config.github_repository,
             config.pr_board_sync_seconds,
         )
+    if config.contributor_roles_enabled:
+        if store is None:
+            logging.error(
+                "Contributor roles are enabled but the HTTP server/store did not start, "
+                "so automatic role polling will not run"
+            )
+        else:
+            logging.info(
+                "Contributor roles poller active for %s (every %ds, oauth=%s, webhook=%s, backfill_on_boot=%s).",
+                config.github_repository,
+                config.roles_poll_seconds,
+                config.github_oauth_enabled,
+                bool(config.github_webhook_secret),
+                config.roles_backfill_on_boot,
+            )
     if config.merged_weekly_enabled:
         logging.info("Weekly contributor summary: %s", weekly_schedule_status(config, store))
     if config.announcements_enabled:
@@ -304,7 +323,7 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             "weekly posts run only via the Friday %s %s summary scheduler.",
             config.merged_time, config.merged_timezone,
         )
-    if not reviews and not weekly_watchdog and not pr_board_sync:
+    if not reviews and not weekly_watchdog and not pr_board_sync and not roles_poll:
         if not config.announcements_enabled:
             logging.info("Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false).")
         stop_event.wait()
@@ -313,8 +332,15 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
         logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
     first_tick = True
     next_board_sync = 0.0
+    next_roles_poll = 0.0
+    boot_backfill_started = False
     while not stop_event.is_set():
         gateway_live = gateway is not None and gateway.connected.is_set()
+        guild, loop = (
+            gateway.current_guild_and_loop(config)
+            if gateway is not None and hasattr(gateway, "current_guild_and_loop")
+            else (None, None)
+        )
         if reviews and not gateway_live:
             try:
                 poll_review_channels(config, store)
@@ -324,15 +350,26 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
         # cached guild member list; thereafter run a 60s watchdog regardless so
         # a dead gateway or stopped tasks.loop can never silence the Friday post.
         if weekly_watchdog and not (first_tick and gateway is not None and not gateway_live):
-            guild, loop = (
-                gateway.current_guild_and_loop(config)
-                if gateway is not None and hasattr(gateway, "current_guild_and_loop")
-                else (None, None)
-            )
             try:
                 post_weekly_if_due(config, store, guild=guild, loop=loop)
             except Exception:
                 logging.exception("Weekly merge summary watchdog check failed")
+        if roles_poll and not (first_tick and gateway is not None and not gateway_live):
+            if not boot_backfill_started and should_run_boot_backfill(config, store):
+                boot_backfill_started = True
+                logging.info("Starting one-time contributor roles backfill on boot (ROLES_BACKFILL_ON_BOOT=true)")
+                threading.Thread(
+                    target=_run_boot_backfill,
+                    args=(config, store, guild, loop),
+                    name="roles-boot-backfill",
+                    daemon=True,
+                ).start()
+            if time.monotonic() >= next_roles_poll:
+                next_roles_poll = time.monotonic() + float(config.roles_poll_seconds)
+                try:
+                    poll_merged_prs_for_roles(config, store, guild=guild, loop=loop)
+                except Exception:
+                    logging.exception("Contributor roles poll failed")
         if pr_board_sync and time.monotonic() >= next_board_sync:
             next_board_sync = time.monotonic() + float(config.pr_board_sync_seconds)
             try:
@@ -342,7 +379,16 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
         delay = float(config.poll_interval_seconds)
         if weekly_watchdog:
             delay = min(delay, 60.0)
+        if roles_poll:
+            delay = min(delay, max(1.0, next_roles_poll - time.monotonic()))
         if pr_board_sync:
             delay = min(delay, max(1.0, next_board_sync - time.monotonic()))
         first_tick = False
         stop_event.wait(delay)
+
+
+def _run_boot_backfill(config, store, guild=None, loop=None) -> None:
+    try:
+        run_roles_backfill(config, store, guild=guild, loop=loop)
+    except Exception:
+        logging.exception("Boot contributor roles backfill failed")

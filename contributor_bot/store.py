@@ -147,6 +147,12 @@ CREATE TABLE IF NOT EXISTS pr_board_meta (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS roles_poller_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -365,6 +371,53 @@ class Store:
                 (repository, github_user_id),
             ).fetchall()
         return [_pull_dict(row) for row in rows]
+
+    def pulls_for_author_login(self, repository: str, github_login: str) -> list[dict]:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM merged_pull_requests
+                WHERE repository = ? AND lower(github_login) = ?
+                ORDER BY merged_at, number
+                """,
+                (repository, key),
+            ).fetchall()
+        return [_pull_dict(row) for row in rows]
+
+    def all_pull_authors(self, repository: str) -> list[dict]:
+        """Return distinct PR authors stored for ``repository``, with latest login and PR count."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    github_user_id,
+                    (
+                        SELECT p2.github_login
+                        FROM merged_pull_requests p2
+                        WHERE p2.repository = p1.repository
+                          AND p2.github_user_id = p1.github_user_id
+                        ORDER BY p2.merged_at DESC, p2.number DESC
+                        LIMIT 1
+                    ) AS github_login,
+                    COUNT(*) AS pull_count
+                FROM merged_pull_requests p1
+                WHERE repository = ?
+                GROUP BY github_user_id
+                ORDER BY github_user_id
+                """,
+                (repository,),
+            ).fetchall()
+        return [
+            {
+                "github_user_id": int(row["github_user_id"]),
+                "github_login": str(row["github_login"]),
+                "pull_count": int(row["pull_count"]),
+            }
+            for row in rows
+        ]
 
     def pull_count(self, repository: str | None = None) -> int:
         with self._lock:
@@ -742,6 +795,22 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def confirmed_match_for_discord(self, discord_id: str) -> dict | None:
+        if not is_discord_id(discord_id):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                FROM github_discord_matches
+                WHERE discord_id = ?
+                ORDER BY matched_at DESC
+                LIMIT 1
+                """,
+                (discord_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_cached_github_user(self, github_login: str) -> dict | None:
         key = (github_login or "").strip().lower()
         if not key:
@@ -878,6 +947,28 @@ class Store:
             self._conn.execute(
                 """
                 INSERT INTO pr_board_meta (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, updated_at),
+            )
+            self._conn.commit()
+
+    def get_roles_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM roles_poller_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_roles_meta(self, key: str, value: str, updated_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO roles_poller_meta (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                     value = excluded.value,

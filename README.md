@@ -149,11 +149,10 @@ file; previews use their own cache and can run alongside the worker.
 ## Contributor roles
 
 The same process can grant Discord roles for merged pull requests on
-`BerriAI/litellm`. It stays off until `CONTRIBUTOR_ROLES_ENABLED=true`, so an
-existing weekly-roundup worker keeps its current behavior. Role state lives in
-SQLite (`ROLES_DB_PATH`, default `.data/contributor_roles.db` on the persistent
-disk), separate from the weekly JSON ledger. The SQL is isolated in
-`contributor_bot/store.py` if you later move it to Postgres.
+`BerriAI/litellm` **without requiring a GitHub OAuth app, account linking, or a
+repository webhook**. It stays off until `CONTRIBUTOR_ROLES_ENABLED=true`. Role
+state lives in SQLite (`ROLES_DB_PATH`, default `.data/contributor_roles.db` on
+the persistent disk), separate from the weekly JSON ledger.
 
 Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 
@@ -164,77 +163,62 @@ Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 | Agent Builder | a merged PR whose paths contain `mcp`, `agent`, or `a2a`, or whose labels include `agents` |
 | Provider Wizard | 3+ merged PRs that touch `litellm/llms/` |
 
-Bot authors are ignored. Roles are sticky: the bot adds them and does not remove
-them. A person keeps OSS Champion after the month they earned it. Docs Hero is
-no longer granted; anyone who already has that Discord role keeps it.
-`/unlink-github` drops the account link and leaves roles already granted.
+Bots, `MAINTAINER_GITHUB_LOGINS`, GitHub org members, and BerriAI staff handles
+are ignored. Every ~10 minutes (`ROLES_POLL_SECONDS`, default `600`), the bot
+polls newly merged PRs since a SQLite checkpoint, stores their metadata and
+changed file paths, resolves community PR authors to Discord members using the
+same automatic matcher as the weekly summary (`exact_login`, TypeSafe Jev,
+deterministic fallback, cached in SQLite with a 30-day TTL — never assigning on
+ambiguous ties), and grants newly earned roles. Ongoing new role grants post a
+short `<@user> just became an oss champion 🎉` line to
+`ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Roles are sticky: the bot adds them and never
+removes them. Docs Hero is no longer granted; anyone who already has that
+Discord role keeps it.
 
-### Discord setup
+### Minimal setup (no GitHub OAuth or webhook required)
 
-1. Invite the bot with the `bot` and `applications.commands` scopes. For roles,
-   grant **Manage Roles**, plus View Channel and Send Messages in the
-   announcement channel (for example #shipped). The weekly roundup still needs
-   its existing channel permissions and the Message Content Intent.
-2. In the server role list, put the bot's role **above** every role it grants.
-   Discord rejects assignments otherwise; the log says so and the bot keeps running.
-3. Copy each role's snowflake into `ROLE_CONTRIBUTOR_ID`, `ROLE_OSS_CHAMPION_ID`,
-   `ROLE_AGENT_BUILDER_ID`, and `ROLE_PROVIDER_WIZARD_ID`.
-   Optional `ROLE_*_NAME` overrides change the announcement text only.
-4. Set `DISCORD_GUILD_ID`, `DISCORD_APPLICATION_ID`, and `DISCORD_PUBLIC_KEY`
-   (the 64-character hex key from the application). Set
-   `ROLE_ANNOUNCEMENTS_CHANNEL_ID` to the channel that should receive posts like
-   `<@user> just became an oss champion 🎉`.
-5. Start the bot, then set the application's Interactions Endpoint URL to
-   `https://<public-host>/discord/interactions`. Discord sends a ping; the
-   endpoint must already be up. Slash commands are registered for that guild:
-   `/link-github`, `/unlink-github`, and `/my-prs`.
+1. **Create the 4 Discord roles**: `Contributor`, `OSS Champion`, `Agent Builder`,
+   and `Provider Wizard`.
+2. **Place the bot's role above those 4 roles** in Server Settings → Roles, and
+   grant the bot **Manage Roles** plus View Channel and Send Messages in the
+   announcements channel (for example `#shipped`).
+3. **Set Render environment variables**:
+   - `CONTRIBUTOR_ROLES_ENABLED=true`
+   - `DISCORD_GUILD_ID`
+   - `ROLE_CONTRIBUTOR_ID`, `ROLE_OSS_CHAMPION_ID`, `ROLE_AGENT_BUILDER_ID`,
+     `ROLE_PROVIDER_WIZARD_ID` (optional `ROLE_*_NAME` overrides change
+     announcement copy only)
+   - `ROLE_ANNOUNCEMENTS_CHANNEL_ID`
+   - Optional: `ROLES_POLL_SECONDS=600`, `ROLES_BACKFILL_ON_BOOT=true` (one-time
+     historical backfill on startup), `BACKFILL_SINCE=2023-01-01T00:00:00Z`,
+     `GITHUB_TOKEN` (or `GITHUB_ACTOR_TOKEN`) for higher GitHub read limits.
+4. **Historical backfill**: either set `ROLES_BACKFILL_ON_BOOT=true` for a
+   one-time boot run, or have a moderator run `/roles-backfill` in Discord
+   (ephemeral, rate-limit aware, time-bounded, resumable). Backfill assigns
+   roles silently and posts **at most a single summary line** to
+   `ROLE_ANNOUNCEMENTS_CHANNEL_ID` (never one message per contributor).
 
-`/link-github` replies with a GitHub OAuth link that expires in 10 minutes.
-`/my-prs` is ephemeral and shows the caller's open LiteLLM pull requests (with
-review status), the merged count this bot has recorded, and the roles those
-pull requests earn.
+`DISCORD_PUBLIC_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_*`, and the
+Interactions Endpoint URL are all **optional** and not required. `/link-github`
+and `/unlink-github` stay hidden unless GitHub OAuth is configured. `/my-prs`
+shows an ephemeral PR snapshot for any auto-matched (or manually mapped)
+contributor, and `/roles-backfill` is mod-only (`Manage Messages`).
 
-### GitHub setup
+### Optional webhook / GitHub OAuth
 
-1. Create a GitHub OAuth app. Callback URL:
-   `https://<public-host>/github/oauth/callback`, the same value as
-   `GITHUB_OAUTH_REDIRECT_URI`. Homepage URL can be the Discord invite.
-   The app only requests the `read:user` scope. Put the client id and secret in
-   `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET`.
-2. On `BerriAI/litellm`, add a webhook for **Pull requests** only.
-   Payload URL `https://<public-host>/github/webhook`, content type
-   `application/json`, secret `GITHUB_WEBHOOK_SECRET`. The bot checks
-   `X-Hub-Signature-256` and ignores anything that is not a merged pull request
-   from a human on the configured repository.
-3. `GITHUB_TOKEN` should be a fine-grained token that can read pull requests
-   (and metadata) on `BerriAI/litellm`. It is used for changed-file lists,
-   historical backfill, and `/my-prs`. Anonymous access still works until the
-   rate limit; file paths are what the path-based roles need.
-4. The process listens on `HTTP_HOST`:`HTTP_PORT` (default `0.0.0.0` and `8080`,
-   or Render's `PORT` when `HTTP_PORT` is unset). GitHub and Discord need
-   public HTTPS. A Render **web service** with the same start command
-   (`python3 bot.py`) provides that. Leave the existing background worker as-is
-   until you are ready to receive webhooks; do not run two pollers on one state file.
+If you also want real-time webhook delivery or optional `/link-github` OAuth:
 
-On each merged pull request the bot stores the number, author, `merged_at`,
-labels, and changed paths, then re-evaluates that author. If their Discord
-account is linked, new roles are assigned and announced. A linked author can
-also get a short `<@user> just shipped #1234 🎉` line
-(`MERGE_SHOUTOUTS_ENABLED`, default `true`). Linking an account evaluates roles
-immediately and catches up that person's older merged pull requests in the
-background.
-
-Backfill everyone else, rate-limit aware, after people have linked (or before;
-linking catches a person up either way):
-
-```sh
-python3 bot.py --backfill-merged-prs
-```
-
-`GITHUB_TOKEN` is required. `BACKFILL_SINCE` defaults to `2023-01-01T00:00:00Z`.
-Completed search windows are checkpointed, so a rerun skips work it finished.
-The command does not post a shoutout per historical pull request; it announces
-a role once when a linked account newly qualifies.
+- Set `GITHUB_WEBHOOK_SECRET` and point a `BerriAI/litellm` **Pull requests**
+  webhook at `https://<public-host>/github/webhook`.
+- Set `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, and
+  `GITHUB_OAUTH_REDIRECT_URI` (`https://<public-host>/github/oauth/callback`)
+  to enable `/link-github` and `/unlink-github`.
+- Set `DISCORD_APPLICATION_ID` and `DISCORD_PUBLIC_KEY` only if you want HTTP
+  interactions (`https://<public-host>/discord/interactions`) instead of gateway
+  slash commands.
+- You can also run `python3 bot.py --backfill-merged-prs` in Render Shell
+  (`GITHUB_TOKEN` or `GITHUB_ACTOR_TOKEN` required; `BACKFILL_SINCE` defaults to
+  `2023-01-01T00:00:00Z`).
 
 ### Optional invite comment
 
