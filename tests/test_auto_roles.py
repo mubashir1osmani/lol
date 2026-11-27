@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from contributor_bot.api import TransientAPIError
+from contributor_bot.api import TransientAPIError, fetch_author_merged_count
 from contributor_bot.config import get_config
 from contributor_bot.gateway import commands_for_guild
 from contributor_bot.interactions import (
@@ -269,6 +269,7 @@ class AutoRolesPollerTests(unittest.TestCase):
                 search_merged_fn=lambda repo, start, end, tok: set(pulls.keys()),
                 pull_fetcher=lambda repo, num, tok: pulls[num],
                 files_fetcher=lambda repo, num, tok: files_map.get(num, []),
+                count_fetcher=lambda repo, login, tok: 3,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
                 github_getter=fake_github_get,
@@ -334,6 +335,105 @@ class AutoRolesPollerTests(unittest.TestCase):
         self.assertTrue(res.rate_limited)
         self.assertIsNone(self.store.get_roles_meta("last_merged_checkpoint:berriai/litellm"))
 
+    def test_lifetime_count_cached_incremented_and_files_fetched_only_when_needed(self):
+        members = [_member("4001", "veteran-dev", "Veteran Dev")]
+        count_calls = []
+
+        def fake_count(repo, login, tok):
+            count_calls.append((repo, login))
+            return 9  # 9 lifetime merged PRs on first sight -> Contributor (not yet 10)
+
+        files_calls = []
+
+        def fake_files(repo, num, tok):
+            files_calls.append(num)
+            return ["litellm/llms/openai.py", "litellm/proxy/mcp_server.py"]
+
+        # Seed 2 prior stored provider PRs so PR #401 (the 3rd) unlocks BOTH Provider Wizard + Agent Builder!
+        for n in (398, 399):
+            self.store.upsert_pull(
+                repository="BerriAI/litellm",
+                number=n,
+                github_user_id=701,
+                github_login="veteran-dev",
+                merged_at=f"2026-0{n - 396}-01T00:00:00+00:00",
+                title=f"old {n}",
+                labels=[],
+                files=["litellm/llms/anthropic.py"],
+            )
+
+        pr_401 = {
+            "number": 401, "merged": True, "merged_at": "2026-11-27T14:00:00Z", "title": "third provider + mcp",
+            "user": {"login": "veteran-dev", "id": 701, "type": "User"},
+            "author_association": "CONTRIBUTOR", "labels": [],
+        }
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
+             mock.patch("contributor_bot.rewards.post_message", return_value={"id": "901"}):
+            res1 = poll_merged_prs_for_roles(
+                self.config,
+                self.store,
+                now=datetime(2026, 11, 27, 15, 0, tzinfo=UTC),
+                search_merged_fn=lambda repo, start, end, tok: {401},
+                pull_fetcher=lambda repo, num, tok: pr_401,
+                files_fetcher=fake_files,
+                count_fetcher=fake_count,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+
+        # Needed files for PR #401 (didn't have Agent Builder or Provider Wizard yet).
+        self.assertEqual(files_calls, [401])
+        self.assertEqual(res1.files_skipped, 0)
+        # Lifetime count fetched ONCE and cached in SQLite as 9 -> earns Contributor, Agent Builder, Provider Wizard (not OSS Champion yet).
+        self.assertEqual(count_calls, [("BerriAI/litellm", "veteran-dev")])
+        cached = self.store.get_author_merged_count("BerriAI/litellm", "veteran-dev")
+        self.assertEqual(cached["total_count"], 9)
+        self.assertEqual(
+            {call.args[2] for call in add_role.call_args_list},
+            {"1001", "1003", "1004"},
+        )
+
+        # Next poll (10 min later): PR #402 merges AFTER cached fetched_at (15:00Z).
+        # 1) Author ALREADY has both Agent Builder and Provider Wizard -> fetch_pull_files is SKIPPED!
+        # 2) Cached lifetime count increments 9 -> 10 WITHOUT calling count_fetcher again -> earns OSS Champion!
+        pr_402 = {
+            "number": 402, "merged": True, "merged_at": "2026-11-27T15:05:00Z", "title": "tenth lifetime pr",
+            "user": {"login": "veteran-dev", "id": 701, "type": "User"},
+            "author_association": "CONTRIBUTOR", "labels": [],
+        }
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role2, \
+             mock.patch("contributor_bot.rewards.post_message", return_value={"id": "902"}) as post_msg2:
+            res2 = poll_merged_prs_for_roles(
+                self.config,
+                self.store,
+                now=datetime(2026, 11, 27, 15, 10, tzinfo=UTC),
+                search_merged_fn=lambda repo, start, end, tok: {401, 402},
+                pull_fetcher=lambda repo, num, tok: pr_402,
+                files_fetcher=fake_files,
+                count_fetcher=fake_count,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+
+        self.assertEqual(files_calls, [401])  # ZERO file-list calls for PR #402!
+        self.assertEqual(res2.files_skipped, 1)
+        self.assertEqual(count_calls, [("BerriAI/litellm", "veteran-dev")])  # ZERO extra search calls!
+        self.assertEqual(self.store.get_author_merged_count("BerriAI/litellm", "veteran-dev")["total_count"], 10)
+        self.assertEqual([call.args[2] for call in add_role2.call_args_list], ["1002"])  # OSS Champion!
+        self.assertEqual(post_msg2.call_args.args[2]["content"], "<@4001> just became an oss champion 🎉")
+
+    def test_fetch_author_merged_count_search_query_and_validation(self):
+        with mock.patch("contributor_bot.api._pace_github_search"), \
+             mock.patch("contributor_bot.api._request_json", return_value={"total_count": 14, "incomplete_results": False, "items": []}) as req:
+            count = fetch_author_merged_count("BerriAI/litellm", "octocat", "tok")
+        self.assertEqual(count, 14)
+        url = req.call_args.args[0].full_url
+        self.assertIn("author%3Aoctocat", url)
+        self.assertIn("is%3Apr+is%3Amerged", url)
+        self.assertIn("per_page=1", url)
+        with self.assertRaises(ValueError):
+            fetch_author_merged_count("BerriAI/litellm", "bad login!", "tok")
+
 
 class AutoRolesBackfillTests(unittest.TestCase):
     def setUp(self):
@@ -376,6 +476,7 @@ class AutoRolesBackfillTests(unittest.TestCase):
                 search_merged_fn=lambda repo, start, end, tok: {201, 202},
                 pull_fetcher=lambda repo, num, tok: pulls[num],
                 files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
             )
@@ -428,6 +529,7 @@ class AutoRolesBackfillTests(unittest.TestCase):
                 search_merged_fn=flaky_search,
                 pull_fetcher=lambda repo, num, tok: pull_301,
                 files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
             )

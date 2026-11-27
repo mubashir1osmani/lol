@@ -165,8 +165,12 @@ Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 
 Bots, `MAINTAINER_GITHUB_LOGINS`, GitHub org members, and BerriAI staff handles
 are ignored. Every ~10 minutes (`ROLES_POLL_SECONDS`, default `600`), the bot
-polls newly merged PRs since a SQLite checkpoint, stores their metadata and
-changed file paths, resolves community PR authors to Discord members using the
+polls newly merged PRs since a SQLite checkpoint, stores their metadata
+(`number`, author, `merged_at`, labels, and changed file paths — fetching file
+lists only when still needed for Agent Builder or Provider Wizard), caches each
+author's lifetime merged PR `total_count` via one GitHub search
+(`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental updates
+from the poller, resolves community PR authors to Discord members using the
 same automatic matcher as the weekly summary (`exact_login`, TypeSafe Jev,
 deterministic fallback, cached in SQLite with a 30-day TTL — never assigning on
 ambiguous ties), and grants newly earned roles. Ongoing new role grants post a
@@ -177,8 +181,10 @@ Discord role keeps it.
 
 ### Minimal setup (no GitHub OAuth or webhook required)
 
-1. **Create the 4 Discord roles**: `Contributor`, `OSS Champion`, `Agent Builder`,
-   and `Provider Wizard`.
+1. **Copy the 4 existing Discord role IDs** (`Contributor`, `OSS Champion`,
+   `Agent Builder`, and `Provider Wizard`) from Server Settings → Roles into
+   `ROLE_CONTRIBUTOR_ID`, `ROLE_OSS_CHAMPION_ID`, `ROLE_AGENT_BUILDER_ID`, and
+   `ROLE_PROVIDER_WIZARD_ID`.
 2. **Place the bot's role above those 4 roles** in Server Settings → Roles, and
    grant the bot **Manage Roles** plus View Channel and Send Messages in the
    announcements channel (for example `#shipped`).

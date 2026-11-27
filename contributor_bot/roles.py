@@ -80,13 +80,22 @@ def _agent_label(labels: tuple[str, ...]) -> bool:
     return any(label.strip().lower() == AGENT_LABEL for label in labels)
 
 
-def qualifies_contributor(pulls: list[MergedPull]) -> bool:
-    return len(_human(pulls)) >= CONTRIBUTOR_MIN_MERGED
+def qualifies_contributor(
+    pulls: list[MergedPull],
+    *,
+    lifetime_merged_count: int | None = None,
+) -> bool:
+    total = max(len(_human(pulls)), int(lifetime_merged_count or 0))
+    return total >= CONTRIBUTOR_MIN_MERGED
 
 
-def qualifies_oss_champion(pulls: list[MergedPull]) -> bool:
+def qualifies_oss_champion(
+    pulls: list[MergedPull],
+    *,
+    lifetime_merged_count: int | None = None,
+) -> bool:
     humans = _human(pulls)
-    if len(humans) >= OSS_CHAMPION_MIN_MERGED:
+    if max(len(humans), int(lifetime_merged_count or 0)) >= OSS_CHAMPION_MIN_MERGED:
         return True
     months: dict[tuple[int, int], int] = {}
     for pull in humans:
@@ -118,6 +127,19 @@ RULES = (
 )
 
 
-def earned_role_keys(pulls: list[MergedPull]) -> list[str]:
+def earned_role_keys(
+    pulls: list[MergedPull],
+    *,
+    lifetime_merged_count: int | None = None,
+) -> list[str]:
     """Role keys this author has earned, in announcement order."""
-    return [key for key, qualifies in RULES if qualifies(pulls)]
+    earned: list[str] = []
+    if qualifies_contributor(pulls, lifetime_merged_count=lifetime_merged_count):
+        earned.append("contributor")
+    if qualifies_oss_champion(pulls, lifetime_merged_count=lifetime_merged_count):
+        earned.append("oss_champion")
+    if qualifies_agent_builder(pulls):
+        earned.append("agent_builder")
+    if qualifies_provider_wizard(pulls):
+        earned.append("provider_wizard")
+    return earned

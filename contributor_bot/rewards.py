@@ -81,6 +81,7 @@ def apply_roles(
     pr_number: int | None = None,
     shoutout: bool = False,
     announce: bool = True,
+    lifetime_merged_count: int | None = None,
 ) -> list[str]:
     """Grant any newly earned roles and optionally post one announcement when something is new.
 
@@ -88,7 +89,13 @@ def apply_roles(
     """
     if not config.contributor_roles_enabled:
         return []
-    earned = earned_role_keys(_models(store.pulls_for_author(config.github_repository, github_user_id)))
+    rows = store.pulls_for_author(config.github_repository, github_user_id)
+    effective_count = lifetime_merged_count
+    if effective_count is None and rows:
+        cached = store.get_author_merged_count(config.github_repository, rows[-1]["github_login"])
+        if cached is not None:
+            effective_count = int(cached["total_count"])
+    earned = earned_role_keys(_models(rows), lifetime_merged_count=effective_count)
     already = store.grant_keys(discord_id)
     now = iso(datetime.now(UTC))
     # A role Discord refused to add is left unannounced. Skipping the merge

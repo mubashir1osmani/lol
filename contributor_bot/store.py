@@ -153,6 +153,15 @@ CREATE TABLE IF NOT EXISTS roles_poller_meta (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS author_merged_counts (
+    repository TEXT NOT NULL,
+    github_login TEXT NOT NULL,
+    github_user_id INTEGER,
+    total_count INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (repository, github_login)
+);
 """
 
 
@@ -977,6 +986,79 @@ class Store:
                 (key, value, updated_at),
             )
             self._conn.commit()
+
+    def get_author_merged_count(self, repository: str, github_login: str) -> dict | None:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT repository, github_login, github_user_id, total_count, fetched_at
+                FROM author_merged_counts
+                WHERE repository = ? AND github_login = ?
+                """,
+                (repository, key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_author_merged_count(
+        self,
+        repository: str,
+        github_login: str,
+        total_count: int,
+        fetched_at: str,
+        *,
+        github_user_id: int | None = None,
+    ) -> None:
+        key = (github_login or "").strip().lower()
+        if not key or not _LOGIN.fullmatch(key):
+            raise ValueError("Invalid GitHub login")
+        if not isinstance(total_count, int) or total_count < 0:
+            raise ValueError("Invalid merged PR count")
+        uid = github_user_id if isinstance(github_user_id, int) and github_user_id > 0 else None
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO author_merged_counts (
+                    repository, github_login, github_user_id, total_count, fetched_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(repository, github_login) DO UPDATE SET
+                    github_user_id = COALESCE(excluded.github_user_id, author_merged_counts.github_user_id),
+                    total_count = excluded.total_count,
+                    fetched_at = excluded.fetched_at
+                """,
+                (repository, key, uid, total_count, fetched_at),
+            )
+            self._conn.commit()
+
+    def increment_author_merged_count(
+        self,
+        repository: str,
+        github_login: str,
+        delta: int = 1,
+    ) -> int | None:
+        """Increment a cached lifetime merged PR count if present. Returns new total or None."""
+        key = (github_login or "").strip().lower()
+        if not key or delta <= 0:
+            return None
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE author_merged_counts
+                SET total_count = total_count + ?
+                WHERE repository = ? AND github_login = ?
+                """,
+                (delta, repository, key),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                "SELECT total_count FROM author_merged_counts WHERE repository = ? AND github_login = ?",
+                (repository, key),
+            ).fetchone()
+            self._conn.commit()
+        return int(row["total_count"]) if row else None
 
     @staticmethod
     def _review_key(repository: str, number: int) -> None:

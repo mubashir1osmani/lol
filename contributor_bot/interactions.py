@@ -435,9 +435,11 @@ def my_prs_content(config: Config, store: Store, link: dict) -> str:
         MergedPull(int(row["number"]), parse_time(row["merged_at"]), tuple(row["labels"]), tuple(row["files"]))
         for row in rows
     ]
+    cached_count = store.get_author_merged_count(config.github_repository, link["github_login"])
+    lifetime_count = int(cached_count["total_count"]) if cached_count is not None else None
     names = [
         config.role_names.get(key) or DEFAULT_ROLE_NAMES[key]
-        for key in earned_role_keys(models)
+        for key in earned_role_keys(models, lifetime_merged_count=lifetime_count)
     ]
     open_prs: list[dict] = []
     open_total = None
@@ -451,8 +453,9 @@ def my_prs_content(config: Config, store: Store, link: dict) -> str:
     except (TransientAPIError, RuntimeError, ValueError):
         logging.warning("Open PR lookup failed for %s", link["github_login"])
         open_error = True
+    merged_display_count = max(len(rows), lifetime_count or 0)
     return my_prs_text(
-        link["github_login"], open_prs, open_total, len(rows), names, open_error=open_error,
+        link["github_login"], open_prs, open_total, merged_display_count, names, open_error=open_error,
     )
 
 

@@ -18,6 +18,7 @@ from typing import Any
 
 from .api import (
     TransientAPIError,
+    fetch_author_merged_count,
     fetch_merged_numbers,
     fetch_pull_files,
     fetch_pull_request,
@@ -26,7 +27,8 @@ from .api import (
 )
 from .config import Config
 from .matcher import match_community_contributors_with_diagnostics
-from .rewards import _label_names, apply_roles
+from .rewards import _label_names, _models, apply_roles
+from .roles import _agent_label, qualifies_agent_builder, qualifies_provider_wizard
 from .schedule import UTC, iso, parse_time
 from .store import Store
 from .weekly import (
@@ -41,6 +43,8 @@ POLL_OVERLAP_MINUTES = 5
 POLL_MAX_LOOKBACK_DAYS = 7
 POLL_DEADLINE_SECONDS = 90.0
 POLL_MAX_PULLS_PER_TICK = 50
+
+AUTHOR_COUNT_CACHE_TTL_DAYS = 30
 
 BACKFILL_WINDOW = timedelta(days=28)
 BACKFILL_DEADLINE_SECONDS = 300.0
@@ -59,6 +63,7 @@ class RolesPollResult:
     authors_evaluated: int
     authors_matched: int
     roles_granted: int
+    files_skipped: int = 0
     rate_limited: bool = False
     timed_out: bool = False
 
@@ -118,6 +123,85 @@ def _is_excluded_author(
     return False
 
 
+def _count_is_fresh(fetched_at: str | None, now: datetime) -> bool:
+    if not fetched_at:
+        return False
+    try:
+        recorded = parse_time(fetched_at)
+    except Exception:
+        return False
+    return (now - recorded) <= timedelta(days=AUTHOR_COUNT_CACHE_TTL_DAYS)
+
+
+def ensure_author_merged_count(
+    config: Config,
+    store: Store,
+    login: str,
+    user_id: int,
+    *,
+    now: datetime,
+    count_fetcher=None,
+) -> int | None:
+    """Return cached lifetime merged PR total_count, fetching once via GitHub search on miss."""
+    repo = config.github_repository
+    cached = store.get_author_merged_count(repo, login)
+    if cached is not None and _count_is_fresh(cached.get("fetched_at"), now):
+        return int(cached["total_count"])
+    fetcher = count_fetcher or fetch_author_merged_count
+    try:
+        total = int(fetcher(repo, login, config.effective_github_token))
+    except (TransientAPIError, RuntimeError, ValueError) as error:
+        logging.warning(
+            "Could not fetch lifetime merged PR count for %s (%s); using stored rows",
+            login,
+            error,
+        )
+        return int(cached["total_count"]) if cached is not None else None
+    stored_count = len(store.pulls_for_author(repo, user_id))
+    effective = max(total, stored_count)
+    store.set_author_merged_count(
+        repo,
+        login,
+        effective,
+        iso(now),
+        github_user_id=user_id,
+    )
+    return effective
+
+
+def _needs_pull_files(
+    store: Store,
+    repository: str,
+    user_id: int,
+    login: str,
+    labels: list[str],
+) -> bool:
+    """True only when changed file paths could still unlock Agent Builder or Provider Wizard."""
+    granted: set[str] = set()
+    link = store.link_for_github_user(user_id)
+    if link and link.get("discord_id"):
+        granted = store.grant_keys(str(link["discord_id"]))
+    else:
+        matched = store.get_confirmed_match(login)
+        if matched and matched.get("discord_id"):
+            granted = store.grant_keys(str(matched["discord_id"]))
+
+    if "agent_builder" in granted and "provider_wizard" in granted:
+        return False
+
+    existing_models = _models(store.pulls_for_author(repository, user_id))
+    has_agent = (
+        ("agent_builder" in granted)
+        or _agent_label(tuple(labels))
+        or qualifies_agent_builder(existing_models)
+    )
+    has_provider = (
+        ("provider_wizard" in granted)
+        or qualifies_provider_wizard(existing_models)
+    )
+    return not (has_agent and has_provider)
+
+
 def _ingest_community_pull(
     config: Config,
     store: Store,
@@ -130,9 +214,8 @@ def _ingest_community_pull(
 ) -> tuple[dict[str, Any] | None, bool]:
     """Fetch and store one merged PR if authored by an external human contributor.
 
-    Returns ``(author_info, excluded)`` where ``author_info`` is
-    ``{"user_id": int, "login": str, "number": int, "merged_at": str}`` when stored,
-    or ``None`` when not merged or excluded.
+    Fetches changed file paths only when needed for Agent Builder or Provider
+    Wizard, and incrementally updates any cached lifetime merged PR count.
     """
     get_pr = pull_fetcher or fetch_pull_request
     get_files = files_fetcher or fetch_pull_files
@@ -157,9 +240,12 @@ def _ingest_community_pull(
         org=org,
     ):
         return None, True
-    files = get_files(config.github_repository, number, token)
+    labels = _label_names(pull)
+    need_files = _needs_pull_files(store, config.github_repository, user_id, login, labels)
+    files = get_files(config.github_repository, number, token) if need_files else []
     merged_iso = iso(parse_time(merged_raw))
     title = pull.get("title") if isinstance(pull.get("title"), str) else ""
+    already_existed = store.get_pull(config.github_repository, number) is not None
     store.upsert_pull(
         repository=config.github_repository,
         number=number,
@@ -167,14 +253,19 @@ def _ingest_community_pull(
         github_login=login,
         merged_at=merged_iso,
         title=title,
-        labels=_label_names(pull),
+        labels=labels,
         files=files,
     )
+    if not already_existed:
+        cached = store.get_author_merged_count(config.github_repository, login)
+        if cached is not None and merged_iso > str(cached.get("fetched_at") or ""):
+            store.increment_author_merged_count(config.github_repository, login, delta=1)
     return {
         "user_id": user_id,
         "login": login,
         "number": number,
         "merged_at": merged_iso,
+        "files_fetched": need_files,
     }, False
 
 
@@ -241,6 +332,7 @@ def poll_merged_prs_for_roles(
     search_merged_fn=None,
     pull_fetcher=None,
     files_fetcher=None,
+    count_fetcher=None,
     org_members_fetcher=None,
     members=None,
     github_getter=None,
@@ -306,6 +398,7 @@ def poll_merged_prs_for_roles(
         stored = 0
         skipped_existing = 0
         skipped_excluded = 0
+        files_skipped = 0
         rate_limited = False
         timed_out = False
         affected_authors: dict[int, dict[str, Any]] = {}
@@ -343,6 +436,8 @@ def poll_merged_prs_for_roles(
                 skipped_excluded += 1
                 continue
             stored += 1
+            if not info.get("files_fetched", True):
+                files_skipped += 1
             uid = info["user_id"]
             entry = affected_authors.setdefault(
                 uid,
@@ -374,6 +469,15 @@ def poll_merged_prs_for_roles(
 
         roles_granted = 0
         for uid, discord_id in resolved_map.items():
+            login = affected_authors[uid]["login"]
+            lifetime_count = ensure_author_merged_count(
+                config,
+                store,
+                login,
+                uid,
+                now=moment,
+                count_fetcher=count_fetcher,
+            )
             try:
                 granted = apply_roles(
                     config,
@@ -382,6 +486,7 @@ def poll_merged_prs_for_roles(
                     uid,
                     shoutout=False,
                     announce=True,
+                    lifetime_merged_count=lifetime_count,
                 )
                 roles_granted += len(granted)
             except TransientAPIError as error:
@@ -391,12 +496,13 @@ def poll_merged_prs_for_roles(
 
         logging.info(
             "Contributor roles poll for %s complete: discovered=%d stored=%d existing=%d "
-            "excluded=%d matched=%d/%d roles_granted=%d in %.2fs",
+            "excluded=%d files_skipped=%d matched=%d/%d roles_granted=%d in %.2fs",
             repo,
             len(numbers),
             stored,
             skipped_existing,
             skipped_excluded,
+            files_skipped,
             matched_count,
             len(author_list),
             roles_granted,
@@ -410,6 +516,7 @@ def poll_merged_prs_for_roles(
             authors_evaluated=len(author_list),
             authors_matched=matched_count,
             roles_granted=roles_granted,
+            files_skipped=files_skipped,
             rate_limited=rate_limited,
             timed_out=timed_out,
         )
@@ -437,6 +544,7 @@ def run_roles_backfill(
     search_merged_fn=None,
     pull_fetcher=None,
     files_fetcher=None,
+    count_fetcher=None,
     org_members_fetcher=None,
     members=None,
     github_getter=None,
@@ -608,12 +716,21 @@ def run_roles_backfill(
             deadline=deadline,
         )
 
+        login_by_uid = {a["user_id"]: a["login"] for a in eligible_authors}
         contributors_granted = 0
         roles_granted = 0
         for uid, discord_id in resolved_map.items():
             if deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
                 break
+            lifetime_count = ensure_author_merged_count(
+                config,
+                store,
+                login_by_uid[uid],
+                uid,
+                now=moment,
+                count_fetcher=count_fetcher,
+            )
             try:
                 newly = apply_roles(
                     config,
@@ -622,6 +739,7 @@ def run_roles_backfill(
                     uid,
                     shoutout=False,
                     announce=False,
+                    lifetime_merged_count=lifetime_count,
                 )
             except TransientAPIError as error:
                 logging.warning("Backfill role assignment hit rate limit for %s: %s", discord_id, error)
