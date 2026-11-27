@@ -258,25 +258,36 @@ def _is_rate_limit_error(error: Exception) -> bool:
     return "HTTP 403" in text or "HTTP 429" in text or "rate limit" in text.lower()
 
 
-def _github_budget_available(*, sleep=time.sleep, clock=time.time) -> bool:
-    """Return True if GitHub API budget is available, waiting briefly when reset is imminent."""
+def _github_budget_available(
+    *,
+    sleep=time.sleep,
+    clock=time.time,
+    allow_sleep: bool = False,
+) -> bool:
+    """Return True if GitHub API budget is available; never blocks for long rate-limit resets."""
     remaining, reset = github_rate_limit_status()
-    if remaining is None or remaining > 2:
+    if remaining is None or remaining > 5:
         return True
     now_ts = clock()
     if reset is None or reset <= now_ts:
         return True
     delay = reset - now_ts + 0.25
-    if 0 < delay <= 60.0:
+    if allow_sleep and 0 < delay <= 10.0:
         logging.info("GitHub rate limit low (remaining=%d); waiting %.1fs for reset", remaining, delay)
         sleep(delay)
         return True
     logging.warning(
-        "GitHub rate limit nearly exhausted (remaining=%d, resets in %.0fs); deferring further profile lookups",
+        "GitHub rate limit low (remaining=%d, resets in %.0fs); stopping optional profile lookups",
         remaining,
         delay,
     )
     return False
+
+
+def _call_github_enrichment(fetch, url: str, token: str | None, *, timeout: float = 10.0):
+    if fetch is github_get_json:
+        return github_get_json(url, token, pace=False, attempts=1, timeout=timeout, max_retry_delay=0.0)
+    return fetch(url, token, pace=False)
 
 
 def fetch_github_author_profile(
@@ -289,9 +300,11 @@ def fetch_github_author_profile(
     getter=None,
     store=None,
     now: datetime | None = None,
+    deadline: float | None = None,
 ) -> tuple[GitHubAuthorProfile, bool]:
     """Fetch GitHub user profile (with 7-day SQLite cache) + PR commit author names/email locals."""
     fetch = getter or github_get_json
+    using_real_github = fetch is github_get_json
     moment = now or datetime.now(UTC)
     name = ""
     blog = ""
@@ -316,6 +329,11 @@ def fetch_github_author_profile(
         if cleaned.casefold() not in {n.casefold() for n in commit_names}:
             commit_names.append(cleaned)
 
+    def _time_left() -> float:
+        if deadline is None:
+            return 10.0
+        return deadline - time.monotonic()
+
     used_cached_user = False
     if login and re.fullmatch(r"[A-Za-z0-9-]+", login):
         cached_user = (
@@ -334,11 +352,14 @@ def fetch_github_author_profile(
                 email_locals.append(cached_email_local)
 
         if not used_cached_user:
-            if getter is None and not _github_budget_available():
+            if deadline is not None and _time_left() <= 1.0:
+                rate_limited = True
+            elif using_real_github and not _github_budget_available():
                 rate_limited = True
             else:
                 try:
-                    profile = fetch(f"{GITHUB_API}/users/{login}", token, pace=True)
+                    req_timeout = min(10.0, max(2.0, _time_left()))
+                    profile = _call_github_enrichment(fetch, f"{GITHUB_API}/users/{login}", token, timeout=req_timeout)
                     if isinstance(profile, dict):
                         name = (profile.get("name") or "").strip() if isinstance(profile.get("name"), str) else ""
                         blog = (profile.get("blog") or "").strip() if isinstance(profile.get("blog"), str) else ""
@@ -370,14 +391,19 @@ def fetch_github_author_profile(
         for pr_number in pull_numbers[:2]:
             if not isinstance(pr_number, int) or pr_number <= 0:
                 continue
-            if getter is None and not _github_budget_available():
+            if deadline is not None and _time_left() <= 1.0:
+                rate_limited = True
+                break
+            if using_real_github and not _github_budget_available():
                 rate_limited = True
                 break
             try:
-                commits = fetch(
+                req_timeout = min(10.0, max(2.0, _time_left()))
+                commits = _call_github_enrichment(
+                    fetch,
                     f"{GITHUB_API}/repos/{repository}/pulls/{pr_number}/commits?per_page=30",
                     token,
-                    pace=True,
+                    timeout=req_timeout,
                 )
             except Exception as error:
                 if _is_rate_limit_error(error):
@@ -469,6 +495,13 @@ async def _collect_async_members(result) -> list:
 
 def _run_guild_coro(coro, loop):
     if loop is not None and loop.is_running():
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            coro.close()
+            raise RuntimeError("Cannot block gateway event loop from its own thread")
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=GUILD_FETCH_TIMEOUT_SECONDS)
     return asyncio.run(coro)
 
@@ -645,21 +678,33 @@ class _MemberIndex:
     def __init__(self, members: list[DiscordMemberInfo]):
         self.members = list(members)
         self.by_id: dict[str, DiscordMemberInfo] = {m.discord_id: m for m in members}
+        self.entry_idx_by_id: dict[str, int] = {}
         self.by_raw: dict[str, list[DiscordMemberInfo]] = {}
         self.by_strict: dict[str, list[DiscordMemberInfo]] = {}
         self.by_base: dict[str, list[DiscordMemberInfo]] = {}
+        self.by_bigram: dict[str, list[int]] = {}
         self.entries: list[tuple[DiscordMemberInfo, set[str], set[str], set[str], tuple[str, ...]]] = []
 
-        for member in members:
+        for idx, member in enumerate(members):
             raw_l, strict_s, base_s = _member_tokens(member)
             norms = tuple(sorted({t for t in (strict_s | base_s) if len(t) >= 3}))
             self.entries.append((member, raw_l, strict_s, base_s, norms))
+            self.entry_idx_by_id[member.discord_id] = idx
             for tok in raw_l:
                 self.by_raw.setdefault(tok, []).append(member)
             for tok in strict_s:
                 self.by_strict.setdefault(tok, []).append(member)
             for tok in base_s:
                 self.by_base.setdefault(tok, []).append(member)
+            seen_bigrams: set[str] = set()
+            for norm in norms:
+                if len(norm) < 4:
+                    continue
+                for pos in range(len(norm) - 1):
+                    bg = norm[pos: pos + 2]
+                    if bg not in seen_bigrams:
+                        seen_bigrams.add(bg)
+                        self.by_bigram.setdefault(bg, []).append(idx)
 
     def exact_tier_hits(self, value: str) -> list[DiscordMemberInfo]:
         """Match exact/strict normalized form first; strip trailing digit suffixes only if no strict hit."""
@@ -682,6 +727,43 @@ class _MemberIndex:
             for member in self.by_base.get(base, ()):
                 hits_by_id[member.discord_id] = member
         return list(hits_by_id.values())
+
+    def exact_field_indices(self, value: str) -> set[int]:
+        """Indices of members matching ``value`` via raw, strict, or base token."""
+        cleaned = (value or "").strip()
+        if not cleaned:
+            return set()
+        out: set[int] = set()
+        lowered = cleaned.casefold()
+        if len(lowered) >= 3:
+            for member in self.by_raw.get(lowered, ()):
+                out.add(self.entry_idx_by_id[member.discord_id])
+        strict = normalize_strict(cleaned)
+        if len(strict) >= 4:
+            for member in self.by_strict.get(strict, ()):
+                out.add(self.entry_idx_by_id[member.discord_id])
+        base = normalize_base(cleaned)
+        if len(base) >= 4:
+            for member in self.by_base.get(base, ()):
+                out.add(self.entry_idx_by_id[member.discord_id])
+        return out
+
+    def initial_pattern_indices(self, full_name: str) -> set[int]:
+        parts = [re.sub(r"[^a-z]+", "", _fold_ascii(p)) for p in re.split(r"[\s._-]+", full_name or "")]
+        parts = [p for p in parts if p]
+        if len(parts) < 2:
+            return set()
+        first, last = parts[0], parts[-1]
+        if len(first) < 2 or len(last) < 2:
+            return set()
+        out: set[int] = set()
+        for pattern in (f"{first[0]}{last}", f"{first}{last[0]}", f"{last}{first}"):
+            if len(pattern) >= 4:
+                for member in self.by_strict.get(pattern, ()):
+                    out.add(self.entry_idx_by_id[member.discord_id])
+                for member in self.by_base.get(pattern, ()):
+                    out.add(self.entry_idx_by_id[member.discord_id])
+        return out
 
 
 def _exact_strict_match(value: str, raw_lower: set[str], strict_set: set[str]) -> bool:
@@ -767,7 +849,11 @@ def _fuzzy_score_entry(
             # Cheap length-ratio filter before SequenceMatcher: ratio <= 2*min/(a+b).
             if (2 * min(src_len, mem_len)) / (src_len + mem_len) < FUZZY_CANDIDATE_THRESHOLD:
                 continue
-            ratio = difflib.SequenceMatcher(None, src_norm, mem_norm).ratio()
+            sm = difflib.SequenceMatcher(None, src_norm, mem_norm)
+            if sm.quick_ratio() >= FUZZY_CANDIDATE_THRESHOLD:
+                ratio = sm.ratio()
+            else:
+                ratio = 0.0
             if ratio >= FUZZY_CANDIDATE_THRESHOLD:
                 if ratio > best:
                     best = ratio
@@ -861,13 +947,31 @@ def score_author_against_members(
             entry[1].append(f"ambiguous_{method}")
 
     # 4. Collect ambiguous strong collisions + fuzzy/commit/email candidates for Jev/Haiku.
+    # Every string pair of length >= 4 with SequenceMatcher ratio >= 0.72 (or len >= 5 substring)
+    # must share at least one 2-gram, so narrowing by exact/initial + 2-gram index is exact and fast.
     source_norms = _profile_source_norms(profile)
-    candidates: list[CandidatePair] = []
-    seen_ids: set[str] = set()
+    candidate_indices: set[int] = set()
+    for uid in ambiguous_strong:
+        idx = index.entry_idx_by_id.get(uid)
+        if idx is not None:
+            candidate_indices.add(idx)
+    for commit_name in profile.commit_names:
+        candidate_indices.update(index.exact_field_indices(commit_name))
+        candidate_indices.update(index.initial_pattern_indices(commit_name))
+    for email_local in profile.email_locals:
+        candidate_indices.update(index.exact_field_indices(email_local))
+    if profile.name:
+        candidate_indices.update(index.initial_pattern_indices(profile.name))
+    for _label, src_norm in source_norms:
+        for pos in range(len(src_norm) - 1):
+            hits_idx = index.by_bigram.get(src_norm[pos: pos + 2])
+            if hits_idx:
+                candidate_indices.update(hits_idx)
 
-    for member, raw_l, strict_s, base_s, norms in index.entries:
+    candidates: list[CandidatePair] = []
+    for idx in sorted(candidate_indices):
+        member, raw_l, strict_s, base_s, norms = index.entries[idx]
         if member.discord_id in ambiguous_strong:
-            seen_ids.add(member.discord_id)
             _m, sigs = ambiguous_strong[member.discord_id]
             fuzzy_score, fuzzy_sigs = _fuzzy_score_entry(profile, source_norms, raw_l, strict_s, base_s, norms)
             combined_sigs = tuple(dict.fromkeys(sigs + fuzzy_sigs))
@@ -910,6 +1014,7 @@ def _score_pairs_with_jev(
     api_key: str,
     *,
     jev_transport=None,
+    timeout: float = 15.0,
 ) -> dict[str, float]:
     """Send all candidate pairs to TypeSafe Jev in a single batched noul request."""
     model = getattr(config, "review_decision_model", None) or "jev-latest"
@@ -930,7 +1035,7 @@ def _score_pairs_with_jev(
             },
         }
     state = json.dumps({"candidate_pairs": state_items})
-    payload = call_jev_questions(model, state, questions, api_key, transport=jev_transport)
+    payload = call_jev_questions(model, state, questions, api_key, transport=jev_transport, timeout=timeout)
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if isinstance(usage, dict) and isinstance(usage.get("input_tokens"), int):
         _note_cost(usage["input_tokens"] * JEV_INPUT_USD_PER_TOKEN)
@@ -954,6 +1059,7 @@ def _score_pairs_with_haiku(
     pairs: list[CandidatePair],
     *,
     haiku_complete=None,
+    timeout: float = 20.0,
 ) -> dict[str, float]:
     """Single batched Haiku fallback when TYPESAFE_API_KEY is not configured."""
     if haiku_complete is None and not _has_haiku_credentials():
@@ -984,7 +1090,7 @@ def _score_pairs_with_haiku(
         raw = haiku_complete(model, messages)
     else:
         from .review_llm import complete_litellm
-        raw = complete_litellm(model, messages)
+        raw = complete_litellm(model, messages, timeout=timeout)
     try:
         start = raw.find("{")
         end = raw.rfind("}")
@@ -1039,6 +1145,7 @@ def _disambiguate_with_reasons(
     threshold: float = JEV_MATCH_THRESHOLD,
     jev_transport=None,
     haiku_complete=None,
+    deadline: float | None = None,
 ) -> tuple[dict[str, tuple[DiscordMemberInfo, str, float]], str, dict[str, str]]:
     """Score ambiguous/fuzzy pairs in one batched Jev call, Haiku fallback, or deterministic fallback."""
     if not candidates:
@@ -1053,25 +1160,48 @@ def _disambiguate_with_reasons(
     any_llm_succeeded = False
 
     for offset in range(0, len(candidates), MAX_PAIRS_PER_BATCH):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 3.0:
+                logging.warning(
+                    "Weekly report deadline reached before LLM disambiguation batch %d; "
+                    "falling back to deterministic matching",
+                    offset // MAX_PAIRS_PER_BATCH + 1,
+                )
+                break
+            jev_timeout = min(15.0, max(3.0, remaining))
+            haiku_timeout = min(20.0, max(3.0, remaining))
+        else:
+            jev_timeout = 15.0
+            haiku_timeout = 20.0
         batch = candidates[offset: offset + MAX_PAIRS_PER_BATCH]
         batch_scores: dict[str, float] = {}
         if api_key or jev_transport is not None:
             try:
-                batch_scores = _score_pairs_with_jev(config, batch, api_key, jev_transport=jev_transport)
+                batch_scores = _score_pairs_with_jev(
+                    config, batch, api_key, jev_transport=jev_transport, timeout=jev_timeout,
+                )
                 source = "jev"
                 any_llm_succeeded = True
             except Exception as error:
                 logging.warning("Jev contributor matching failed; trying Haiku fallback: %s", error)
-                try:
-                    batch_scores = _score_pairs_with_haiku(config, batch, haiku_complete=haiku_complete)
-                    source = "haiku"
-                    any_llm_succeeded = True
-                except Exception as haiku_error:
-                    logging.warning("Haiku contributor matching fallback unavailable: %s", haiku_error)
+                if deadline is not None and (deadline - time.monotonic()) <= 3.0:
                     batch_scores = {}
+                else:
+                    try:
+                        batch_scores = _score_pairs_with_haiku(
+                            config, batch, haiku_complete=haiku_complete, timeout=haiku_timeout,
+                        )
+                        source = "haiku"
+                        any_llm_succeeded = True
+                    except Exception as haiku_error:
+                        logging.warning("Haiku contributor matching fallback unavailable: %s", haiku_error)
+                        batch_scores = {}
         else:
             try:
-                batch_scores = _score_pairs_with_haiku(config, batch, haiku_complete=haiku_complete)
+                batch_scores = _score_pairs_with_haiku(
+                    config, batch, haiku_complete=haiku_complete, timeout=haiku_timeout,
+                )
                 source = "haiku"
                 any_llm_succeeded = True
             except Exception as haiku_error:
@@ -1195,6 +1325,7 @@ def match_community_contributors_with_diagnostics(
     rest_fetcher=None,
     rest_searcher=None,
     skip_github_enrichment: bool = False,
+    deadline: float | None = None,
 ) -> tuple[list[dict], int, list[MatchDetail], MatchDiagnostics]:
     """Resolve community PR authors to LiteLLM Discord guild members with diagnostics."""
     moment = now or datetime.now(UTC)
@@ -1253,12 +1384,19 @@ def match_community_contributors_with_diagnostics(
         pending.append(group)
 
     if members is None and (pending or sqlite_resolved_keys):
+        t_members = time.monotonic()
         guild_members, members_source = load_guild_members_with_source(
             guild,
             loop=loop,
             guild_id=guild_id,
             discord_token=discord_token,
             rest_fetcher=rest_fetcher,
+        )
+        logging.info(
+            "Weekly report: loaded %d Discord members (source=%s) in %.2fs",
+            len(guild_members),
+            members_source,
+            time.monotonic() - t_members,
         )
 
     member_index = _MemberIndex(guild_members)
@@ -1309,8 +1447,10 @@ def match_community_contributors_with_diagnostics(
         repository = getattr(config, "github_repository", "") or ""
         rate_limited = False
         pending_by_login = {g["login"].strip().casefold(): g for g in pending}
+        enrich_deadline = (deadline - 20.0) if deadline is not None else None
+        deadline_tripped = False
 
-        for group in pending:
+        for idx, group in enumerate(pending):
             login = group["login"]
             login_key = login.strip().casefold()
 
@@ -1325,7 +1465,17 @@ def match_community_contributors_with_diagnostics(
                 for p in group.get("pulls", ())
                 if isinstance(p, dict) and isinstance(p.get("number"), int)
             ]
-            if skip_github_enrichment or rate_limited:
+            if enrich_deadline is not None and time.monotonic() >= enrich_deadline:
+                if not deadline_tripped:
+                    deadline_tripped = True
+                    logging.warning(
+                        "Weekly report GitHub enrichment deadline reached after %d/%d pending authors; "
+                        "continuing with deterministic login matching",
+                        idx,
+                        len(pending),
+                    )
+                profile = GitHubAuthorProfile(login=login, user_id=group.get("user_id"))
+            elif skip_github_enrichment or rate_limited:
                 profile = GitHubAuthorProfile(login=login, user_id=group.get("user_id"))
             else:
                 profile, hit_limit = fetch_github_author_profile(
@@ -1337,6 +1487,7 @@ def match_community_contributors_with_diagnostics(
                     getter=github_getter,
                     store=store,
                     now=moment,
+                    deadline=enrich_deadline,
                 )
                 if hit_limit:
                     rate_limited = True
@@ -1360,6 +1511,7 @@ def match_community_contributors_with_diagnostics(
                 ambiguous_candidates,
                 jev_transport=jev_transport,
                 haiku_complete=haiku_complete,
+                deadline=(deadline - 10.0) if deadline is not None else None,
             )
             for login_key, (member, method, confidence) in llm_winners.items():
                 if login_key not in resolved and login_key in pending_by_login:

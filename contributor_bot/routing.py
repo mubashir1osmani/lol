@@ -150,22 +150,29 @@ def call_jev_questions(
     questions: dict,
     api_key: str,
     transport=None,
+    *,
+    timeout: float = 15.0,
 ) -> dict:
     body = json.dumps({"model": model, "state": state, "questions": questions}).encode()
     if transport is not None:
         return transport(body)
     from urllib.request import Request
     from .api import _request_json
-    return _request_json(Request(
-        JEV_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "litellm-contributor-discord-bot",
-        },
-    ))
+    return _request_json(
+        Request(
+            JEV_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "litellm-contributor-discord-bot",
+            },
+        ),
+        attempts=1,
+        timeout=timeout,
+        max_retry_delay=0.0,
+    )
 
 
 def call_jev(model: str, state: str, api_key: str, transport=None) -> dict:
