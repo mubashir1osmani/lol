@@ -687,17 +687,30 @@ class WeeklyTests(unittest.TestCase):
         # Preview must NOT mark the week posted in SQLite.
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", week_key(datetime.now(timezone.utc))))
 
-        # Scheduled weekly post uses the exact same format, SUPPRESS_EMBEDS flag, and allowed_mentions.
+        # Scheduled weekly post fires Friday 10:00 AM America/Toronto to #announcements ("456"),
+        # using the exact same format, SUPPRESS_EMBEDS flag, and allowed_mentions.
         posted = []
-        moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
+        monday_moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github):
+            self.assertIsNone(post_weekly_if_due(
+                config,
+                store,
+                monday_moment,
+                post=lambda ch, _tok, msg: posted.append((ch, msg)),
+                guild=fake_guild,
+            ))
+        self.assertEqual(posted, [])
+
+        friday_moment = datetime(2026, 11, 27, 15, 0, tzinfo=timezone.utc)  # Friday 10:00 AM EST
         with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github):
             post_weekly_if_due(
                 config,
                 store,
-                moment,
+                friday_moment,
                 post=lambda ch, _tok, msg: posted.append((ch, msg)),
                 guild=fake_guild,
             )
+        self.assertEqual([ch for ch, _msg in posted], ["456"] * len(all_chunks))
         self.assertEqual([msg["content"] for _ch, msg in posted], all_chunks)
         for _ch, msg in posted:
             self.assertEqual(msg.get("flags"), SUPPRESS_EMBEDS_FLAG)
@@ -757,7 +770,11 @@ class WeeklyTests(unittest.TestCase):
         })
         self.assertEqual(cfg.discord_guild_id, "333")
         self.assertEqual(cfg.discord_application_id, "444")
-        self.assertEqual(cfg.oss_contributors_channel_id, "123")
+        self.assertEqual(cfg.oss_contributors_channel_id, "")
+        self.assertEqual(cfg.announcements_channel_id, "456")
+        self.assertEqual(cfg.merged_weekday, 4)
+        self.assertEqual(cfg.merged_time, "10:00")
+        self.assertEqual(cfg.merged_timezone, "America/Toronto")
 
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1116,6 +1133,118 @@ class WeeklyTests(unittest.TestCase):
         self.assertIn("<@222222222222222222> - handle timeout (<https://github.com/BerriAI/litellm/pull/502>)", post_text)
         self.assertIn("want to be on next week's list? grab a good first issue: <https://github.com/BerriAI/litellm/issues>", post_text)
         self.assertNotIn("checked 2 contributors", post_text)
+
+    def test_friday_schedule_restart_resilience_channel_resolution_and_lookback(self):
+        from types import SimpleNamespace
+        from contributor_bot.weekly import (
+            build_weekly_report,
+            post_weekly_if_due,
+            reset_org_members_cache,
+            resolve_weekly_channel_id,
+            weekly_lookback_since,
+        )
+
+        reset_org_members_cache()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db_path = str(Path(directory.name) / "roles.db")
+        store = Store(db_path)
+        self.addCleanup(store.close)
+
+        # 1) Channel resolution precedence: OSS_CONTRIBUTORS_CHANNEL_ID > ANNOUNCEMENTS_CHANNEL_ID > #announcements lookup.
+        cfg_oss_override = Config("tok", "123", "456", oss_contributors_channel_id="789", discord_guild_id="333")
+        self.assertEqual(resolve_weekly_channel_id(cfg_oss_override), "789")
+
+        cfg_ann_override = Config("tok", "123", "456", oss_contributors_channel_id="", discord_guild_id="333")
+        self.assertEqual(resolve_weekly_channel_id(cfg_ann_override), "456")
+
+        # Neither channel ID set -> resolves #announcements by name from guild cache.
+        cfg_lookup = Config("tok", "123", "", oss_contributors_channel_id="", discord_guild_id="333")
+        guild_with_channels = SimpleNamespace(
+            id=333,
+            text_channels=[
+                SimpleNamespace(id=9001, name="general", type=0),
+                SimpleNamespace(id=9002, name="announcements", type=5),
+            ],
+            members=[
+                SimpleNamespace(id=111111111111111111, name="alice-dev", global_name=None, nick=None, display_name="alice-dev", bot=False),
+            ],
+            chunked=True,
+        )
+        self.assertEqual(resolve_weekly_channel_id(cfg_lookup, guild=guild_with_channels), "9002")
+
+        # Guild is None -> falls back to Discord REST /guilds/{id}/channels to find #announcements.
+        rest_channels = [
+            {"id": "9003", "name": "announcements", "type": 2},  # voice channel ignored
+            {"id": "9004", "name": "Announcements", "type": 0},
+        ]
+        self.assertEqual(
+            resolve_weekly_channel_id(cfg_lookup, guild=None, channels_fetcher=lambda _gid, _tok: rest_channels),
+            "9004",
+        )
+
+        # 2) Friday-only 10:00 AM America/Toronto (EST = UTC-5 in Nov) + Render restart resilience.
+        queries_seen = []
+
+        def fake_github(url, _token, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            if "/search/issues" in url:
+                queries_seen.append(url)
+                return {
+                    "items": [
+                        {
+                            "number": 801,
+                            "title": "feat: add anthropic batch helper",
+                            "html_url": "https://github.com/BerriAI/litellm/pull/801",
+                            "user": {"login": "alice-dev", "type": "User", "id": 10},
+                            "author_association": "FIRST_TIME_CONTRIBUTOR",
+                        }
+                    ]
+                }
+            return []
+
+        posted = []
+        send = lambda ch, _tok, msg: posted.append((ch, msg))
+
+        # Thursday 10:00 AM Toronto -> must NOT fire.
+        thu = datetime(2026, 11, 26, 15, 0, tzinfo=timezone.utc)
+        # Friday 09:59 AM Toronto (e.g. Render restarted before 10am) -> must NOT fire yet.
+        fri_before = datetime(2026, 11, 27, 14, 59, tzinfo=timezone.utc)
+        # Friday 10:07 AM Toronto (e.g. Render restarted at 10:02am after missing 10:00 sharp) -> MUST fire!
+        fri_after_restart = datetime(2026, 11, 27, 15, 7, tzinfo=timezone.utc)
+        # Friday 10:15 AM Toronto (another Render restart after posting) -> MUST NOT double-post!
+        fri_later = datetime(2026, 11, 27, 15, 15, tzinfo=timezone.utc)
+        # Saturday 10:00 AM Toronto -> must NOT fire.
+        sat = datetime(2026, 11, 28, 15, 0, tzinfo=timezone.utc)
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github):
+            self.assertIsNone(post_weekly_if_due(cfg_lookup, store, thu, post=send, guild=guild_with_channels))
+            self.assertIsNone(post_weekly_if_due(cfg_lookup, store, fri_before, post=send, guild=guild_with_channels))
+            self.assertEqual(posted, [])
+
+            result = post_weekly_if_due(cfg_lookup, store, fri_after_restart, post=send, guild=guild_with_channels)
+            self.assertIsNotNone(result)
+            self.assertEqual(len(posted), 1)
+            self.assertEqual(posted[0][0], "9002")  # resolved #announcements channel!
+            self.assertIn("thank you to this week's contributors 🙏", posted[0][1]["content"])
+            self.assertIn("<@111111111111111111> 🎉 - add anthropic batch helper", posted[0][1]["content"])
+
+            # Simulate a full Render process restart with a fresh Store reading the same SQLite DB.
+            restarted_store = Store(db_path)
+            self.addCleanup(restarted_store.close)
+            self.assertIsNone(post_weekly_if_due(cfg_lookup, restarted_store, fri_later, post=send, guild=guild_with_channels))
+            self.assertIsNone(post_weekly_if_due(cfg_lookup, restarted_store, sat, post=send, guild=guild_with_channels))
+            self.assertEqual(len(posted), 1)
+
+            # 3) Next Friday's lookback window starts at the exact previous Friday post timestamp!
+            next_friday = datetime(2026, 12, 4, 15, 0, tzinfo=timezone.utc)
+            since = weekly_lookback_since(restarted_store, "BerriAI/litellm", next_friday)
+            self.assertEqual(since, fri_after_restart)
+            queries_seen.clear()
+            report_next = build_weekly_report(cfg_lookup, restarted_store, next_friday, guild=guild_with_channels)
+            self.assertEqual(report_next.since, fri_after_restart)
+            self.assertTrue(any("2026-11-27T15%3A07%3A00Z" in q for q in queries_seen))
 
 
 class SampleRoutingTests(unittest.TestCase):

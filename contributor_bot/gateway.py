@@ -234,18 +234,16 @@ def _start_status_rotation_task(discord, client, config: Config) -> None:
 
 
 def _start_weekly_task(discord, client, config, store) -> None:
-    """Fire at the configured local time. The store stops a second post the same week."""
+    """Check every 60s so Render restarts before or after the scheduled minute never miss or double-post."""
     if store is None or not config.merged_weekly_enabled:
         return
-    from datetime import time as clock
-    from zoneinfo import ZoneInfo
     from discord.ext import tasks
     from .weekly import post_weekly_if_due
 
-    hour, minute = (int(part) for part in config.merged_time.split(":", 1))
-    when = clock(hour, minute, tzinfo=ZoneInfo(config.merged_timezone))
+    weekday_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    day_label = weekday_names[config.merged_weekday] if 0 <= config.merged_weekday <= 6 else str(config.merged_weekday)
 
-    @tasks.loop(time=when)
+    @tasks.loop(seconds=60)
     async def merged_weekly_post():
         guild = None
         if config.discord_guild_id and hasattr(client, "get_guild"):
@@ -254,11 +252,20 @@ def _start_weekly_task(discord, client, config, store) -> None:
             except (TypeError, ValueError):
                 guild = None
         loop = asyncio.get_running_loop()
-        await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
+        try:
+            await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
+        except Exception:
+            logging.exception("Weekly merge summary check failed; will retry on next tick")
 
     @merged_weekly_post.before_loop
     async def wait_until_ready():
         await client.wait_until_ready()
+        logging.info(
+            "Weekly contributor summary scheduler active: %s %s %s",
+            day_label,
+            config.merged_time,
+            config.merged_timezone,
+        )
 
     try:
         merged_weekly_post.start()

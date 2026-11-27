@@ -112,7 +112,7 @@ class Config:
     merged_weekly_enabled: bool = True
     oss_contributors_channel_id: str = ""
     maintainer_logins: tuple[str, ...] = ()
-    merged_weekday: int = 0
+    merged_weekday: int = 4
     merged_time: str = "10:00"
     merged_timezone: str = "America/Toronto"
     answers_enabled: bool = True
@@ -243,7 +243,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_trigger_wait_seconds=_bounded_int(values, "REVIEW_TRIGGER_WAIT_SECONDS", 1200, 0, 3600),
         review_trigger_hourly_limit=_bounded_int(values, "REVIEW_TRIGGER_HOURLY_LIMIT", 4, 1, 20),
         merged_weekly_enabled=_flag(values, "MERGED_WEEKLY_ENABLED", True),
-        oss_contributors_channel_id=_optional_channel(values, "OSS_CONTRIBUTORS_CHANNEL_ID") or source,
+        oss_contributors_channel_id=_optional_channel(values, "OSS_CONTRIBUTORS_CHANNEL_ID"),
         maintainer_logins=_logins(values, "MAINTAINER_GITHUB_LOGINS"),
         merged_weekday=_weekday(values),
         merged_time=_clock(values, "MERGED_POST_TIME", "10:00"),
@@ -324,7 +324,7 @@ def _logins(values: dict[str, str], name: str) -> tuple[str, ...]:
 
 def _weekday(values: dict[str, str]) -> int:
     from .weekly import parse_weekday
-    return parse_weekday(values.get("MERGED_POST_WEEKDAY", "monday"))
+    return parse_weekday(values.get("MERGED_POST_WEEKDAY", "friday"))
 
 
 def _clock(values: dict[str, str], name: str, default: str) -> str:

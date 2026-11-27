@@ -584,6 +584,21 @@ class Store:
             ).fetchone()
         return row is not None
 
+    def last_merged_week(self, repository: str) -> dict | None:
+        """Return the most recent posted weekly summary for ``repository``."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT week_key, posted_at
+                FROM merged_weeks
+                WHERE repository = ?
+                ORDER BY posted_at DESC
+                LIMIT 1
+                """,
+                (repository,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def mark_merged_week(self, repository: str, week_key: str, posted_at: str) -> bool:
         """Return False when this week was already recorded."""
         with self._lock:

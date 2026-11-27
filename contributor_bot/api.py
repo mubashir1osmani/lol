@@ -778,6 +778,19 @@ def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
     return channel
 
 
+def fetch_guild_channels(guild_id: str, token: str) -> list[dict[str, Any]]:
+    """List channels in a Discord guild over REST."""
+    if not is_discord_id(guild_id):
+        raise ValueError("Unexpected Discord guild ID")
+    channels = _request_json(Request(
+        f"{DISCORD_API}/guilds/{guild_id}/channels",
+        headers=_discord_headers(token),
+    ))
+    if not isinstance(channels, list):
+        return []
+    return [item for item in channels if isinstance(item, dict)]
+
+
 def fetch_guild_members(
     guild_id: str,
     token: str,
