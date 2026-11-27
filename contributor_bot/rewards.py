@@ -80,16 +80,28 @@ def apply_roles(
     *,
     pr_number: int | None = None,
     shoutout: bool = False,
-) -> None:
-    """Grant any newly earned roles and post one announcement when something is new."""
+    announce: bool = True,
+    lifetime_merged_count: int | None = None,
+) -> list[str]:
+    """Grant any newly earned roles and optionally post one announcement when something is new.
+
+    Returns the list of role keys newly granted during this call.
+    """
     if not config.contributor_roles_enabled:
-        return
-    earned = earned_role_keys(_models(store.pulls_for_author(config.github_repository, github_user_id)))
+        return []
+    rows = store.pulls_for_author(config.github_repository, github_user_id)
+    effective_count = lifetime_merged_count
+    if effective_count is None and rows:
+        cached = store.get_author_merged_count(config.github_repository, rows[-1]["github_login"])
+        if cached is not None:
+            effective_count = int(cached["total_count"])
+    earned = earned_role_keys(_models(rows), lifetime_merged_count=effective_count)
     already = store.grant_keys(discord_id)
     now = iso(datetime.now(UTC))
     # A role Discord refused to add is left unannounced. Skipping the merge
     # shoutout too lets the next attempt post one combined message.
     assignment_blocked = False
+    newly_granted: list[str] = []
     for key in earned:
         if key in already:
             continue
@@ -97,18 +109,23 @@ def apply_roles(
             assignment_blocked = True
             continue
         name = config.role_names.get(key) or DEFAULT_ROLE_NAMES[key]
-        store.record_grant(discord_id, key, name, now)
+        if store.record_grant(discord_id, key, name, now):
+            newly_granted.append(key)
+    if not announce:
+        if newly_granted:
+            store.mark_grants_announced(discord_id, newly_granted, now)
+        return newly_granted
     pending = store.unannounced_grants(discord_id)
     pending.sort(key=lambda grant: _ROLE_ORDER.get(grant["role_key"], len(ROLE_KEYS)))
     if assignment_blocked and not pending:
-        return
+        return newly_granted
     recorded = store.get_pull(config.github_repository, pr_number) if pr_number else None
     want_shoutout = bool(
         shoutout and config.merge_shoutouts_enabled and pr_number
         and recorded and not recorded["shoutout_at"]
     )
     if not pending and not want_shoutout:
-        return
+        return newly_granted
     channel_id = config.role_announcements_channel_id
     names = [grant["role_name"] for grant in pending]
     if not channel_id:
@@ -116,7 +133,7 @@ def apply_roles(
             "ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; not announcing roles for discord user %s",
             discord_id,
         )
-        return
+        return newly_granted
     content = announcement_text(discord_id, names, pr_number if want_shoutout else None)
     try:
         post_message(channel_id, config.discord_token, {
@@ -131,11 +148,12 @@ def apply_roles(
             "The bot needs View Channel and Send Messages there.",
             channel_id, error,
         )
-        return
+        return newly_granted
     if pending:
         store.mark_grants_announced(discord_id, [grant["role_key"] for grant in pending], now)
     if want_shoutout and pr_number:
         store.mark_shoutout(config.github_repository, pr_number, now)
+    return newly_granted
 
 
 def _maybe_invite(config: Config, store: Store, login: str, github_user_id: int, number: int) -> str:

@@ -147,6 +147,21 @@ CREATE TABLE IF NOT EXISTS pr_board_meta (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS roles_poller_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS author_merged_counts (
+    repository TEXT NOT NULL,
+    github_login TEXT NOT NULL,
+    github_user_id INTEGER,
+    total_count INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (repository, github_login)
+);
 """
 
 
@@ -365,6 +380,53 @@ class Store:
                 (repository, github_user_id),
             ).fetchall()
         return [_pull_dict(row) for row in rows]
+
+    def pulls_for_author_login(self, repository: str, github_login: str) -> list[dict]:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM merged_pull_requests
+                WHERE repository = ? AND lower(github_login) = ?
+                ORDER BY merged_at, number
+                """,
+                (repository, key),
+            ).fetchall()
+        return [_pull_dict(row) for row in rows]
+
+    def all_pull_authors(self, repository: str) -> list[dict]:
+        """Return distinct PR authors stored for ``repository``, with latest login and PR count."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    github_user_id,
+                    (
+                        SELECT p2.github_login
+                        FROM merged_pull_requests p2
+                        WHERE p2.repository = p1.repository
+                          AND p2.github_user_id = p1.github_user_id
+                        ORDER BY p2.merged_at DESC, p2.number DESC
+                        LIMIT 1
+                    ) AS github_login,
+                    COUNT(*) AS pull_count
+                FROM merged_pull_requests p1
+                WHERE repository = ?
+                GROUP BY github_user_id
+                ORDER BY github_user_id
+                """,
+                (repository,),
+            ).fetchall()
+        return [
+            {
+                "github_user_id": int(row["github_user_id"]),
+                "github_login": str(row["github_login"]),
+                "pull_count": int(row["pull_count"]),
+            }
+            for row in rows
+        ]
 
     def pull_count(self, repository: str | None = None) -> int:
         with self._lock:
@@ -742,6 +804,22 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def confirmed_match_for_discord(self, discord_id: str) -> dict | None:
+        if not is_discord_id(discord_id):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                FROM github_discord_matches
+                WHERE discord_id = ?
+                ORDER BY matched_at DESC
+                LIMIT 1
+                """,
+                (discord_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_cached_github_user(self, github_login: str) -> dict | None:
         key = (github_login or "").strip().lower()
         if not key:
@@ -886,6 +964,101 @@ class Store:
                 (key, value, updated_at),
             )
             self._conn.commit()
+
+    def get_roles_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM roles_poller_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_roles_meta(self, key: str, value: str, updated_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO roles_poller_meta (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, updated_at),
+            )
+            self._conn.commit()
+
+    def get_author_merged_count(self, repository: str, github_login: str) -> dict | None:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT repository, github_login, github_user_id, total_count, fetched_at
+                FROM author_merged_counts
+                WHERE repository = ? AND github_login = ?
+                """,
+                (repository, key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_author_merged_count(
+        self,
+        repository: str,
+        github_login: str,
+        total_count: int,
+        fetched_at: str,
+        *,
+        github_user_id: int | None = None,
+    ) -> None:
+        key = (github_login or "").strip().lower()
+        if not key or not _LOGIN.fullmatch(key):
+            raise ValueError("Invalid GitHub login")
+        if not isinstance(total_count, int) or total_count < 0:
+            raise ValueError("Invalid merged PR count")
+        uid = github_user_id if isinstance(github_user_id, int) and github_user_id > 0 else None
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO author_merged_counts (
+                    repository, github_login, github_user_id, total_count, fetched_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(repository, github_login) DO UPDATE SET
+                    github_user_id = COALESCE(excluded.github_user_id, author_merged_counts.github_user_id),
+                    total_count = excluded.total_count,
+                    fetched_at = excluded.fetched_at
+                """,
+                (repository, key, uid, total_count, fetched_at),
+            )
+            self._conn.commit()
+
+    def increment_author_merged_count(
+        self,
+        repository: str,
+        github_login: str,
+        delta: int = 1,
+    ) -> int | None:
+        """Increment a cached lifetime merged PR count if present. Returns new total or None."""
+        key = (github_login or "").strip().lower()
+        if not key or delta <= 0:
+            return None
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE author_merged_counts
+                SET total_count = total_count + ?
+                WHERE repository = ? AND github_login = ?
+                """,
+                (delta, repository, key),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = self._conn.execute(
+                "SELECT total_count FROM author_merged_counts WHERE repository = ? AND github_login = ?",
+                (repository, key),
+            ).fetchone()
+            self._conn.commit()
+        return int(row["total_count"]) if row else None
 
     @staticmethod
     def _review_key(repository: str, number: int) -> None:

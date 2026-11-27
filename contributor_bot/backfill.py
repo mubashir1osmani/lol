@@ -104,8 +104,9 @@ def schedule_author_sync(config: Config, store: Store, login: str, github_user_i
 
 
 def backfill_merged_pulls(config: Config) -> None:
-    """Scan historical merged PRs, then evaluate every linked Discord account."""
+    """Scan historical merged PRs, then evaluate linked and auto-matched contributors."""
     store = Store(config.roles_db_path)
+    token = config.effective_github_token
     try:
         cursor = parse_time(config.backfill_since)
         now = datetime.now(UTC)
@@ -116,7 +117,7 @@ def backfill_merged_pulls(config: Config) -> None:
                 numbers = _retry(
                     f"Backfill search {start_iso}..{end_iso}",
                     lambda start=cursor, stop=end: fetch_merged_numbers(
-                        config.github_repository, start, stop, config.github_token,
+                        config.github_repository, start, stop, token,
                     ),
                 )
                 stored = 0
@@ -146,5 +147,10 @@ def backfill_merged_pulls(config: Config) -> None:
         for link in links:
             apply_roles(config, store, link["discord_id"], link["github_user_id"], shoutout=False)
             time.sleep(0.4)
+        # Also evaluate unlinked community PR authors via the automatic Discord matcher
+        # (posting at most one summary line rather than one message per contributor).
+        if not links:
+            from .roles_sync import run_roles_backfill
+            run_roles_backfill(config, store, now=now)
     finally:
         store.close()

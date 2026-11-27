@@ -864,6 +864,40 @@ def fetch_merged_numbers(repository: str, start, end, token: str | None, author:
         page += 1
 
 
+def fetch_author_merged_count(
+    repository: str,
+    author: str,
+    token: str | None,
+    *,
+    timeout: float = 15.0,
+) -> int:
+    """Return an author's lifetime merged PR total_count via a single GitHub search call."""
+    if not author or not re.fullmatch(r"[A-Za-z0-9-]+", author):
+        raise ValueError("Unexpected GitHub login")
+    params = urlencode({
+        "q": f"repo:{repository} is:pr is:merged author:{author}",
+        "per_page": 1,
+    })
+    _pace_github_search(token)
+    payload = _request_json(
+        Request(
+            f"{GITHUB_API}/search/issues?{params}",
+            headers=github_headers(token),
+        ),
+        attempts=2,
+        timeout=timeout,
+        max_retry_delay=5.0,
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("incomplete_results") is True
+        or not isinstance(payload.get("total_count"), int)
+        or payload["total_count"] < 0
+    ):
+        raise TransientAPIError("GitHub search returned an incomplete author merged count")
+    return int(payload["total_count"])
+
+
 def fetch_recent_messages(channel_id: str, token: str, limit: int = 20) -> list[dict[str, Any]]:
     """Newest messages in a channel or thread. One page, no history backfill."""
     if not is_discord_id(channel_id) or not 1 <= limit <= 50:

@@ -22,7 +22,7 @@ from .roles import DEFAULT_ROLE_NAMES, MergedPull, earned_role_keys
 from .schedule import UTC, iso, parse_time
 from .store import Store
 
-SLASH_COMMANDS = [
+OAUTH_SLASH_COMMANDS = [
     {
         "name": "link-github",
         "description": "Link your GitHub account to earn LiteLLM contributor roles",
@@ -35,6 +35,9 @@ SLASH_COMMANDS = [
         "type": 1,
         "dm_permission": False,
     },
+]
+
+ROLE_BASE_SLASH_COMMANDS = [
     {
         "name": "my-prs",
         "description": "Show your open LiteLLM PRs, merged count, and roles",
@@ -42,6 +45,8 @@ SLASH_COMMANDS = [
         "dm_permission": False,
     },
 ]
+
+SLASH_COMMANDS = [*OAUTH_SLASH_COMMANDS, *ROLE_BASE_SLASH_COMMANDS]
 
 _PERM_ADMINISTRATOR = 1 << 3
 _PERM_MANAGE_GUILD = 1 << 5
@@ -53,6 +58,29 @@ _MOD_PERMISSION_MASK = (
     | _PERM_MANAGE_MESSAGES
     | _PERM_MODERATE_MEMBERS
 )
+
+ROLES_BACKFILL_SLASH_COMMANDS = [
+    {
+        "name": "roles-backfill",
+        "description": "Run the time-bounded historical contributor roles backfill",
+        "type": 1,
+        "dm_permission": False,
+        "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
+    },
+]
+
+
+def role_slash_commands(config: Config) -> list[dict]:
+    """Slash commands to register when contributor roles are enabled.
+
+    /link-github and /unlink-github stay hidden unless GitHub OAuth is configured.
+    """
+    if not config.contributor_roles_enabled:
+        return []
+    commands = list(ROLE_BASE_SLASH_COMMANDS) + list(ROLES_BACKFILL_SLASH_COMMANDS)
+    if config.github_oauth_enabled:
+        return list(OAUTH_SLASH_COMMANDS) + commands
+    return commands
 
 # Registered whenever MERGED_WEEKLY_ENABLED=true and DISCORD_GUILD_ID is set.
 MERGED_SLASH_COMMANDS = [
@@ -132,19 +160,41 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
         return _ephemeral("that interaction isn't supported.")
     if payload.get("guild_id") != config.discord_guild_id:
         return _ephemeral("run this in the litellm discord server.")
-    if str(payload.get("application_id") or "") != (config.discord_application_id or ""):
+    if config.discord_application_id and str(payload.get("application_id") or "") != config.discord_application_id:
         return _ephemeral("this command isn't for this bot.")
     user = (payload.get("member") or {}).get("user") or {}
     discord_id = user.get("id")
     if not is_discord_id(discord_id):
         return _ephemeral("couldn't tell who ran that command.")
     name = (payload.get("data") or {}).get("name")
+    app_id = str(payload.get("application_id") or config.discord_application_id or "")
     if name == "link-github":
+        if not config.github_oauth_enabled:
+            return _ephemeral(
+                "github account linking is disabled on this bot; contributor roles are assigned automatically."
+            )
         return _link(config, store, discord_id)
     if name == "unlink-github":
+        if not config.github_oauth_enabled:
+            return _ephemeral(
+                "github account linking is disabled on this bot; contributor roles are assigned automatically."
+            )
         return _unlink(store, discord_id)
     if name == "my-prs":
-        return _my_prs(config, store, discord_id, payload.get("token"))
+        return _my_prs(config, store, discord_id, payload.get("token"), app_id)
+    if name == "roles-backfill":
+        if not is_server_moderator(payload):
+            return _ephemeral("only mods can run this")
+        if not config.contributor_roles_enabled:
+            return _ephemeral("contributor roles are off on this bot.")
+        return _roles_backfill(
+            config,
+            store,
+            payload.get("token"),
+            app_id,
+            guild=payload.get("_guild"),
+            loop=payload.get("_loop"),
+        )
     if name == "merged-this-week":
         if not is_server_moderator(payload):
             return _ephemeral("only mods can run this")
@@ -152,7 +202,7 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
             config,
             store,
             payload.get("token"),
-            application_id=str(payload.get("application_id") or config.discord_application_id or ""),
+            application_id=app_id,
             channel_id=str(payload.get("channel_id") or ""),
             guild=payload.get("_guild"),
             loop=payload.get("_loop"),
@@ -267,29 +317,107 @@ def _unlink(store: Store, discord_id: str) -> dict:
     return _ephemeral("your github isn't linked. run /link-github first.")
 
 
-def _my_prs(config: Config, store: Store, discord_id: str, interaction_token: object) -> dict:
+def _roles_backfill(
+    config: Config,
+    store: Store,
+    interaction_token: object,
+    application_id: str,
+    *,
+    guild=None,
+    loop=None,
+) -> dict:
+    if not isinstance(interaction_token, str) or not interaction_token:
+        return _ephemeral("couldn't open that reply. try /roles-backfill again.")
+    threading.Thread(
+        target=_finish_roles_backfill,
+        args=(config, store, interaction_token, application_id, guild, loop),
+        name="roles-backfill",
+        daemon=True,
+    ).start()
+    return {"type": 5, "data": {"flags": _EPHEMERAL}}
+
+
+def _finish_roles_backfill(
+    config: Config,
+    store: Store,
+    interaction_token: str,
+    application_id: str,
+    guild=None,
+    loop=None,
+) -> None:
+    from .roles_sync import format_backfill_result, run_roles_backfill
+
+    try:
+        result = run_roles_backfill(config, store, guild=guild, loop=loop)
+        content = format_backfill_result(result)
+    except Exception:
+        logging.exception("/roles-backfill failed")
+        content = "contributor roles backfill hit an unexpected error. check logs and try again."
+    try:
+        edit_original_interaction(application_id, interaction_token, {
+            "content": content,
+            "flags": _EPHEMERAL,
+            "allowed_mentions": {"parse": []},
+        })
+    except Exception:
+        logging.exception("Could not send the /roles-backfill follow-up")
+
+
+def _resolved_identity_for_discord(config: Config, store: Store, discord_id: str) -> dict | None:
     link = store.link_for_discord(discord_id)
+    if link:
+        return link
+    matched = store.confirmed_match_for_discord(discord_id)
+    if matched:
+        return {
+            "discord_id": discord_id,
+            "github_login": matched["github_login"],
+            "github_user_id": matched.get("github_user_id"),
+        }
+    for login, mapped_id in (config.github_discord_map or {}).items():
+        if mapped_id == discord_id:
+            return {"discord_id": discord_id, "github_login": login, "github_user_id": None}
+    return None
+
+
+def _my_prs(
+    config: Config,
+    store: Store,
+    discord_id: str,
+    interaction_token: object,
+    application_id: str = "",
+) -> dict:
+    link = _resolved_identity_for_discord(config, store, discord_id)
     if not link:
-        return _ephemeral("your github isn't linked yet. run /link-github to connect it.")
+        if config.github_oauth_enabled:
+            return _ephemeral("your github isn't linked yet. run /link-github to connect it.")
+        return _ephemeral("couldn't match your discord account to a merged litellm github contributor yet.")
     if not isinstance(interaction_token, str):
         return _ephemeral("couldn't open that reply. try /my-prs again.")
+    resolved_app_id = application_id or (config.discord_application_id or "")
     threading.Thread(
         target=_finish_my_prs,
-        args=(config, store, link, interaction_token),
+        args=(config, store, link, interaction_token, resolved_app_id),
         name="my-prs",
         daemon=True,
     ).start()
     return {"type": 5, "data": {"flags": _EPHEMERAL}}
 
 
-def _finish_my_prs(config: Config, store: Store, link: dict, interaction_token: str) -> None:
+def _finish_my_prs(
+    config: Config,
+    store: Store,
+    link: dict,
+    interaction_token: str,
+    application_id: str = "",
+) -> None:
     try:
         content = my_prs_content(config, store, link)
     except Exception:
         logging.exception("my-prs failed for discord user %s", link.get("discord_id"))
         content = "couldn't load your prs just now. try again in a minute."
     try:
-        edit_original_interaction(config.discord_application_id or "", interaction_token, {
+        edit_original_interaction(application_id or (config.discord_application_id or ""), interaction_token, {
             "content": content,
             "allowed_mentions": {"parse": []},
         })
@@ -298,14 +426,20 @@ def _finish_my_prs(config: Config, store: Store, link: dict, interaction_token: 
 
 
 def my_prs_content(config: Config, store: Store, link: dict) -> str:
-    rows = store.pulls_for_author(config.github_repository, link["github_user_id"])
+    github_user_id = link.get("github_user_id")
+    if isinstance(github_user_id, int) and github_user_id > 0:
+        rows = store.pulls_for_author(config.github_repository, github_user_id)
+    else:
+        rows = store.pulls_for_author_login(config.github_repository, link["github_login"])
     models = [
         MergedPull(int(row["number"]), parse_time(row["merged_at"]), tuple(row["labels"]), tuple(row["files"]))
         for row in rows
     ]
+    cached_count = store.get_author_merged_count(config.github_repository, link["github_login"])
+    lifetime_count = int(cached_count["total_count"]) if cached_count is not None else None
     names = [
         config.role_names.get(key) or DEFAULT_ROLE_NAMES[key]
-        for key in earned_role_keys(models)
+        for key in earned_role_keys(models, lifetime_merged_count=lifetime_count)
     ]
     open_prs: list[dict] = []
     open_total = None
@@ -319,8 +453,9 @@ def my_prs_content(config: Config, store: Store, link: dict) -> str:
     except (TransientAPIError, RuntimeError, ValueError):
         logging.warning("Open PR lookup failed for %s", link["github_login"])
         open_error = True
+    merged_display_count = max(len(rows), lifetime_count or 0)
     return my_prs_text(
-        link["github_login"], open_prs, open_total, len(rows), names, open_error=open_error,
+        link["github_login"], open_prs, open_total, merged_display_count, names, open_error=open_error,
     )
 
 

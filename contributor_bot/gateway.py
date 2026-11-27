@@ -21,6 +21,7 @@ from .interactions import (
     REVIEW_SLASH_COMMANDS,
     SLASH_COMMANDS,
     handle_interaction,
+    role_slash_commands,
 )
 from .review_job import handle_channel_message, handle_thread_message
 from .store import Store
@@ -452,7 +453,7 @@ def commands_for_guild(config: Config) -> list[dict]:
     """Slash commands the gateway syncs to the guild. Empty means do not sync."""
     commands = []
     if config.contributor_roles_enabled:
-        commands.extend(SLASH_COMMANDS)
+        commands.extend(role_slash_commands(config))
     if config.pr_review_enabled:
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
@@ -630,6 +631,7 @@ def _interaction_payload(interaction, *, guild=None, loop=None) -> dict:
 _DEFERRED_COMMAND_EPHEMERAL = {
     "merged-this-week": True,
     "my-prs": True,
+    "roles-backfill": True,
 }
 
 
@@ -705,11 +707,13 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
         tree.command(name=spec["name"], description=spec["description"], guild=guild)(wrapped)
 
     if config.contributor_roles_enabled:
-        for spec in SLASH_COMMANDS:
+        for spec in role_slash_commands(config):
             async def callback(interaction):
                 await _dispatch_command(discord, interaction, config, store, client=client)
 
             callback.__name__ = spec["name"].replace("-", "_")
+            if spec.get("default_member_permissions"):
+                callback = app.default_permissions(manage_messages=True)(callback)
             add(spec, callback)
     if config.pr_review_enabled:
         recheck_spec = next(spec for spec in REVIEW_SLASH_COMMANDS if spec["name"] == "recheck")
