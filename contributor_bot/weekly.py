@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
@@ -25,7 +25,6 @@ _WEEKDAYS = {
 WEEKLY_CHUNK_LIMIT = 1900
 SUPPRESS_EMBEDS_FLAG = 1 << 2  # Discord message flag: SUPPRESS_EMBEDS (4)
 WEEKLY_HEADER = "thank you to this week's contributors 🙏"
-GOOD_FIRST_ISSUE_LABEL = "good first issue"
 
 COMMUNITY_AUTHOR_ASSOCIATIONS = frozenset({"CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"})
 EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
@@ -33,7 +32,6 @@ EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
 ORG_MEMBERS_CACHE_TTL_SECONDS = 3600.0
 _org_cache_lock = threading.Lock()
 _org_members_cache: dict[str, tuple[frozenset[str], float]] = {}
-_label_cache: dict[tuple[str, str], tuple[bool, float]] = {}
 
 _MENTION_ID = re.compile(r"<@([1-9][0-9]{0,19})>")
 _LEADING_BRACKET_TAG = re.compile(r"^\s*\[[^\]]{1,40}\]\s*")
@@ -98,7 +96,6 @@ def reset_org_members_cache() -> None:
     """Test helper."""
     with _org_cache_lock:
         _org_members_cache.clear()
-        _label_cache.clear()
 
 
 class WeeklyFetchError(RuntimeError):
@@ -189,45 +186,8 @@ def fetch_org_public_members(
     return result
 
 
-def has_repo_label(
-    repository: str,
-    label: str,
-    token: str | None,
-    *,
-    ttl_seconds: float = ORG_MEMBERS_CACHE_TTL_SECONDS,
-    clock=time.monotonic,
-) -> bool:
-    """Return True when ``label`` exists on ``repository`` (cached with TTL)."""
-    repo_key = (repository or "").strip().lower()
-    label_key = (label or "").strip().lower()
-    if not repo_key or not label_key:
-        return False
-    now = clock()
-    with _org_cache_lock:
-        cached = _label_cache.get((repo_key, label_key))
-        if cached is not None and now < cached[1]:
-            return cached[0]
-    exists = False
-    try:
-        encoded = quote(label, safe="")
-        payload = github_get_json(
-            f"{GITHUB_API}/repos/{repository}/labels/{encoded}",
-            token,
-            pace=False,
-        )
-        exists = isinstance(payload, dict) and isinstance(payload.get("name"), str) and bool(payload["name"])
-    except Exception as error:
-        logging.info("Label %r check on %s fell back to plain issues URL: %s", label, repository, error)
-        exists = False
-    with _org_cache_lock:
-        _label_cache[(repo_key, label_key)] = (exists, now + ttl_seconds)
-    return exists
-
-
-def good_first_issue_url(repository: str, token: str | None) -> str:
+def good_first_issue_url(repository: str, _token: str | None = None) -> str:
     repo = (repository or "BerriAI/litellm").strip()
-    if has_repo_label(repo, GOOD_FIRST_ISSUE_LABEL, token):
-        return f"https://github.com/{repo}/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22"
     return f"https://github.com/{repo}/issues"
 
 

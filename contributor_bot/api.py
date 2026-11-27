@@ -80,7 +80,6 @@ def _github_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(check_run + r"/annotations", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/contents(?:/[^/]+)+", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/pulls", path)
-        or re.fullmatch(rf"/repos/{_OWNER_REPO}/labels/[^/]+", path)
         or re.fullmatch(r"/orgs/[A-Za-z0-9._-]+/public_members", path)
         or re.fullmatch(r"/users/[A-Za-z0-9-]+", path)
         or path in {"/search/issues", "/search/code", "/user"}

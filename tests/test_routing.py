@@ -165,7 +165,6 @@ class WeeklyTests(unittest.TestCase):
         text = render_weekly(
             groups,
             since=datetime(2026, 11, 19, tzinfo=timezone.utc),
-            issues_url="https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22",
         )
         self.assertTrue(text.startswith("thank you to this week's contributors 🙏\n\n"))
         self.assertIn(
@@ -174,8 +173,8 @@ class WeeklyTests(unittest.TestCase):
             text,
         )
         self.assertTrue(text.endswith(
-            '\n\nwant to be on next week\'s list? grab a good first issue: '
-            '<https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22>'
+            "\n\nwant to be on next week's list? grab a good first issue: "
+            "<https://github.com/BerriAI/litellm/issues>"
         ))
         self.assertNotIn("octocat", text)
         self.assertNotIn("newbie", text)
@@ -497,7 +496,7 @@ class WeeklyTests(unittest.TestCase):
             groups,
             since=datetime(2026, 11, 20, tzinfo=timezone.utc),
             summaries=summaries,
-            issues_url="https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22",
+            issues_url=good_first_issue_url("BerriAI/litellm"),
         )
         self.assertEqual(len(chunks), 1)
         expected = (
@@ -505,23 +504,11 @@ class WeeklyTests(unittest.TestCase):
             "<@935715497901707324> 🎉 - fix gemini tool call argument parsing (<https://github.com/BerriAI/litellm/pull/50020>)\n"
             "<@409084113006493706> - log requests blocked by guardrails (<https://github.com/BerriAI/litellm/pull/51014>), "
             "clarify proxy timeout config (<https://github.com/BerriAI/litellm/pull/51015>)\n\n"
-            'want to be on next week\'s list? grab a good first issue: '
-            '<https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22>'
+            "want to be on next week's list? grab a good first issue: "
+            "<https://github.com/BerriAI/litellm/issues>"
         )
         self.assertEqual(chunks[0], expected)
-
-        # Label lookup: returns filtered URL when label exists, falls back to plain /issues on 404.
-        with mock.patch("contributor_bot.weekly.github_get_json", return_value={"name": "good first issue"}) as getter:
-            url1 = good_first_issue_url("BerriAI/litellm", None)
-            url2 = good_first_issue_url("BerriAI/litellm", None)
-        self.assertEqual(url1, 'https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22')
-        self.assertEqual(url2, url1)
-        self.assertEqual(getter.call_count, 1)
-
-        reset_org_members_cache()
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=RuntimeError("api.github.com returned HTTP 404")):
-            fallback_url = good_first_issue_url("BerriAI/litellm", None)
-        self.assertEqual(fallback_url, "https://github.com/BerriAI/litellm/issues")
+        self.assertEqual(good_first_issue_url("BerriAI/litellm"), "https://github.com/BerriAI/litellm/issues")
 
         # First-time contributor detection via prior merged PR count (when GitHub flips association to CONTRIBUTOR on merge).
         from contributor_bot.weekly import _mark_first_time_contributors
@@ -692,7 +679,10 @@ class WeeklyTests(unittest.TestCase):
         self.assertEqual(len(contributor_lines), 22)
         # Half of the 22 contributors are FIRST_TIME_CONTRIBUTOR and get the 🎉 badge.
         self.assertEqual(sum(1 for line in contributor_lines if " 🎉 - " in line), 11)
-        self.assertIn("want to be on next week's list? grab a good first issue:", all_chunks[-1])
+        self.assertIn(
+            "want to be on next week's list? grab a good first issue: <https://github.com/BerriAI/litellm/issues>",
+            all_chunks[-1],
+        )
         # Preview must NOT mark the week posted in SQLite.
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", week_key(datetime.now(timezone.utc))))
 
