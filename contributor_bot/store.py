@@ -10,6 +10,7 @@ placeholders from ``?`` to ``%s``, and translate ``INSERT OR IGNORE`` to
 """
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -106,6 +107,7 @@ CREATE TABLE IF NOT EXISTS merged_weeks (
     repository TEXT NOT NULL,
     week_key TEXT NOT NULL,
     posted_at TEXT NOT NULL,
+    via TEXT NOT NULL DEFAULT 'scheduler',
     PRIMARY KEY (repository, week_key)
 );
 
@@ -153,6 +155,27 @@ class Store:
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(review_threads)")}
             if columns and "last_followup_at" not in columns:
                 self._conn.execute("ALTER TABLE review_threads ADD COLUMN last_followup_at TEXT")
+            mw_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(merged_weeks)")}
+            if mw_columns and "via" not in mw_columns:
+                self._conn.execute("ALTER TABLE merged_weeks ADD COLUMN via TEXT NOT NULL DEFAULT 'scheduler'")
+            # One-time recovery for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
+            bad_rows = self._conn.execute(
+                "SELECT repository, week_key, posted_at FROM merged_weeks "
+                "WHERE week_key = '2026-W48' AND (posted_at LIKE '2026-11-27T20:34:06%' OR via = 'manual_preview')",
+            ).fetchall()
+            if bad_rows:
+                self._conn.execute(
+                    "DELETE FROM merged_weeks "
+                    "WHERE week_key = '2026-W48' AND (posted_at LIKE '2026-11-27T20:34:06%' OR via = 'manual_preview')",
+                )
+                for row in bad_rows:
+                    logging.info(
+                        "Cleared bogus ephemeral-preview merged_weeks entry for %s %s (posted_at=%s) "
+                        "so scheduled post can run",
+                        row["repository"],
+                        row["week_key"],
+                        row["posted_at"],
+                    )
             self._conn.commit()
         if path != ":memory:":
             os.chmod(path, 0o600)
@@ -590,10 +613,10 @@ class Store:
         return self.merged_week_info(repository, week_key) is not None
 
     def merged_week_info(self, repository: str, week_key: str) -> dict | None:
-        """Return ``{"week_key", "posted_at"}`` if this week was already recorded."""
+        """Return ``{"week_key", "posted_at", "via"}`` if this week was already recorded."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT week_key, posted_at FROM merged_weeks WHERE repository = ? AND week_key = ?",
+                "SELECT week_key, posted_at, via FROM merged_weeks WHERE repository = ? AND week_key = ?",
                 (repository, week_key),
             ).fetchone()
         return dict(row) if row else None
@@ -613,7 +636,7 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT week_key, posted_at
+                SELECT week_key, posted_at, via
                 FROM merged_weeks
                 WHERE repository = ?
                 ORDER BY posted_at DESC
@@ -623,16 +646,23 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
-    def mark_merged_week(self, repository: str, week_key: str, posted_at: str) -> bool:
+    def mark_merged_week(
+        self,
+        repository: str,
+        week_key: str,
+        posted_at: str,
+        *,
+        via: str = "scheduler",
+    ) -> bool:
         """Return False when this week was already recorded."""
         with self._lock:
             cursor = self._conn.execute(
                 """
-                INSERT INTO merged_weeks (repository, week_key, posted_at)
-                VALUES (?, ?, ?)
+                INSERT INTO merged_weeks (repository, week_key, posted_at, via)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(repository, week_key) DO NOTHING
                 """,
-                (repository, week_key, posted_at),
+                (repository, week_key, posted_at, via),
             )
             self._conn.commit()
             return cursor.rowcount == 1
