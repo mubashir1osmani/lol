@@ -110,7 +110,11 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         rf"/api/v10/channels/{_SNOWFLAKE}/messages/{_SNOWFLAKE}", path
     ):
         return True
-    if method == "GET" and re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/channels", path):
+    if method == "GET" and (
+        re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/channels", path)
+        or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/members", path)
+        or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/members/search", path)
+    ):
         return True
     # Add an existing role to a member. Creating roles, editing members, and
     # removing roles stay blocked.
@@ -772,6 +776,82 @@ def fetch_channel(channel_id: str, token: str) -> dict[str, Any]:
     if not isinstance(channel, dict) or channel.get("id") != channel_id:
         raise RuntimeError("Discord returned an unexpected channel response")
     return channel
+
+
+def fetch_guild_channels(guild_id: str, token: str) -> list[dict[str, Any]]:
+    """List channels in a Discord guild over REST."""
+    if not is_discord_id(guild_id):
+        raise ValueError("Unexpected Discord guild ID")
+    channels = _request_json(Request(
+        f"{DISCORD_API}/guilds/{guild_id}/channels",
+        headers=_discord_headers(token),
+    ))
+    if not isinstance(channels, list):
+        return []
+    return [item for item in channels if isinstance(item, dict)]
+
+
+def fetch_guild_members(
+    guild_id: str,
+    token: str,
+    *,
+    max_pages: int = 50,
+) -> list[dict[str, Any]]:
+    """List guild members over Discord REST (1,000 per page).
+
+    Works whenever Server Members Intent is enabled in the Discord Developer
+    Portal, even if the gateway client connected without intents.members or the
+    interaction arrived over HTTP with no gateway guild object.
+    """
+    if not is_discord_id(guild_id):
+        raise ValueError("Unexpected Discord guild ID")
+    collected: list[dict[str, Any]] = []
+    after = "0"
+    for _page in range(max_pages):
+        params = urlencode({"limit": 1000, "after": after})
+        batch = _request_json(Request(
+            f"{DISCORD_API}/guilds/{guild_id}/members?{params}",
+            headers=_discord_headers(token),
+        ))
+        if not isinstance(batch, list) or not batch:
+            break
+        last_id = None
+        for item in batch:
+            if not isinstance(item, dict):
+                continue
+            collected.append(item)
+            user = item.get("user") if isinstance(item.get("user"), dict) else {}
+            uid = user.get("id")
+            if isinstance(uid, str) and is_discord_id(uid):
+                last_id = uid
+        if len(batch) < 1000 or not last_id or last_id == after:
+            break
+        after = last_id
+    return collected
+
+
+def search_guild_members(
+    guild_id: str,
+    query: str,
+    token: str,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Search guild members by username/nickname prefix over REST (no members intent needed)."""
+    if not is_discord_id(guild_id):
+        raise ValueError("Unexpected Discord guild ID")
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return []
+    bounded = max(1, min(int(limit), 100))
+    params = urlencode({"query": cleaned[:32], "limit": bounded})
+    payload = _request_json(Request(
+        f"{DISCORD_API}/guilds/{guild_id}/members/search?{params}",
+        headers=_discord_headers(token),
+    ))
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
 
 
 def add_reaction(channel_id: str, message_id: str, emoji: str, token: str) -> None:

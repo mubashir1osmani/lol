@@ -1,4 +1,4 @@
-"""Monday summary of community pull requests merged in the last seven days."""
+"""Friday summary of community pull requests merged since the previous Friday post."""
 
 import json
 import logging
@@ -11,11 +11,11 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
+from .api import GITHUB_API, TransientAPIError, fetch_guild_channels, github_get_json, post_message
 from .config import is_discord_id
-from .matcher import MatchDetail, match_community_contributors
+from .matcher import MatchDetail, MatchDiagnostics, match_community_contributors_with_diagnostics
 from .routing import FAST_MODEL
-from .schedule import UTC, iso
+from .schedule import UTC, iso, parse_time
 
 _WEEKDAYS = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -25,6 +25,9 @@ _WEEKDAYS = {
 WEEKLY_CHUNK_LIMIT = 1900
 SUPPRESS_EMBEDS_FLAG = 1 << 2  # Discord message flag: SUPPRESS_EMBEDS (4)
 WEEKLY_HEADER = "thank you to this week's contributors 🙏"
+DEFAULT_WEEKLY_CHANNEL_NAME = "announcements"
+_POSTABLE_CHANNEL_TYPES = frozenset({0, 5})  # GUILD_TEXT, GUILD_ANNOUNCEMENT
+WEEKLY_LOOKBACK_MAX_DAYS = 14
 
 COMMUNITY_AUTHOR_ASSOCIATIONS = frozenset({"CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"})
 EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
@@ -90,6 +93,7 @@ class WeeklyReport:
     rate_limited: bool = False
     match_details: tuple[MatchDetail, ...] = ()
     issues_url: str = ""
+    diagnostics: MatchDiagnostics | None = None
 
 
 def reset_org_members_cache() -> None:
@@ -107,10 +111,93 @@ class WeeklyFetchError(RuntimeError):
 
 
 def parse_weekday(value: str) -> int:
-    key = (value or "monday").strip().lower()
+    key = (value or "friday").strip().lower()
     if key not in _WEEKDAYS:
         raise ValueError("MERGED_POST_WEEKDAY must be a weekday name")
     return _WEEKDAYS[key]
+
+
+def _channel_type_int(channel) -> int | None:
+    raw = channel.get("type") if isinstance(channel, dict) else getattr(channel, "type", None)
+    val = getattr(raw, "value", raw)
+    return val if isinstance(val, int) and not isinstance(val, bool) else None
+
+
+def _channel_name_matches(channel, target_name: str) -> str | None:
+    name = channel.get("name") if isinstance(channel, dict) else getattr(channel, "name", None)
+    if not isinstance(name, str) or name.strip().lower() != target_name:
+        return None
+    ctype = _channel_type_int(channel)
+    if ctype is not None and ctype not in _POSTABLE_CHANNEL_TYPES:
+        return None
+    cid = channel.get("id") if isinstance(channel, dict) else getattr(channel, "id", None)
+    cid_str = str(cid) if cid is not None else ""
+    return cid_str if is_discord_id(cid_str) else None
+
+
+def resolve_weekly_channel_id(
+    config,
+    *,
+    guild=None,
+    channels_fetcher=None,
+    channel_name: str = DEFAULT_WEEKLY_CHANNEL_NAME,
+) -> str | None:
+    """Resolve the weekly post channel.
+
+    Precedence:
+    1. Explicit OSS_CONTRIBUTORS_CHANNEL_ID override (when set)
+    2. Explicit ANNOUNCEMENTS_CHANNEL_ID override (when set)
+    3. Guild text/announcement channel named 'announcements' (cache, then REST)
+    """
+    for override in (
+        getattr(config, "oss_contributors_channel_id", "") or "",
+        getattr(config, "announcements_channel_id", "") or "",
+    ):
+        cleaned = str(override).strip()
+        if is_discord_id(cleaned):
+            return cleaned
+
+    target = (channel_name or DEFAULT_WEEKLY_CHANNEL_NAME).strip().lower()
+    if guild is not None:
+        for attr in ("text_channels", "channels"):
+            for channel in getattr(guild, attr, ()) or ():
+                found = _channel_name_matches(channel, target)
+                if found:
+                    return found
+
+    guild_id = getattr(config, "discord_guild_id", None) or (str(getattr(guild, "id", "")) if guild is not None else "")
+    token = getattr(config, "discord_token", None) or ""
+    if is_discord_id(str(guild_id)) and token:
+        fetcher = channels_fetcher or fetch_guild_channels
+        try:
+            for channel in fetcher(str(guild_id), token) or ():
+                found = _channel_name_matches(channel, target)
+                if found:
+                    return found
+        except Exception as error:
+            logging.warning("Could not resolve #%s via guild channels REST lookup: %s", target, error)
+    return None
+
+
+def weekly_lookback_since(store, repository: str, moment: datetime) -> datetime:
+    """Cover the week since the previous Friday post, defaulting to 7 days."""
+    default_since = moment - timedelta(days=7)
+    if store is None or not repository or not hasattr(store, "last_merged_week"):
+        return default_since
+    try:
+        last = store.last_merged_week(repository)
+    except Exception:
+        return default_since
+    if not last or not isinstance(last.get("posted_at"), str):
+        return default_since
+    try:
+        previous = parse_time(last["posted_at"])
+    except Exception:
+        return default_since
+    elapsed = moment - previous
+    if timedelta(hours=1) <= elapsed <= timedelta(days=WEEKLY_LOOKBACK_MAX_DAYS):
+        return previous
+    return default_since
 
 
 def week_key(moment: datetime) -> str:
@@ -539,14 +626,14 @@ def _search_merged_pages(
     pace: bool = False,
     max_pages: int = 5,
 ) -> tuple[list[dict], bool]:
-    day = since.astimezone(UTC).date().isoformat()
+    cutoff = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     found = []
     seen_numbers: set[int] = set()
     rate_limited = False
     page = 1
     while page <= max_pages:
         params = urlencode({
-            "q": f"repo:{repository} is:pr is:merged merged:>={day}",
+            "q": f"repo:{repository} is:pr is:merged merged:>={cutoff}",
             "sort": "updated",
             "order": "desc",
             "per_page": 100,
@@ -657,6 +744,7 @@ def build_weekly_report(
     store,
     now: datetime | None = None,
     *,
+    since: datetime | None = None,
     guild=None,
     loop=None,
     pace: bool = False,
@@ -666,13 +754,15 @@ def build_weekly_report(
     jev_transport=None,
     haiku_complete=None,
     title_summarizer=None,
+    rest_fetcher=None,
+    rest_searcher=None,
 ) -> WeeklyReport:
     moment = now or datetime.now(UTC)
-    since = moment - timedelta(days=7)
+    window_since = since if since is not None else weekly_lookback_since(store, config.github_repository, moment)
     token = config.github_token or getattr(config, "github_actor_token", None)
     org = config.github_repository.split("/", 1)[0] if "/" in config.github_repository else ""
     org_members = fetch_org_public_members(org, token) if org else frozenset()
-    rows, rate_limited = _search_merged_pages(config.github_repository, since, token, pace=pace)
+    rows, rate_limited = _search_merged_pages(config.github_repository, window_since, token, pace=pace)
     raw_groups = community_groups(
         rows,
         config.maintainer_logins,
@@ -680,7 +770,7 @@ def build_weekly_report(
         org_members=org_members,
         org=org,
     )
-    matched, skipped, details = match_community_contributors(
+    matched, skipped, details, diagnostics = match_community_contributors_with_diagnostics(
         raw_groups,
         config,
         store,
@@ -691,13 +781,17 @@ def build_weekly_report(
         github_getter=github_get_json,
         jev_transport=jev_transport,
         haiku_complete=haiku_complete,
+        rest_fetcher=rest_fetcher,
+        rest_searcher=rest_searcher,
     )
     if matched and not rate_limited:
         matched = _mark_first_time_contributors(matched, config.github_repository, token)
     logging.info(
-        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped",
+        "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped (members=%d source=%s)",
         len(matched),
         skipped,
+        diagnostics.member_count,
+        diagnostics.members_source,
     )
     summaries = summarize_pr_titles(config, matched, summarizer=title_summarizer) if matched else {}
     issues_url = good_first_issue_url(config.github_repository, token) if matched else ""
@@ -706,7 +800,7 @@ def build_weekly_report(
         note = "(stopped early because of github search rate limits; set GITHUB_TOKEN for higher limits.)"
     chunks = weekly_chunks(
         matched,
-        since=since,
+        since=window_since,
         limit=limit,
         max_chunks=max_chunks,
         note=note,
@@ -717,10 +811,11 @@ def build_weekly_report(
         chunks=chunks,
         matched_count=len(matched),
         skipped_count=skipped,
-        since=since,
+        since=window_since,
         rate_limited=rate_limited,
         match_details=tuple(details),
         issues_url=issues_url,
+        diagnostics=diagnostics,
     )
 
 
@@ -761,8 +856,15 @@ def post_weekly_if_due(
     post=None,
     guild=None,
     loop=None,
+    channels_fetcher=None,
 ) -> str | None:
-    """Post this week's summary once. Return the text when a new post is made."""
+    """Post this week's summary once on the configured weekday/time.
+
+    Safe across process restarts:
+    - Before the scheduled time: returns None.
+    - At or after the scheduled time on the target weekday: posts once and
+      persists ``week_key`` in SQLite so later restarts never double-post.
+    """
     if not config.merged_weekly_enabled:
         return None
     moment = now or datetime.now(UTC)
@@ -773,9 +875,9 @@ def post_weekly_if_due(
         key if store.merged_week_posted(config.github_repository, key) else None,
     ):
         return None
-    channel = config.oss_contributors_channel_id or config.contributions_channel_id
+    channel = resolve_weekly_channel_id(config, guild=guild, channels_fetcher=channels_fetcher)
     if not channel:
-        logging.warning("Weekly merge summary skipped: no destination channel configured")
+        logging.warning("Weekly merge summary skipped: no destination channel configured or #announcements found")
         return None
     report = build_weekly_report(
         config,
@@ -785,7 +887,17 @@ def post_weekly_if_due(
         loop=loop,
         pace=True,
     )
+    if report.matched_count == 0:
+        diag = report.diagnostics.summary_line() if report.diagnostics is not None else ""
+        logging.warning("Weekly merge summary skipped: 0 discord-matched contributors %s", diag)
+        # If guild members were actually loaded and truly 0 matched, record the week so
+        # the 60s scheduler does not re-query GitHub every minute. If 0 members were
+        # loaded (transient outage), leave unmarked so the next tick retries.
+        if report.diagnostics is not None and report.diagnostics.member_count > 0:
+            store.mark_merged_week(config.github_repository, key, iso(moment))
+        return None
     sender = post or post_message
+    recorded = False
     for chunk in report.chunks:
         users = chunk_mention_user_ids(chunk)
         sender(channel, config.discord_token, {
@@ -793,6 +905,9 @@ def post_weekly_if_due(
             "flags": SUPPRESS_EMBEDS_FLAG,
             "allowed_mentions": {"parse": [], "users": users},
         })
-    if not store.mark_merged_week(config.github_repository, key, iso(moment)):
-        logging.info("Weekly merge summary for %s was already recorded", key)
+        if not recorded:
+            recorded = True
+            if not store.mark_merged_week(config.github_repository, key, iso(moment)):
+                logging.info("Weekly merge summary for %s was already recorded", key)
+    logging.info("Posted weekly merge summary for %s to channel %s (%d chunks)", key, channel, len(report.chunks))
     return "\n\n".join(report.chunks)
