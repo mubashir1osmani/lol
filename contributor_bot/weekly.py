@@ -1,17 +1,20 @@
 """Monday summary of community pull requests merged in the last seven days."""
 
+import json
 import logging
+import os
 import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from .api import GITHUB_API, TransientAPIError, github_get_json, post_message
 from .config import is_discord_id
 from .matcher import MatchDetail, match_community_contributors
+from .routing import FAST_MODEL
 from .schedule import UTC, iso
 
 _WEEKDAYS = {
@@ -20,11 +23,9 @@ _WEEKDAYS = {
 }
 
 WEEKLY_CHUNK_LIMIT = 1900
-WEEKLY_PREVIEW_MAX_CHUNKS = 5
-WEEKLY_POST_MAX_CHUNKS = 10
-WEEKLY_MAX_CONTRIBUTORS = 15
-WEEKLY_MAX_PRS_PER_LINE = 3
 SUPPRESS_EMBEDS_FLAG = 1 << 2  # Discord message flag: SUPPRESS_EMBEDS (4)
+WEEKLY_HEADER = "thank you to this week's contributors 🙏"
+GOOD_FIRST_ISSUE_LABEL = "good first issue"
 
 COMMUNITY_AUTHOR_ASSOCIATIONS = frozenset({"CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"})
 EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
@@ -32,8 +33,54 @@ EXCLUDED_AUTHOR_ASSOCIATIONS = frozenset({"MEMBER", "OWNER", "COLLABORATOR"})
 ORG_MEMBERS_CACHE_TTL_SECONDS = 3600.0
 _org_cache_lock = threading.Lock()
 _org_members_cache: dict[str, tuple[frozenset[str], float]] = {}
+_label_cache: dict[tuple[str, str], tuple[bool, float]] = {}
 
 _MENTION_ID = re.compile(r"<@([1-9][0-9]{0,19})>")
+_LEADING_BRACKET_TAG = re.compile(r"^\s*\[[^\]]{1,40}\]\s*")
+_TICKET_PREFIX = re.compile(r"^\s*(?:[A-Z]{2,12}-[0-9]+|GH-[0-9]+|#[0-9]+)\s*[:\-–—]?\s*", re.IGNORECASE)
+_CONVENTIONAL_PREFIX = re.compile(
+    r"^\s*(feat|feature|fix|bugfix|bug|chore|docs|doc|refactor|perf|test|tests|ci|build|style|revert)"
+    r"(?:\(([^)]{1,40})\))?\s*!?\s*:\s*",
+    re.IGNORECASE,
+)
+_TRAILING_REF = re.compile(
+    r"(?:\s*\((?:(?:fix(?:es)?|close[sd]?|resolve[sd]?)\s+)?#[0-9]+\)|\s*\[#[0-9]+\]|\s+(?:fix(?:es)?|close[sd]?|resolve[sd]?)\s+#[0-9]+)+\s*$",
+    re.IGNORECASE,
+)
+_INLINE_TICKET = re.compile(r"\b[A-Z]{2,12}-[0-9]+\b")
+_DISALLOWED_MENTIONS = re.compile(r"<@[!&]?[0-9]+>|@(?:everyone|here)", re.IGNORECASE)
+_MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+
+_LEADING_VERBS = frozenset({
+    "add", "allow", "avoid", "bump", "cache", "check", "clean", "cleanup", "close",
+    "convert", "correct", "create", "default", "defer", "delete", "disable", "drop",
+    "emit", "enable", "enforce", "ensure", "expose", "extract", "fall", "fallback",
+    "fetch", "filter", "fix", "format", "forward", "guard", "handle", "ignore",
+    "implement", "improve", "include", "init", "initialize", "inject", "keep",
+    "limit", "load", "log", "make", "map", "merge", "migrate", "move", "normalize",
+    "parse", "pass", "persist", "populate", "preserve", "prevent", "prune", "raise",
+    "read", "record", "reduce", "refactor", "register", "reject", "relay", "release",
+    "remove", "rename", "render", "replace", "report", "require", "reset", "resolve",
+    "respect", "restore", "retry", "return", "rewrite", "route", "run", "sanitize",
+    "save", "send", "set", "show", "simplify", "skip", "sort", "split", "stop",
+    "stream", "strip", "support", "switch", "sync", "tag", "track", "trim", "unify",
+    "update", "upgrade", "use", "validate", "verify", "wire", "wrap", "write", "bill",
+})
+_TRAILING_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "if", "in",
+    "instead", "into", "is", "not", "of", "on", "or", "that", "the", "to", "via",
+    "when", "where", "which", "while", "with", "without",
+})
+_LLM_API_KEY_ENVS = (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "LITELLM_API_KEY",
+    "GEMINI_API_KEY",
+    "AZURE_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "VERTEXAI_PROJECT",
+)
 
 
 @dataclass(frozen=True)
@@ -44,12 +91,14 @@ class WeeklyReport:
     since: datetime
     rate_limited: bool = False
     match_details: tuple[MatchDetail, ...] = ()
+    issues_url: str = ""
 
 
 def reset_org_members_cache() -> None:
     """Test helper."""
     with _org_cache_lock:
         _org_members_cache.clear()
+        _label_cache.clear()
 
 
 class WeeklyFetchError(RuntimeError):
@@ -140,6 +189,179 @@ def fetch_org_public_members(
     return result
 
 
+def has_repo_label(
+    repository: str,
+    label: str,
+    token: str | None,
+    *,
+    ttl_seconds: float = ORG_MEMBERS_CACHE_TTL_SECONDS,
+    clock=time.monotonic,
+) -> bool:
+    """Return True when ``label`` exists on ``repository`` (cached with TTL)."""
+    repo_key = (repository or "").strip().lower()
+    label_key = (label or "").strip().lower()
+    if not repo_key or not label_key:
+        return False
+    now = clock()
+    with _org_cache_lock:
+        cached = _label_cache.get((repo_key, label_key))
+        if cached is not None and now < cached[1]:
+            return cached[0]
+    exists = False
+    try:
+        encoded = quote(label, safe="")
+        payload = github_get_json(
+            f"{GITHUB_API}/repos/{repository}/labels/{encoded}",
+            token,
+            pace=False,
+        )
+        exists = isinstance(payload, dict) and isinstance(payload.get("name"), str) and bool(payload["name"])
+    except Exception as error:
+        logging.info("Label %r check on %s fell back to plain issues URL: %s", label, repository, error)
+        exists = False
+    with _org_cache_lock:
+        _label_cache[(repo_key, label_key)] = (exists, now + ttl_seconds)
+    return exists
+
+
+def good_first_issue_url(repository: str, token: str | None) -> str:
+    repo = (repository or "BerriAI/litellm").strip()
+    if has_repo_label(repo, GOOD_FIRST_ISSUE_LABEL, token):
+        return f"https://github.com/{repo}/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22"
+    return f"https://github.com/{repo}/issues"
+
+
+def weekly_footer(issues_url: str) -> str:
+    return f"want to be on next week's list? grab a good first issue: <{issues_url}>"
+
+
+def clean_pr_title(title: str, *, number: int | None = None, max_words: int = 9) -> str:
+    """Deterministic lowercase ~8-word plain-English cleanup of a PR title."""
+    text = (title or "").strip()
+    text = _MARKDOWN_LINK.sub(r"\1", text)
+    text = _DISALLOWED_MENTIONS.sub("", text)
+    text = text.replace("<", "").replace(">", "")
+    text = _TRAILING_REF.sub("", text).strip()
+
+    # Strip leading [TAG] / ticket IDs and conventional-commit prefixes.
+    for _ in range(3):
+        prev = text
+        text = _LEADING_BRACKET_TAG.sub("", text).strip()
+        text = _TICKET_PREFIX.sub("", text).strip()
+        if text == prev:
+            break
+
+    prefix_kind = ""
+    prefix_scope = ""
+    match = _CONVENTIONAL_PREFIX.match(text)
+    if match:
+        prefix_kind = (match.group(1) or "").lower()
+        prefix_scope = (match.group(2) or "").strip().lower()
+        text = text[match.end():].strip()
+        text = _TICKET_PREFIX.sub("", text).strip()
+
+    text = _INLINE_TICKET.sub("", text)
+    text = text.replace("`", "").replace('"', "").strip()
+    text = re.sub(r"\s+", " ", text).strip(" -–—:;.,!?")
+    lowered = text.lower()
+
+    # If a fix(...) title has a noun phrase without a verb, keep "fix" (and scope if omitted).
+    if lowered and prefix_kind in {"fix", "bug", "bugfix"}:
+        first_word = re.sub(r"[^a-z]+", "", lowered.split()[0])
+        if first_word and first_word not in _LEADING_VERBS:
+            if prefix_scope and prefix_scope not in lowered and re.fullmatch(r"[a-z0-9._-]{2,20}", prefix_scope):
+                lowered = f"fix {prefix_scope} {lowered}"
+            else:
+                lowered = f"fix {lowered}"
+
+    words = lowered.split()
+    if len(words) > max_words:
+        words = words[:max_words]
+        while len(words) > 3 and words[-1].rstrip(",;:") in _TRAILING_STOPWORDS:
+            words.pop()
+    result = " ".join(words).rstrip(" ,;:.!?-–—")
+    if not result:
+        return f"pr #{number}" if number else "update"
+    return result
+
+
+def _sanitize_summary(text: str, fallback: str) -> str:
+    cleaned = (text or "").strip().strip("\"'")
+    cleaned = _MARKDOWN_LINK.sub(r"\1", cleaned)
+    cleaned = _DISALLOWED_MENTIONS.sub("", cleaned)
+    cleaned = cleaned.replace("<", "").replace(">", "").replace("\n", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—:;.,!?").lower()
+    words = cleaned.split()
+    if not words or len(words) > 14:
+        return fallback
+    return " ".join(words).rstrip(" ,;:.!?-–—") or fallback
+
+
+def _has_llm_credentials() -> bool:
+    return any(os.environ.get(name, "").strip() for name in _LLM_API_KEY_ENVS)
+
+
+def summarize_pr_titles(config, groups: list[dict], *, summarizer=None) -> dict[int, str]:
+    """Rewrite matched PR titles into short lowercase plain-English summaries (~8 words).
+
+    Uses one batched fast-tier (Haiku) call when configured, falling back to
+    deterministic cleanup cleanly when offline or on any model error.
+    """
+    pulls_by_num: dict[int, str] = {}
+    for group in groups:
+        for pull in group.get("pulls", ()):
+            num = pull.get("number")
+            if isinstance(num, int) and num not in pulls_by_num:
+                pulls_by_num[num] = pull.get("title") or f"#{num}"
+
+    fallbacks = {num: clean_pr_title(title, number=num) for num, title in pulls_by_num.items()}
+    if not pulls_by_num:
+        return fallbacks
+
+    if summarizer is None and not _has_llm_credentials():
+        return fallbacks
+
+    model = (
+        getattr(config, "review_classifier_model", None)
+        or getattr(config, "fast_model", None)
+        or FAST_MODEL
+    )
+    items_payload = {str(num): title for num, title in pulls_by_num.items()}
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Rewrite each pull request title as a casual, lowercase plain-English summary "
+                "of roughly 6 to 8 words. Drop conventional-commit prefixes (like fix(...): or feat:) "
+                "and ticket/issue IDs. No trailing punctuation, no links, no mentions. "
+                "Reply with a single JSON object mapping each PR number string to its summary."
+            ),
+        },
+        {"role": "user", "content": json.dumps(items_payload)},
+    ]
+    try:
+        if summarizer is not None:
+            raw = summarizer(model, messages)
+        else:
+            from .review_llm import complete_litellm
+            raw = complete_litellm(model, messages)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}
+    except Exception as error:
+        logging.warning("PR title summarization fallback to deterministic cleanup: %s", error)
+        return fallbacks
+
+    if not isinstance(parsed, dict):
+        return fallbacks
+    summaries = dict(fallbacks)
+    for num, fallback in fallbacks.items():
+        candidate = parsed.get(str(num))
+        if isinstance(candidate, str) and candidate.strip():
+            summaries[num] = _sanitize_summary(candidate, fallback)
+    return summaries
+
+
 def community_groups(
     items: list[dict],
     maintainers: tuple[str, ...],
@@ -177,12 +399,16 @@ def community_groups(
             "login": login,
             "user_id": user_id if isinstance(user_id, int) else None,
             "discord_id": str(discord_id) if discord_id and is_discord_id(str(discord_id)) else None,
+            "first_time": False,
             "pulls": [],
         })
+        if association == "FIRST_TIME_CONTRIBUTOR" or item.get("first_time"):
+            bucket["first_time"] = True
         bucket["pulls"].append({
             "number": item["number"],
             "title": item.get("title") or f"#{item['number']}",
             "url": item.get("url") or "",
+            "author_association": association,
         })
     return sorted(grouped.values(), key=lambda group: (-len(group["pulls"]), group["login"].lower()))
 
@@ -203,59 +429,74 @@ def chunk_mention_user_ids(chunk: str) -> list[str]:
     return ordered
 
 
-def _compact_contributor_line(group: dict, *, max_prs: int = WEEKLY_MAX_PRS_PER_LINE) -> str:
+def _pull_entry(pull: dict, summaries: dict[int, str] | None = None) -> str:
+    number = pull.get("number")
+    summary = (
+        summaries.get(number)
+        if summaries and isinstance(number, int) and number in summaries
+        else pull.get("summary") or clean_pr_title(pull.get("title") or "", number=number if isinstance(number, int) else None)
+    )
+    url = pull.get("url") or ""
+    return f"{summary} (<{url}>)" if url else summary
+
+
+def _contributor_lines(
+    group: dict,
+    *,
+    summaries: dict[int, str] | None = None,
+    limit: int = WEEKLY_CHUNK_LIMIT,
+    first_line_limit: int | None = None,
+) -> list[str]:
+    """Render one line per contributor, splitting only if a single line exceeds ``limit``."""
     discord_id = group.get("discord_id")
     if not discord_id or not is_discord_id(str(discord_id)):
         raise ValueError("Weekly contributor lines require a resolved Discord user ID")
-    pulls = group["pulls"]
-    count = len(pulls)
-    noun = "PR" if count == 1 else "PRs"
-    shown = pulls[:max_prs]
-    refs = []
-    for pull in shown:
-        number = pull["number"]
-        url = pull.get("url") or ""
-        refs.append(f"[#{number}](<{url}>)" if url else f"#{number}")
-    if count > max_prs:
-        refs.append(f"+{count - max_prs} more")
-    return f"- <@{discord_id}>: {count} {noun} ({', '.join(refs)})"
+    badge = " 🎉" if group.get("first_time") else ""
+    prefix = f"<@{discord_id}>{badge} - "
+    entries = [_pull_entry(pull, summaries) for pull in group.get("pulls", ())]
+    if not entries:
+        return []
+    head_limit = first_line_limit if first_line_limit is not None else limit
+    full_line = prefix + ", ".join(entries)
+    if _utf16_len(full_line) <= head_limit:
+        return [full_line]
+
+    # Only wrap across lines when a single contributor's PR list exceeds Discord's limit.
+    lines: list[str] = []
+    current = prefix + entries[0]
+    active_limit = head_limit
+    for entry in entries[1:]:
+        candidate = f"{current}, {entry}"
+        if _utf16_len(candidate) <= active_limit:
+            current = candidate
+        else:
+            lines.append(current)
+            current = f"<@{discord_id}> - {entry}"
+            active_limit = limit
+    lines.append(current)
+    return lines
+
+
+def _default_issues_url(repository: str = "BerriAI/litellm") -> str:
+    return f"https://github.com/{repository}/issues"
 
 
 def render_weekly(
     groups: list[dict],
     *,
     since: datetime,
-    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+    summaries: dict[int, str] | None = None,
+    issues_url: str | None = None,
 ) -> str:
-    start = since.date().isoformat()
-    matched = [group for group in groups if group.get("discord_id") and is_discord_id(str(group["discord_id"]))]
-    if not matched:
-        return f"no Discord-matched community pull requests merged since {start}."
-    lines = [
-        f"thanks to the community for what landed in litellm since {start}:",
-        "",
-    ]
-    shown = matched[:max_contributors]
-    for group in shown:
-        lines.append(_compact_contributor_line(group))
-    extra = matched[max_contributors:]
-    if extra:
-        extra_prs = sum(len(group["pulls"]) for group in extra)
-        noun = "contributor" if len(extra) == 1 else "contributors"
-        pr_noun = "PR" if extra_prs == 1 else "PRs"
-        lines.append(f"and {len(extra)} more {noun} ({extra_prs} {pr_noun}).")
-    return "\n".join(lines).strip()
-
-
-def _trim_chunk_for_footer(chunk: str, footer: str, limit: int) -> str:
-    lines = chunk.split("\n")
-    while lines and _utf16_len("\n".join(lines) + "\n" + footer) > limit:
-        lines.pop()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines:
-        return footer[:limit]
-    return "\n".join(lines) + "\n" + footer
+    return "\n\n".join(
+        weekly_chunks(
+            groups,
+            since=since,
+            summaries=summaries,
+            issues_url=issues_url,
+            limit=100_000,
+        )
+    )
 
 
 def weekly_chunks(
@@ -263,63 +504,63 @@ def weekly_chunks(
     *,
     since: datetime,
     limit: int = WEEKLY_CHUNK_LIMIT,
-    max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
-    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+    max_chunks: int | None = None,
     note: str = "",
+    summaries: dict[int, str] | None = None,
+    issues_url: str | None = None,
 ) -> list[str]:
-    """Render compact one-line-per-Discord-contributor summary under 2000 chars."""
+    """Render the weekly thank-you post, splitting cleanly only when over ``limit``."""
     start = since.date().isoformat()
     matched = [group for group in groups if group.get("discord_id") and is_discord_id(str(group["discord_id"]))]
     if not matched:
-        empty = f"no Discord-matched community pull requests merged since {start}."
+        empty = f"no discord-matched community pull requests merged since {start}."
         if note:
             empty = f"{empty}\n\n{note}"
         return [empty[:limit]]
 
-    shown = matched[:max_contributors]
-    overflow_groups = matched[max_contributors:]
-    header = f"thanks to the community for what landed in litellm since {start}:\n"
+    first_line_budget = max(200, limit - _utf16_len(WEEKLY_HEADER) - 2)
+    rendered_lines: list[str] = []
+    for idx, group in enumerate(matched):
+        rendered_lines.extend(
+            _contributor_lines(
+                group,
+                summaries=summaries,
+                limit=limit,
+                first_line_limit=first_line_budget if idx == 0 else limit,
+            )
+        )
 
     chunks: list[str] = []
-    current = header
-    dropped_from_shown: list[dict] = []
+    current = WEEKLY_HEADER
+    first_in_chunk = True
 
-    for index, group in enumerate(shown):
-        line = _compact_contributor_line(group)
-        if _utf16_len(line) > limit - 4:
-            line = _compact_contributor_line(group, max_prs=2)[: limit - 4]
-        separator = "\n\n" if current == header else "\n"
-        candidate = f"{current.rstrip()}{separator}{line}"
+    for line in rendered_lines:
+        sep = "\n\n" if (not chunks and first_in_chunk) else "\n"
+        candidate = f"{current}{sep}{line}" if current else line
         if _utf16_len(candidate) <= limit:
             current = candidate
+            first_in_chunk = False
             continue
-        if len(chunks) + 1 >= max_chunks:
-            dropped_from_shown = shown[index:]
+        if current:
+            chunks.append(current)
+        if max_chunks is not None and len(chunks) >= max_chunks:
+            current = ""
             break
-        if current.strip():
-            chunks.append(current.rstrip())
         current = line
+        first_in_chunk = False
 
-    if current.strip():
-        chunks.append(current.rstrip())
+    if current:
+        chunks.append(current)
 
-    all_extra = dropped_from_shown + overflow_groups
-    footers = []
-    if all_extra:
-        extra_prs = sum(len(group["pulls"]) for group in all_extra)
-        noun = "contributor" if len(all_extra) == 1 else "contributors"
-        pr_noun = "PR" if extra_prs == 1 else "PRs"
-        footers.append(f"and {len(all_extra)} more {noun} ({extra_prs} {pr_noun}).")
+    footer_parts = [weekly_footer(issues_url or _default_issues_url())]
     if note:
-        footers.append(note)
-    if footers:
-        footer = "\n".join(footers)
-        if _utf16_len(chunks[-1] + "\n" + footer) <= limit:
-            chunks[-1] = chunks[-1] + "\n" + footer
-        elif len(chunks) < max_chunks:
-            chunks.append(footer[:limit])
-        else:
-            chunks[-1] = _trim_chunk_for_footer(chunks[-1], footer, limit)
+        footer_parts.append(note)
+    footer = "\n".join(footer_parts)
+
+    if chunks and _utf16_len(chunks[-1] + "\n\n" + footer) <= limit:
+        chunks[-1] = chunks[-1] + "\n\n" + footer
+    elif max_chunks is None or len(chunks) < max_chunks:
+        chunks.append(footer[:limit])
     return chunks
 
 
@@ -406,6 +647,51 @@ def fetch_merged_community(
     return rows
 
 
+def _mark_first_time_contributors(
+    matched: list[dict],
+    repository: str,
+    token: str | None,
+) -> list[dict]:
+    """Detect first-time contributors whose author_association flipped to CONTRIBUTOR after merge.
+
+    GitHub changes ``FIRST_TIME_CONTRIBUTOR`` to ``CONTRIBUTOR`` once a PR merges, so
+    for each matched contributor not already flagged we check whether all of their
+    merged PRs in ``repository`` landed in this week's batch (``total_count <= len(pulls)``).
+    """
+    if not matched or not repository:
+        return matched
+    updated: list[dict] = []
+    rate_limited = False
+    for group in matched:
+        if group.get("first_time") or rate_limited:
+            updated.append(group)
+            continue
+        login = group.get("login") or ""
+        if not login or not re.fullmatch(r"[A-Za-z0-9-]+", login):
+            updated.append(group)
+            continue
+        first_time = False
+        try:
+            params = urlencode({
+                "q": f"repo:{repository} is:pr is:merged author:{login}",
+                "per_page": 1,
+            })
+            payload = github_get_json(
+                f"{GITHUB_API}/search/issues?{params}",
+                token,
+                pace=False,
+            )
+            total = payload.get("total_count") if isinstance(payload, dict) else None
+            if isinstance(total, int) and total > 0 and total <= len(group.get("pulls", ())):
+                first_time = True
+        except Exception as error:
+            if _is_rate_limit_error(error):
+                rate_limited = True
+            logging.info("Could not check prior merged PR count for %s: %s", login, error)
+        updated.append({**group, "first_time": first_time} if first_time else group)
+    return updated
+
+
 def build_weekly_report(
     config,
     store,
@@ -414,12 +700,12 @@ def build_weekly_report(
     guild=None,
     loop=None,
     pace: bool = False,
-    max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
-    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+    max_chunks: int | None = None,
     limit: int = WEEKLY_CHUNK_LIMIT,
     members=None,
     jev_transport=None,
     haiku_complete=None,
+    title_summarizer=None,
 ) -> WeeklyReport:
     moment = now or datetime.now(UTC)
     since = moment - timedelta(days=7)
@@ -446,21 +732,26 @@ def build_weekly_report(
         jev_transport=jev_transport,
         haiku_complete=haiku_complete,
     )
+    if matched and not rate_limited:
+        matched = _mark_first_time_contributors(matched, config.github_repository, token)
     logging.info(
         "Weekly merge summary: %d contributors matched in Discord, %d unmatched skipped",
         len(matched),
         skipped,
     )
+    summaries = summarize_pr_titles(config, matched, summarizer=title_summarizer) if matched else {}
+    issues_url = good_first_issue_url(config.github_repository, token) if matched else ""
     note = ""
     if rate_limited:
-        note = "(stopped early because of GitHub search rate limits; set GITHUB_TOKEN for higher limits.)"
+        note = "(stopped early because of github search rate limits; set GITHUB_TOKEN for higher limits.)"
     chunks = weekly_chunks(
         matched,
         since=since,
         limit=limit,
         max_chunks=max_chunks,
-        max_contributors=max_contributors,
         note=note,
+        summaries=summaries,
+        issues_url=issues_url,
     )
     return WeeklyReport(
         chunks=chunks,
@@ -469,6 +760,7 @@ def build_weekly_report(
         since=since,
         rate_limited=rate_limited,
         match_details=tuple(details),
+        issues_url=issues_url,
     )
 
 
@@ -485,8 +777,7 @@ def build_weekly_chunks(
     guild=None,
     loop=None,
     pace: bool = False,
-    max_chunks: int = WEEKLY_PREVIEW_MAX_CHUNKS,
-    max_contributors: int = WEEKLY_MAX_CONTRIBUTORS,
+    max_chunks: int | None = None,
     limit: int = WEEKLY_CHUNK_LIMIT,
 ) -> list[str]:
     report = build_weekly_report(
@@ -497,7 +788,6 @@ def build_weekly_chunks(
         loop=loop,
         pace=pace,
         max_chunks=max_chunks,
-        max_contributors=max_contributors,
         limit=limit,
     )
     return report.chunks
@@ -534,7 +824,6 @@ def post_weekly_if_due(
         guild=guild,
         loop=loop,
         pace=True,
-        max_chunks=WEEKLY_POST_MAX_CHUNKS,
     )
     sender = post or post_message
     for chunk in report.chunks:
