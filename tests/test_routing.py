@@ -162,8 +162,21 @@ class WeeklyTests(unittest.TestCase):
         ], ("ishaan",), {5: "111"}, org_members={"public-org-member"}, org="BerriAI")
         self.assertEqual([g["login"] for g in groups], ["octocat", "newbie"])
 
-        text = render_weekly(groups, since=datetime(2026, 11, 19, tzinfo=timezone.utc))
-        self.assertIn("- <@111>: 2 PRs ([#12](<https://github.com/BerriAI/litellm/pull/12>), [#19](<https://github.com/BerriAI/litellm/pull/19>))", text)
+        text = render_weekly(
+            groups,
+            since=datetime(2026, 11, 19, tzinfo=timezone.utc),
+            issues_url="https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22",
+        )
+        self.assertTrue(text.startswith("thank you to this week's contributors 🙏\n\n"))
+        self.assertIn(
+            "<@111> - add a timeout (<https://github.com/BerriAI/litellm/pull/12>), "
+            "fix docs (<https://github.com/BerriAI/litellm/pull/19>)",
+            text,
+        )
+        self.assertTrue(text.endswith(
+            '\n\nwant to be on next week\'s list? grab a good first issue: '
+            '<https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22>'
+        ))
         self.assertNotIn("octocat", text)
         self.assertNotIn("newbie", text)
         for excluded in ("public-org-member", "core-member", "repo-owner", "collab", "yuneng-berri", "ishaan", "cursor[bot]"):
@@ -422,7 +435,110 @@ class WeeklyTests(unittest.TestCase):
         self.assertEqual(matched, [])
         self.assertEqual(skipped, 1)
 
-    def test_merged_this_week_defers_suppresses_embeds_and_caps_at_15_lines(self):
+    def test_pr_title_rewriting_first_time_badge_and_good_first_issue_label_check(self):
+        from contributor_bot.weekly import (
+            clean_pr_title,
+            good_first_issue_url,
+            reset_org_members_cache,
+            summarize_pr_titles,
+            weekly_chunks,
+        )
+
+        reset_org_members_cache()
+        self.assertEqual(
+            clean_pr_title("fix(gemini): tool call argument parsing (#50020)"),
+            "fix gemini tool call argument parsing",
+        )
+        self.assertEqual(
+            clean_pr_title("[LITELLM-42] feat(proxy): Log requests blocked by guardrails"),
+            "log requests blocked by guardrails",
+        )
+        self.assertEqual(
+            clean_pr_title("fix(gemini): return an error instead of an empty 200 when a Gemini image request gets no image"),
+            "return an error instead of an empty 200",
+        )
+
+        # Batched fast-tier summarizer rewrites all PRs in one call and sanitizes output.
+        groups = [
+            {
+                "login": "first_timer",
+                "discord_id": "935715497901707324",
+                "first_time": True,
+                "pulls": [
+                    {"number": 50020, "title": "fix(gemini): tool call argument parsing", "url": "https://github.com/BerriAI/litellm/pull/50020"},
+                ],
+            },
+            {
+                "login": "regular_dev",
+                "discord_id": "409084113006493706",
+                "first_time": False,
+                "pulls": [
+                    {"number": 51014, "title": "feat(guardrails): log requests blocked by guardrails", "url": "https://github.com/BerriAI/litellm/pull/51014"},
+                    {"number": 51015, "title": "docs(proxy): clarify timeout config", "url": "https://github.com/BerriAI/litellm/pull/51015"},
+                ],
+            },
+        ]
+        calls = []
+
+        def fake_summarizer(model, messages):
+            calls.append((model, messages))
+            return json.dumps({
+                "50020": "Fix Gemini tool call argument parsing.",
+                "51014": "log requests blocked by guardrails",
+                "51015": "clarify proxy timeout config",
+            })
+
+        cfg = Config("token", "123", "456", fast_model="anthropic/claude-haiku-4-5")
+        summaries = summarize_pr_titles(cfg, groups, summarizer=fake_summarizer)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(summaries[50020], "fix gemini tool call argument parsing")
+
+        chunks = weekly_chunks(
+            groups,
+            since=datetime(2026, 11, 20, tzinfo=timezone.utc),
+            summaries=summaries,
+            issues_url="https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22",
+        )
+        self.assertEqual(len(chunks), 1)
+        expected = (
+            "thank you to this week's contributors 🙏\n\n"
+            "<@935715497901707324> 🎉 - fix gemini tool call argument parsing (<https://github.com/BerriAI/litellm/pull/50020>)\n"
+            "<@409084113006493706> - log requests blocked by guardrails (<https://github.com/BerriAI/litellm/pull/51014>), "
+            "clarify proxy timeout config (<https://github.com/BerriAI/litellm/pull/51015>)\n\n"
+            'want to be on next week\'s list? grab a good first issue: '
+            '<https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22>'
+        )
+        self.assertEqual(chunks[0], expected)
+
+        # Label lookup: returns filtered URL when label exists, falls back to plain /issues on 404.
+        with mock.patch("contributor_bot.weekly.github_get_json", return_value={"name": "good first issue"}) as getter:
+            url1 = good_first_issue_url("BerriAI/litellm", None)
+            url2 = good_first_issue_url("BerriAI/litellm", None)
+        self.assertEqual(url1, 'https://github.com/BerriAI/litellm/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22')
+        self.assertEqual(url2, url1)
+        self.assertEqual(getter.call_count, 1)
+
+        reset_org_members_cache()
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=RuntimeError("api.github.com returned HTTP 404")):
+            fallback_url = good_first_issue_url("BerriAI/litellm", None)
+        self.assertEqual(fallback_url, "https://github.com/BerriAI/litellm/issues")
+
+        # First-time contributor detection via prior merged PR count (when GitHub flips association to CONTRIBUTOR on merge).
+        from contributor_bot.weekly import _mark_first_time_contributors
+        post_merge_groups = [
+            {"login": "brandnew", "discord_id": "111", "first_time": False, "pulls": [{"number": 1, "title": "fix x", "url": "u1"}]},
+            {"login": "veteran", "discord_id": "222", "first_time": False, "pulls": [{"number": 2, "title": "fix y", "url": "u2"}]},
+        ]
+
+        def fake_author_count(url, _token, **_kwargs):
+            return {"total_count": 1} if "author%3Abrandnew" in url else {"total_count": 7}
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_author_count):
+            marked = _mark_first_time_contributors(post_merge_groups, "BerriAI/litellm", None)
+        self.assertTrue(marked[0]["first_time"])
+        self.assertFalse(marked[1]["first_time"])
+
+    def test_merged_this_week_defers_suppresses_embeds_and_splits_over_2000_chars(self):
         import asyncio
         from types import SimpleNamespace
         from contributor_bot.gateway import _dispatch_command, commands_for_guild
@@ -444,11 +560,11 @@ class WeeklyTests(unittest.TestCase):
         )
         self.assertIn("merged-this-week", [cmd["name"] for cmd in commands_for_guild(config)])
 
-        # 22 matched external contributors + 3 unmatched external contributors + org/member entries.
+        # 22 matched external contributors (all included, splitting cleanly >1900 chars) + 3 unmatched + org/member.
         items = [
             {
                 "number": 1000 + i,
-                "title": f"feat(provider-{i}): add support",
+                "title": f"feat(provider-{i}): add streaming provider support for endpoint {i}",
                 "html_url": f"https://github.com/BerriAI/litellm/pull/{1000 + i}",
                 "user": {"login": f"contrib-{i:02d}", "type": "User", "id": 500 + i},
                 "author_association": "CONTRIBUTOR" if i % 2 == 0 else "FIRST_TIME_CONTRIBUTOR",
@@ -540,6 +656,8 @@ class WeeklyTests(unittest.TestCase):
         def fake_github(url, _token, **_kwargs):
             if "/orgs/BerriAI/public_members" in url:
                 return [{"login": "staff-org"}]
+            if "/labels/" in url:
+                return {"name": "good first issue"}
             if "/users/" in url:
                 return {"login": url.rsplit("/users/", 1)[1]}
             if "/commits" in url:
@@ -555,30 +673,30 @@ class WeeklyTests(unittest.TestCase):
         self.assertEqual(deferred, [True])
         self.assertEqual(len(edits), 1)
         self.assertEqual(edits[0][2].get("flags"), 64 | SUPPRESS_EMBEDS_FLAG)
-        first_chunk = edits[0][2]["content"]
-        self.assertEqual(
-            edits[0][2].get("allowed_mentions"),
-            {"parse": [], "users": chunk_mention_user_ids(first_chunk)},
-        )
-        self.assertEqual(len(edits[0][2]["allowed_mentions"]["users"]), 15)
-        all_chunks = [first_chunk] + [call[2]["content"] for call in followups]
-        combined = "\n".join(all_chunks)
-        for chunk in all_chunks:
+        all_payloads = [edits[0][2]] + [call[2] for call in followups]
+        all_chunks = [p["content"] for p in all_payloads]
+        self.assertGreaterEqual(len(all_chunks), 2)
+        for payload in all_payloads:
+            chunk = payload["content"]
             self.assertLessEqual(len(chunk), 1900)
-            self.assertEqual(chunk.count("["), chunk.count("]"))
-        self.assertIn("](<https://github.com/BerriAI/litellm/pull/", combined)
-        self.assertNotIn("](https://", combined)
+            self.assertEqual(payload.get("flags"), 64 | SUPPRESS_EMBEDS_FLAG)
+            self.assertEqual(payload.get("allowed_mentions"), {"parse": [], "users": chunk_mention_user_ids(chunk)})
+        combined = "\n".join(all_chunks)
+        self.assertTrue(all_chunks[0].startswith("thank you to this week's contributors 🙏\n\n"))
+        self.assertIn("(<https://github.com/BerriAI/litellm/pull/", combined)
         self.assertNotIn("contrib-", combined)
         self.assertNotIn("unmatched-", combined)
         self.assertNotIn("staff-org", combined)
         self.assertNotIn("core-dev", combined)
-        contributor_lines = [line for line in combined.splitlines() if line.startswith("- <@")]
-        self.assertEqual(len(contributor_lines), 15)
-        self.assertIn("and 7 more contributors (7 PRs).", combined)
+        contributor_lines = [line for line in combined.splitlines() if line.startswith("<@")]
+        self.assertEqual(len(contributor_lines), 22)
+        # Half of the 22 contributors are FIRST_TIME_CONTRIBUTOR and get the 🎉 badge.
+        self.assertEqual(sum(1 for line in contributor_lines if " 🎉 - " in line), 11)
+        self.assertIn("want to be on next week's list? grab a good first issue:", all_chunks[-1])
         # Preview must NOT mark the week posted in SQLite.
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", week_key(datetime.now(timezone.utc))))
 
-        # Scheduled weekly post also sets SUPPRESS_EMBEDS flag and allowed_mentions.
+        # Scheduled weekly post uses the exact same format, SUPPRESS_EMBEDS flag, and allowed_mentions.
         posted = []
         moment = datetime(2026, 11, 23, 15, 0, tzinfo=timezone.utc)
         with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github):
@@ -589,13 +707,10 @@ class WeeklyTests(unittest.TestCase):
                 post=lambda ch, _tok, msg: posted.append((ch, msg)),
                 guild=fake_guild,
             )
-        self.assertTrue(posted)
-        self.assertEqual(posted[0][1].get("flags"), SUPPRESS_EMBEDS_FLAG)
-        self.assertEqual(
-            posted[0][1].get("allowed_mentions"),
-            {"parse": [], "users": chunk_mention_user_ids(posted[0][1]["content"])},
-        )
-        self.assertEqual(len(posted[0][1]["allowed_mentions"]["users"]), 15)
+        self.assertEqual([msg["content"] for _ch, msg in posted], all_chunks)
+        for _ch, msg in posted:
+            self.assertEqual(msg.get("flags"), SUPPRESS_EMBEDS_FLAG)
+            self.assertEqual(msg.get("allowed_mentions"), {"parse": [], "users": chunk_mention_user_ids(msg["content"])})
 
         # Direct handle_interaction returns type 5 immediately (defer).
         started = []
@@ -613,26 +728,26 @@ class WeeklyTests(unittest.TestCase):
         self.assertEqual(response, {"type": 5, "data": {"flags": 64}})
         self.assertEqual(started, [True])
 
-        # Tight limit splits cleanly on line boundaries with overflow footer.
+        # Tight limit splits cleanly on line boundaries with no contributor dropped.
         huge_groups = [
             {
                 "login": f"dev-{i:03d}",
                 "discord_id": str(200000000000000000 + i),
-                "pulls": [{"number": i, "title": "fix", "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
+                "first_time": False,
+                "pulls": [{"number": i, "title": "fix timeout handling", "url": f"https://github.com/BerriAI/litellm/pull/{i}"}],
             }
-            for i in range(30)
+            for i in range(12)
         ]
-        capped = weekly_chunks(
+        split = weekly_chunks(
             huge_groups,
             since=datetime(2026, 11, 19, tzinfo=timezone.utc),
             limit=500,
-            max_chunks=2,
-            max_contributors=15,
         )
-        self.assertLessEqual(len(capped), 2)
-        for chunk in capped:
+        self.assertGreater(len(split), 1)
+        for chunk in split:
             self.assertLessEqual(len(chunk), 500)
-        self.assertIn("more contributors", capped[-1])
+        self.assertEqual(sum(1 for line in "\n".join(split).splitlines() if line.startswith("<@")), 12)
+        self.assertIn("want to be on next week's list?", split[-1])
 
     def test_merged_this_week_handles_github_rate_limit_and_optional_guild_config(self):
         from contributor_bot.api import TransientAPIError
