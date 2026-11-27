@@ -42,6 +42,17 @@ SLASH_COMMANDS = [
     },
 ]
 
+_PERM_ADMINISTRATOR = 1 << 3
+_PERM_MANAGE_GUILD = 1 << 5
+_PERM_MANAGE_MESSAGES = 1 << 13
+_PERM_MODERATE_MEMBERS = 1 << 40
+_MOD_PERMISSION_MASK = (
+    _PERM_ADMINISTRATOR
+    | _PERM_MANAGE_GUILD
+    | _PERM_MANAGE_MESSAGES
+    | _PERM_MODERATE_MEMBERS
+)
+
 # Registered whenever MERGED_WEEKLY_ENABLED=true and DISCORD_GUILD_ID is set.
 MERGED_SLASH_COMMANDS = [
     {
@@ -49,6 +60,7 @@ MERGED_SLASH_COMMANDS = [
         "description": "Preview community pull requests merged in the last 7 days",
         "type": 1,
         "dm_permission": False,
+        "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
     },
 ]
 
@@ -86,6 +98,21 @@ def _ephemeral(content: str) -> dict:
     }
 
 
+def is_server_moderator(payload: dict) -> bool:
+    """True when the invoker has administrator, manage_guild, manage_messages, or moderate_members."""
+    member = payload.get("member") or {}
+    raw = member.get("permissions")
+    if raw is None:
+        return False
+    if hasattr(raw, "value"):
+        raw = raw.value
+    try:
+        bits = int(raw)
+    except (TypeError, ValueError):
+        return False
+    return bool(bits & _MOD_PERMISSION_MASK)
+
+
 def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
     if payload.get("type") == 1:
         return {"type": 1}
@@ -107,6 +134,8 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
     if name == "my-prs":
         return _my_prs(config, store, discord_id, payload.get("token"))
     if name == "merged-this-week":
+        if not is_server_moderator(payload):
+            return _ephemeral("only mods can run this")
         return _merged_preview(
             config,
             store,

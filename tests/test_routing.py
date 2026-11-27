@@ -631,6 +631,7 @@ class WeeklyTests(unittest.TestCase):
             channel_id=123,
             token="tokentokentoken",
             user=SimpleNamespace(id=111),
+            permissions=SimpleNamespace(value=1 << 13),  # manage_messages (moderator)
             data={"name": "merged-this-week", "options": []},
             channel=SimpleNamespace(id=123, type=SimpleNamespace(value=0), parent_id=None),
             guild=fake_guild,
@@ -715,7 +716,7 @@ class WeeklyTests(unittest.TestCase):
             self.assertEqual(msg.get("flags"), SUPPRESS_EMBEDS_FLAG)
             self.assertEqual(msg.get("allowed_mentions"), {"parse": [], "users": chunk_mention_user_ids(msg["content"])})
 
-        # Direct handle_interaction returns type 5 immediately (defer).
+        # Direct handle_interaction returns type 5 immediately (defer) for moderators.
         started = []
         with mock.patch("contributor_bot.interactions.threading.Thread") as thread_cls:
             response = handle_interaction(config, store, {
@@ -724,7 +725,7 @@ class WeeklyTests(unittest.TestCase):
                 "application_id": "444",
                 "channel_id": "123",
                 "token": "tokentokentoken",
-                "member": {"user": {"id": "111"}},
+                "member": {"user": {"id": "111"}, "permissions": str(1 << 13)},
                 "data": {"name": "merged-this-week", "options": []},
             })
             started.append(thread_cls.called)
@@ -1542,7 +1543,7 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
         # Manual run must NOT touch merged_weeks in SQLite.
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
 
-        # Even invoking handle_interaction for /merged-this-week does not mark merged_weeks.
+        # Even invoking handle_interaction for /merged-this-week as a mod does not mark merged_weeks.
         with mock.patch("contributor_bot.interactions.threading.Thread"):
             resp = handle_interaction(cfg, store, {
                 "type": 2,
@@ -1550,7 +1551,7 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
                 "application_id": "444",
                 "channel_id": "123",
                 "token": "tok",
-                "member": {"user": {"id": "111"}},
+                "member": {"user": {"id": "111"}, "permissions": str(1 << 13)},
                 "data": {"name": "merged-this-week", "options": []},
             })
         self.assertEqual(resp, {"type": 5, "data": {"flags": 64}})
@@ -1741,6 +1742,167 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(len(posted), 1)
         self.assertTrue(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+    def test_merged_this_week_restricted_to_moderators(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from contributor_bot.gateway import _bind_command_tree, _dispatch_command
+        from contributor_bot.interactions import MERGED_SLASH_COMMANDS, handle_interaction
+        from contributor_bot.store import Store
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = Store(str(Path(temp_dir.name) / "roles.db"))
+        self.addCleanup(store.close)
+        cfg = Config(
+            "tok", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            merged_weekly_enabled=True,
+        )
+
+        # 1) REST spec and discord.py CommandTree both set default_permissions to hide from regular members.
+        self.assertEqual(MERGED_SLASH_COMMANDS[0].get("default_member_permissions"), str(1 << 13))
+
+        registered = {}
+
+        class _FakeCommandTree:
+            def __init__(self, _client):
+                pass
+
+            def command(self, *, name, description, guild=None):
+                def decorator(fn):
+                    registered[name] = {
+                        "fn": fn,
+                        "description": description,
+                        "guild": guild,
+                        "default_permissions": getattr(fn, "_default_permissions", None),
+                        "allowed_contexts": getattr(fn, "_allowed_contexts", None),
+                    }
+                    return fn
+                return decorator
+
+        def _fake_allowed_contexts(**kwargs):
+            def decorator(fn):
+                fn._allowed_contexts = kwargs
+                return fn
+            return decorator
+
+        def _fake_default_permissions(**kwargs):
+            def decorator(fn):
+                fn._default_permissions = kwargs
+                return fn
+            return decorator
+
+        fake_discord = SimpleNamespace(
+            Object=lambda id: SimpleNamespace(id=id),
+            app_commands=SimpleNamespace(
+                CommandTree=_FakeCommandTree,
+                allowed_contexts=_fake_allowed_contexts,
+                default_permissions=_fake_default_permissions,
+            ),
+        )
+        _bind_command_tree(fake_discord, object(), cfg, store)
+        self.assertIn("merged-this-week", registered)
+        self.assertEqual(registered["merged-this-week"]["default_permissions"], {"manage_messages": True})
+        self.assertEqual(
+            registered["merged-this-week"]["allowed_contexts"],
+            {"guilds": True, "dms": False, "private_channels": False},
+        )
+
+        # Also verify against real discord.py when installed in the environment.
+        try:
+            import discord as real_discord
+        except ImportError:
+            real_discord = None
+        if real_discord is not None:
+            real_client = real_discord.Client(intents=real_discord.Intents.none())
+            real_tree = _bind_command_tree(real_discord, real_client, cfg, store)
+            real_cmd = real_tree.get_command("merged-this-week", guild=real_discord.Object(id=333))
+            self.assertIsNotNone(real_cmd)
+            self.assertEqual(real_cmd.default_permissions, real_discord.Permissions(manage_messages=True))
+
+        # 2) Regular members (missing perms, 0, or only send_messages) get ephemeral "only mods can run this".
+        for perms in (None, "0", str(1 << 11)):
+            member = {"user": {"id": "111"}}
+            if perms is not None:
+                member["permissions"] = perms
+            with mock.patch("contributor_bot.interactions.threading.Thread") as thread_cls:
+                resp = handle_interaction(cfg, store, {
+                    "type": 2,
+                    "guild_id": "333",
+                    "application_id": "444",
+                    "channel_id": "123",
+                    "token": "tok",
+                    "member": member,
+                    "data": {"name": "merged-this-week", "options": []},
+                })
+            self.assertEqual(resp["type"], 4)
+            self.assertEqual(resp["data"]["content"], "only mods can run this")
+            self.assertTrue(bool(resp["data"]["flags"] & 64))
+            thread_cls.assert_not_called()
+
+        # 3) Gateway _dispatch_command replies ephemerally with "only mods can run this" for non-mods.
+        followups = []
+
+        class _RecordingResponse:
+            def __init__(self):
+                self.done = False
+
+            def is_done(self):
+                return self.done
+
+            async def defer(self, *, ephemeral=False):
+                self.done = True
+
+            async def send_message(self, content, *, ephemeral=False):
+                self.done = True
+                followups.append((content, ephemeral))
+
+        async def record_followup(content, *, ephemeral=False):
+            followups.append((content, ephemeral))
+
+        non_mod_interaction = SimpleNamespace(
+            guild_id=333,
+            application_id=444,
+            channel_id=123,
+            token="tok",
+            user=SimpleNamespace(id=111, guild_permissions=SimpleNamespace(value=1 << 11)),
+            permissions=SimpleNamespace(value=1 << 11),
+            data={"name": "merged-this-week", "options": []},
+            channel=SimpleNamespace(id=123, type=SimpleNamespace(value=0), parent_id=None),
+            guild=None,
+            message=None,
+            extras={},
+            response=_RecordingResponse(),
+            followup=SimpleNamespace(send=record_followup),
+        )
+        with mock.patch("contributor_bot.interactions._merged_preview") as preview_mock:
+            asyncio.run(_dispatch_command(None, non_mod_interaction, cfg, store))
+        self.assertEqual(followups, [("only mods can run this", True)])
+        preview_mock.assert_not_called()
+
+        # 4) Each moderator/admin permission bit is allowed to run /merged-this-week.
+        for mod_bits in (
+            1 << 3,   # administrator
+            1 << 5,   # manage_guild
+            1 << 13,  # manage_messages
+            1 << 40,  # moderate_members
+        ):
+            with mock.patch("contributor_bot.interactions.threading.Thread") as thread_cls:
+                resp = handle_interaction(cfg, store, {
+                    "type": 2,
+                    "guild_id": "333",
+                    "application_id": "444",
+                    "channel_id": "123",
+                    "token": "tok",
+                    "member": {"user": {"id": "111"}, "permissions": str(mod_bits)},
+                    "data": {"name": "merged-this-week", "options": []},
+                })
+            self.assertEqual(resp, {"type": 5, "data": {"flags": 64}})
+            thread_cls.assert_called_once()
 
 
 class SampleRoutingTests(unittest.TestCase):
