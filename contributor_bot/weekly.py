@@ -105,9 +105,10 @@ def reset_org_members_cache() -> None:
 class WeeklyFetchError(RuntimeError):
     """GitHub search failed while building the weekly merge summary."""
 
-    def __init__(self, message: str, *, rate_limited: bool = False):
+    def __init__(self, message: str, *, rate_limited: bool = False, retry_after: float | None = None):
         super().__init__(message)
         self.rate_limited = rate_limited
+        self.retry_after = retry_after
 
 
 def parse_weekday(value: str) -> int:
@@ -637,15 +638,16 @@ def _search_merged_pages(
             payload = github_get_json(
                 f"{GITHUB_API}/search/issues?{params}",
                 token,
-                pace=pace and page < max_pages,
+                pace=pace,
             )
         except Exception as error:
             if _is_rate_limit_error(error):
+                retry_after = getattr(error, "retry_after", None)
                 if found:
                     logging.warning("GitHub search rate limit hit on page %d; returning %d rows", page, len(found))
                     rate_limited = True
                     break
-                raise WeeklyFetchError(str(error), rate_limited=True) from error
+                raise WeeklyFetchError(str(error), rate_limited=True, retry_after=retry_after) from error
             raise WeeklyFetchError(str(error)) from error
         items = payload.get("items") if isinstance(payload, dict) else None
         if not isinstance(items, list):
@@ -873,14 +875,25 @@ def post_weekly_if_due(
     if not channel:
         logging.warning("Weekly merge summary skipped: no destination channel configured or #announcements found")
         return None
-    report = build_weekly_report(
-        config,
-        store,
-        moment,
-        guild=guild,
-        loop=loop,
-        pace=True,
-    )
+    try:
+        report = build_weekly_report(
+            config,
+            store,
+            moment,
+            guild=guild,
+            loop=loop,
+            pace=True,
+        )
+    except WeeklyFetchError as error:
+        if error.rate_limited:
+            wait_note = f" (retry_after={error.retry_after:.0f}s)" if isinstance(error.retry_after, (int, float)) else ""
+            logging.warning(
+                "Weekly merge summary deferred due to GitHub rate limit%s; will retry automatically: %s",
+                wait_note,
+                error,
+            )
+            return None
+        raise
     if report.matched_count == 0:
         diag = report.diagnostics.summary_line() if report.diagnostics is not None else ""
         logging.warning("Weekly merge summary skipped: 0 discord-matched contributors %s", diag)

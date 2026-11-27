@@ -117,6 +117,16 @@ CREATE TABLE IF NOT EXISTS github_discord_matches (
     confidence REAL NOT NULL,
     matched_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS github_users_cache (
+    github_login TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    blog TEXT NOT NULL DEFAULT '',
+    twitter_username TEXT NOT NULL DEFAULT '',
+    bio TEXT NOT NULL DEFAULT '',
+    email_local TEXT NOT NULL DEFAULT '',
+    fetched_at TEXT NOT NULL
+);
 """
 
 
@@ -669,6 +679,61 @@ class Store:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_cached_github_user(self, github_login: str) -> dict | None:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT github_login, name, blog, twitter_username, bio, email_local, fetched_at
+                FROM github_users_cache
+                WHERE github_login = ?
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_cached_github_user(
+        self,
+        github_login: str,
+        *,
+        name: str = "",
+        blog: str = "",
+        twitter_username: str = "",
+        bio: str = "",
+        email_local: str = "",
+        fetched_at: str,
+    ) -> None:
+        key = (github_login or "").strip().lower()
+        if not key or not _LOGIN.fullmatch(key):
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO github_users_cache (
+                    github_login, name, blog, twitter_username, bio, email_local, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(github_login) DO UPDATE SET
+                    name = excluded.name,
+                    blog = excluded.blog,
+                    twitter_username = excluded.twitter_username,
+                    bio = excluded.bio,
+                    email_local = excluded.email_local,
+                    fetched_at = excluded.fetched_at
+                """,
+                (
+                    key,
+                    (name or "")[:200],
+                    (blog or "")[:300],
+                    (twitter_username or "")[:100],
+                    (bio or "")[:400],
+                    (email_local or "")[:120],
+                    fetched_at,
+                ),
+            )
+            self._conn.commit()
 
     def mark_review_done(self, repository: str, number: int, reviewed_at: str, head_sha: str) -> None:
         self._review_key(repository, number)

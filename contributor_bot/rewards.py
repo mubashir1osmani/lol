@@ -212,7 +212,7 @@ def handle_github_event(config: Config, store: Store, event: str, payload: dict)
         logging.error("Merged PR #%s has no usable merged_at; ignoring", number)
         return 200
     try:
-        files = fetch_pull_files(config.github_repository, number, config.github_token)
+        files = fetch_pull_files(config.github_repository, number, config.effective_github_token)
     except TransientAPIError as error:
         logging.warning("File list for #%s deferred: %s", number, error)
         return 500

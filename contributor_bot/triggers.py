@@ -117,7 +117,7 @@ def apply_triggers(config, store, number: int, thread_post) -> list[tuple[str, s
         return []
     triggers = config.review_trigger_comments or DEFAULT_TRIGGERS
     try:
-        snapshot = gather_snapshot(config.github_repository, number, config.github_token)
+        snapshot = gather_snapshot(config.github_repository, number, config.effective_github_token)
     except Exception as error:
         logging.warning("Could not decide review triggers for #%s: %s", number, error)
         return []

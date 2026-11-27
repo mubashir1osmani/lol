@@ -93,7 +93,7 @@ def verify(config: Config, state: dict, numbers: set[str], now: datetime, due: b
             continue
         if checks >= MAX_CHECKS_PER_POLL:
             return False
-        result = fetch_pull_request(config.github_repository, int(number), config.github_token)
+        result = fetch_pull_request(config.github_repository, int(number), config.effective_github_token)
         author = result.get("user") or {}
         login = author.get("login", "")
         if (result.get("number") != int(number) or not isinstance(result.get("merged"), bool)
@@ -211,7 +211,7 @@ def poll_once(config: Config, now: datetime | None = None) -> None:
     if due:
         if state["weekly"]["merge_numbers"] is None:
             state["weekly"]["merge_numbers"] = sorted(fetch_merged_numbers(config.github_repository,
-                parse_time(state["weekly"]["start"]), parse_time(state["weekly"]["end"]), config.github_token))
+                parse_time(state["weekly"]["start"]), parse_time(state["weekly"]["end"]), config.effective_github_token))
             save_state(config.state_file, state)
         numbers.update(str(n) for n in state["weekly"]["merge_numbers"]
                        if str(n) in state["pull_requests"] and state["pull_requests"][str(n)].get("discord_id"))
@@ -245,7 +245,7 @@ def preview_roundup(config: Config, now: datetime | None = None) -> dict:
     state["outbox"] = []
     release_numbers = discover(preview_config, state, now)
     merged = fetch_merged_numbers(config.github_repository, parse_time(state["weekly"]["start"]),
-                                 parse_time(state["weekly"]["end"]), config.github_token)
+                                 parse_time(state["weekly"]["end"]), config.effective_github_token)
     numbers = release_numbers | {str(n) for n in merged if str(n) in state["pull_requests"] and state["pull_requests"][str(n)].get("discord_id")}
     if not verify(preview_config, state, numbers, now, True):
         raise RuntimeError("Preview verification is still in progress; run preview again to resume its separate cache")

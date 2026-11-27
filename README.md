@@ -329,7 +329,7 @@ Slash
 commands with no source message are not reacted to. Reactions are best-effort
 and need **Add Reactions** in addition to **Read Message History**.
 
-`bugbot run` ([Bugbot](https://cursor.com/docs/bugbot)) and `@greptileai` ([Greptile](https://www.greptile.com/docs/code-review/developer-essentials)) are the only default trigger comments. Veria publishes no re-run comment, so it is not triggered. `GITHUB_ACTOR_TOKEN` posts them as that user, once per commit. `REVIEW_DRY_RUN=true` only logs them. On Mondays at 10:00 America/Toronto the bot posts community merges from the last seven days. Bots and `MAINTAINER_GITHUB_LOGINS` are left out. `/merged-this-week` previews that text.
+`bugbot run` ([Bugbot](https://cursor.com/docs/bugbot)) and `@greptileai` ([Greptile](https://www.greptile.com/docs/code-review/developer-essentials)) are the only default trigger comments. Veria publishes no re-run comment, so it is not triggered. `GITHUB_ACTOR_TOKEN` posts them as that user, once per commit (and also authenticates GitHub reads when `GITHUB_TOKEN` is unset). `REVIEW_DRY_RUN=true` only logs them. On Fridays at 10:00 America/Toronto the bot posts community merges since the previous Friday post to `ANNOUNCEMENTS_CHANNEL_ID` (falling back to `#announcements`). Bots and `MAINTAINER_GITHUB_LOGINS` are left out. `/merged-this-week` previews that text.
 
 Tools are read-only on GitHub except those allowlisted trigger comments: pull request metadata, the file list, one file's
 diff, a full file at the pull request head or base, code search in this

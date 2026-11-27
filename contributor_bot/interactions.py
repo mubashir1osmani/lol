@@ -262,7 +262,7 @@ def my_prs_content(config: Config, store: Store, link: dict) -> str:
     open_error = False
     try:
         items, open_total = fetch_open_pulls_for_author(
-            config.github_repository, link["github_login"], config.github_token,
+            config.github_repository, link["github_login"], config.effective_github_token,
         )
         for item in items[:8]:
             open_prs.append(_with_review(config, item))
@@ -276,8 +276,8 @@ def my_prs_content(config: Config, store: Store, link: dict) -> str:
 
 def _with_review(config: Config, item: dict) -> dict:
     try:
-        pull = fetch_pull_request(config.github_repository, item["number"], config.github_token)
-        reviews = fetch_pull_reviews(config.github_repository, item["number"], config.github_token)
+        pull = fetch_pull_request(config.github_repository, item["number"], config.effective_github_token)
+        reviews = fetch_pull_reviews(config.github_repository, item["number"], config.effective_github_token)
         status = review_status(pull, reviews)
         title = pull.get("title") if isinstance(pull.get("title"), str) else item["title"]
     except (TransientAPIError, RuntimeError, ValueError):

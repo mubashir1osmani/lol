@@ -165,11 +165,19 @@ def run_backfill(config) -> None:
     backfill_merged_pulls(config)
 
 
+def _gateway_available() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("discord") is not None
+    except Exception:
+        return False
+
+
 def start_contributor_roles(config):
     """Listen for GitHub webhooks and, when configured, Discord HTTP interactions.
 
     A Render web service sets PORT, so /health is served even while features are off.
-    A failure here does not stop the Friday thank-you loop.
+    A failure here does not stop the weekly summary loop.
     """
     features = config.contributor_roles_enabled or config.pr_review_enabled or (
         config.merged_weekly_enabled and bool(config.discord_guild_id)
@@ -188,7 +196,9 @@ def start_contributor_roles(config):
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
         commands.extend(MERGED_SLASH_COMMANDS)
-    if features and commands and config.discord_application_id and config.discord_guild_id:
+    # When discord.py is installed, gateway.py syncs guild commands via CommandTree on
+    # connect. Skip the duplicate REST PUT here so startup does not trigger a Discord 429.
+    if features and commands and config.discord_application_id and config.discord_guild_id and not _gateway_available():
         try:
             register_guild_commands(
                 config.discord_application_id,
@@ -206,7 +216,7 @@ def start_contributor_roles(config):
                 "Could not register slash commands. Check DISCORD_APPLICATION_ID, "
                 "that the bot invite includes applications.commands, and that the bot is in the server."
             )
-    elif features and commands:
+    elif features and commands and not (config.discord_application_id and config.discord_guild_id):
         logging.warning(
             "Skipping REST slash-command registration: DISCORD_APPLICATION_ID or DISCORD_GUILD_ID is unset"
         )
@@ -215,10 +225,9 @@ def start_contributor_roles(config):
             "DISCORD_PUBLIC_KEY is not a valid Ed25519 point. "
             "Discord interactions will be rejected until it is corrected."
         )
-    if features and not config.github_token:
+    if features and not config.effective_github_token:
         logging.warning(
-            "GITHUB_TOKEN is unset. Merge webhooks can still record pull requests, "
-            "but file lists, backfill, /my-prs, and PR pre-review may hit anonymous GitHub rate limits."
+            "GITHUB_TOKEN and GITHUB_ACTOR_TOKEN are unset. GitHub reads may hit anonymous 60/hr rate limits."
         )
     if config.pr_review_enabled:
         logging.info(
@@ -232,35 +241,29 @@ def start_contributor_roles(config):
 
 def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
     reviews = bool(config.pr_review_enabled and store is not None)
-    if not config.announcements_enabled and not reviews:
+    weekday_names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    day_label = weekday_names[config.merged_weekday] if 0 <= config.merged_weekday <= 6 else str(config.merged_weekday)
+    if config.merged_weekly_enabled:
+        dest = (config.announcements_channel_id or "").strip() or "#announcements"
         logging.info(
-            "Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false). "
-            "Use --preview-channel-id for a no-ping weekly preview. "
-            "Set ANNOUNCEMENTS_ENABLED=true and restart to enable the Friday schedule."
+            "Weekly contributor summary: %s %s %s, destination %s",
+            day_label, config.merged_time, config.merged_timezone, dest,
         )
-        stop_event.wait()
-        return
     if config.announcements_enabled:
         logging.info(
-            "Weekly contributor roundup: Friday %s %s, destination %s",
-            config.roundup_time, config.roundup_timezone, config.announcements_channel_id,
+            "Legacy roundup poller (ANNOUNCEMENTS_ENABLED) is retired; "
+            "weekly posts run only via the Friday %s %s summary scheduler.",
+            config.merged_time, config.merged_timezone,
         )
+    if not reviews:
+        if not config.announcements_enabled:
+            logging.info("Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false).")
+        stop_event.wait()
+        return
     if config.pr_review_enabled and not reviews:
         logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
     while not stop_event.is_set():
         delay = config.poll_interval_seconds
-        if config.announcements_enabled:
-            try:
-                poll_once(config)
-                window = load_state(config)["weekly"]
-                if window:
-                    remaining = (parse_time(window["end"]) - datetime.now(UTC)).total_seconds()
-                    if remaining > 0:
-                        delay = min(delay, remaining)
-            except TransientAPIError as error:
-                logging.warning("Contributor check deferred: %s", error)
-            except Exception:
-                logging.exception("Contributor check failed")
         gateway_live = gateway is not None and gateway.connected.is_set()
         if reviews and not gateway_live:
             try:
