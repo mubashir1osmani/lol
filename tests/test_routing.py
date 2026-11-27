@@ -543,7 +543,6 @@ class WeeklyTests(unittest.TestCase):
             discord_guild_id="333",
             discord_application_id="444",
             merged_weekly_enabled=True,
-            oss_contributors_channel_id="",
             discord_members_intent=True,
         )
         self.assertIn("merged-this-week", [cmd["name"] for cmd in commands_for_guild(config)])
@@ -770,7 +769,7 @@ class WeeklyTests(unittest.TestCase):
         })
         self.assertEqual(cfg.discord_guild_id, "333")
         self.assertEqual(cfg.discord_application_id, "444")
-        self.assertEqual(cfg.oss_contributors_channel_id, "")
+        self.assertFalse(hasattr(cfg, "oss_contributors_channel_id"))
         self.assertEqual(cfg.announcements_channel_id, "456")
         self.assertEqual(cfg.merged_weekday, 4)
         self.assertEqual(cfg.merged_time, "10:00")
@@ -1151,15 +1150,21 @@ class WeeklyTests(unittest.TestCase):
         store = Store(db_path)
         self.addCleanup(store.close)
 
-        # 1) Channel resolution precedence: OSS_CONTRIBUTORS_CHANNEL_ID > ANNOUNCEMENTS_CHANNEL_ID > #announcements lookup.
-        cfg_oss_override = Config("tok", "123", "456", oss_contributors_channel_id="789", discord_guild_id="333")
-        self.assertEqual(resolve_weekly_channel_id(cfg_oss_override), "789")
+        # 1) Channel resolution: ANNOUNCEMENTS_CHANNEL_ID standalone, else #announcements lookup.
+        cfg_ann = Config("tok", "123", "456", discord_guild_id="333")
+        self.assertEqual(resolve_weekly_channel_id(cfg_ann), "456")
+        # Legacy OSS_CONTRIBUTORS_CHANNEL_ID env var is ignored and never overrides ANNOUNCEMENTS_CHANNEL_ID.
+        from contributor_bot.config import get_config
+        cfg_ignored = get_config({
+            "DISCORD_BOT_TOKEN": "tok",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+            "ANNOUNCEMENTS_CHANNEL_ID": "456",
+            "OSS_CONTRIBUTORS_CHANNEL_ID": "789",
+        })
+        self.assertEqual(resolve_weekly_channel_id(cfg_ignored), "456")
 
-        cfg_ann_override = Config("tok", "123", "456", oss_contributors_channel_id="", discord_guild_id="333")
-        self.assertEqual(resolve_weekly_channel_id(cfg_ann_override), "456")
-
-        # Neither channel ID set -> resolves #announcements by name from guild cache.
-        cfg_lookup = Config("tok", "123", "", oss_contributors_channel_id="", discord_guild_id="333")
+        # ANNOUNCEMENTS_CHANNEL_ID unset -> resolves #announcements by name from guild cache.
+        cfg_lookup = Config("tok", "123", "", discord_guild_id="333")
         guild_with_channels = SimpleNamespace(
             id=333,
             text_channels=[

@@ -144,18 +144,12 @@ def resolve_weekly_channel_id(
 ) -> str | None:
     """Resolve the weekly post channel.
 
-    Precedence:
-    1. Explicit OSS_CONTRIBUTORS_CHANNEL_ID override (when set)
-    2. Explicit ANNOUNCEMENTS_CHANNEL_ID override (when set)
-    3. Guild text/announcement channel named 'announcements' (cache, then REST)
+    Uses ANNOUNCEMENTS_CHANNEL_ID standalone when set; otherwise falls back to
+    the guild text/announcement channel named 'announcements' (cache, then REST).
     """
-    for override in (
-        getattr(config, "oss_contributors_channel_id", "") or "",
-        getattr(config, "announcements_channel_id", "") or "",
-    ):
-        cleaned = str(override).strip()
-        if is_discord_id(cleaned):
-            return cleaned
+    announcements_id = str(getattr(config, "announcements_channel_id", "") or "").strip()
+    if is_discord_id(announcements_id):
+        return announcements_id
 
     target = (channel_name or DEFAULT_WEEKLY_CHANNEL_NAME).strip().lower()
     if guild is not None:

@@ -110,7 +110,6 @@ class Config:
     review_trigger_wait_seconds: int = 1200
     review_trigger_hourly_limit: int = 4
     merged_weekly_enabled: bool = True
-    oss_contributors_channel_id: str = ""
     maintainer_logins: tuple[str, ...] = ()
     merged_weekday: int = 4
     merged_time: str = "10:00"
@@ -243,7 +242,6 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_trigger_wait_seconds=_bounded_int(values, "REVIEW_TRIGGER_WAIT_SECONDS", 1200, 0, 3600),
         review_trigger_hourly_limit=_bounded_int(values, "REVIEW_TRIGGER_HOURLY_LIMIT", 4, 1, 20),
         merged_weekly_enabled=_flag(values, "MERGED_WEEKLY_ENABLED", True),
-        oss_contributors_channel_id=_optional_channel(values, "OSS_CONTRIBUTORS_CHANNEL_ID"),
         maintainer_logins=_logins(values, "MAINTAINER_GITHUB_LOGINS"),
         merged_weekday=_weekday(values),
         merged_time=_clock(values, "MERGED_POST_TIME", "10:00"),
@@ -292,15 +290,6 @@ def _bounded_int(values: dict[str, str], name: str, default: int, low: int, high
     if not low <= number <= high:
         raise ValueError(f"{name} must be between {low} and {high}")
     return number
-
-
-def _optional_channel(values: dict[str, str], name: str) -> str:
-    raw = values.get(name, "").strip()
-    if not raw:
-        return ""
-    if not is_discord_id(raw):
-        raise ValueError(f"{name} must be a Discord channel ID")
-    return raw
 
 
 def _optional_discord_id(values: dict[str, str], name: str) -> str | None:
