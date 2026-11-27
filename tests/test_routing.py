@@ -360,8 +360,8 @@ class WeeklyTests(unittest.TestCase):
             )
         self.assertEqual(report2.matched_count, 6)
         self.assertEqual(report2.skipped_count, 2)
-        # Only the 2 still-unmatched authors hit GitHub /users on rerun.
-        self.assertEqual(github_calls["users"], 2)
+        # Both persisted matches AND SQLite github_users_cache prevent redundant /users calls on rerun.
+        self.assertEqual(github_calls["users"], 0)
         methods2 = {d.github_login: d.method for d in report2.match_details}
         self.assertEqual(methods2["paveln83"], "sqlite:exact_login")
         self.assertEqual(methods2["gh-fuzzy-win"], "sqlite:jev")
@@ -651,7 +651,7 @@ class WeeklyTests(unittest.TestCase):
                 return []
             return {"items": items}
 
-        with mock.patch("contributor_bot.interactions.threading.Thread", _InlineThread), \
+        with mock.patch("contributor_bot.interactions.threading", SimpleNamespace(Thread=_InlineThread)), \
                 mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_github), \
                 mock.patch("contributor_bot.interactions.edit_original_interaction", side_effect=lambda *a: edits.append(a)), \
                 mock.patch("contributor_bot.interactions.post_interaction_followup", side_effect=lambda *a: followups.append(a)):
@@ -1250,6 +1250,205 @@ class WeeklyTests(unittest.TestCase):
             report_next = build_weekly_report(cfg_lookup, restarted_store, next_friday, guild=guild_with_channels)
             self.assertEqual(report_next.since, fri_after_restart)
             self.assertTrue(any("2026-11-27T15%3A07%3A00Z" in q for q in queries_seen))
+
+    def test_dispatch_command_defers_first_and_handles_10062_gracefully(self):
+        import asyncio
+        import threading
+        from types import SimpleNamespace
+        from contributor_bot.gateway import _dispatch_command
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        config = Config("tok", "123", "456", discord_guild_id="333", discord_application_id="444")
+
+        # 1) Defer must be the very first await, before handle_interaction, and handle_interaction runs off-loop.
+        events = []
+        main_thread_id = threading.get_ident()
+        handler_thread_ids = []
+        followups = []
+
+        class _RecordingResponse:
+            def __init__(self):
+                self.done = False
+
+            def is_done(self):
+                return self.done
+
+            async def defer(self, *, ephemeral=False):
+                events.append(("defer", ephemeral))
+                self.done = True
+
+            async def send_message(self, content, *, ephemeral=False):
+                events.append(("send_message", content))
+                self.done = True
+
+        async def record_followup(content, *, ephemeral=False):
+            events.append(("followup", content, ephemeral))
+            followups.append((content, ephemeral))
+
+        def fake_handle(_cfg, _store, _payload):
+            events.append(("handle_interaction",))
+            handler_thread_ids.append(threading.get_ident())
+            return {"type": 5, "data": {"flags": 64}}
+
+        interaction = SimpleNamespace(
+            guild_id=333,
+            application_id=444,
+            channel_id=123,
+            token="tokentokentoken",
+            user=SimpleNamespace(id=111),
+            data={"name": "merged-this-week", "options": []},
+            channel=SimpleNamespace(id=123, type=SimpleNamespace(value=0), parent_id=None),
+            guild=None,
+            message=None,
+            extras={},
+            response=_RecordingResponse(),
+            followup=SimpleNamespace(send=record_followup),
+        )
+        with mock.patch("contributor_bot.gateway.handle_interaction", side_effect=fake_handle):
+            asyncio.run(_dispatch_command(None, interaction, config, store))
+
+        self.assertEqual(events, [("defer", True), ("handle_interaction",)])
+        self.assertEqual(len(handler_thread_ids), 1)
+        self.assertNotEqual(handler_thread_ids[0], main_thread_id)
+
+        # 2) Discord 10062 Unknown interaction on defer: logs once, no second send_message, no handler run.
+        class _ExpiredError(RuntimeError):
+            code = 10062
+
+        send_calls = []
+
+        class _ExpiredResponse:
+            def is_done(self):
+                return False
+
+            async def defer(self, *, ephemeral=False):
+                raise _ExpiredError("404 Not Found (error code: 10062): Unknown interaction")
+
+            async def send_message(self, content, *, ephemeral=False):
+                send_calls.append(content)
+
+        expired_interaction = SimpleNamespace(
+            guild_id=333,
+            application_id=444,
+            channel_id=123,
+            token="tokentokentoken",
+            user=SimpleNamespace(id=111),
+            data={"name": "merged-this-week", "options": []},
+            channel=SimpleNamespace(id=123, type=SimpleNamespace(value=0), parent_id=None),
+            guild=None,
+            message=None,
+            extras={},
+            response=_ExpiredResponse(),
+            followup=SimpleNamespace(send=record_followup),
+        )
+        handler_mock = mock.Mock()
+        with mock.patch("contributor_bot.gateway.handle_interaction", handler_mock), \
+                self.assertLogs(level="WARNING") as logs:
+            asyncio.run(_dispatch_command(None, expired_interaction, config, store))
+        self.assertEqual(send_calls, [])
+        self.assertEqual(followups, [])
+        handler_mock.assert_not_called()
+        self.assertEqual(sum("10062" in entry for entry in logs.output), 1)
+
+    def test_github_token_fallback_403_retry_and_single_weekly_scheduler(self):
+        import io
+        import time
+        from email.message import Message
+        from urllib.error import HTTPError
+        from contributor_bot import api
+        from contributor_bot.config import get_config
+        from contributor_bot.main import _run_loop
+        from contributor_bot.weekly import post_weekly_if_due, reset_org_members_cache
+
+        api.reset_github_rate_limit_state()
+        reset_org_members_cache()
+
+        # 1) GITHUB_ACTOR_TOKEN is used for GitHub reads when GITHUB_TOKEN is unset; GITHUB_TOKEN wins if both set.
+        base_env = {
+            "DISCORD_BOT_TOKEN": "token",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+            "ANNOUNCEMENTS_CHANNEL_ID": "456",
+        }
+        cfg_actor = get_config(base_env | {"GITHUB_ACTOR_TOKEN": "ghp_actor_only"})
+        self.assertEqual(cfg_actor.github_token, "ghp_actor_only")
+        self.assertEqual(cfg_actor.effective_github_token, "ghp_actor_only")
+        cfg_both = get_config(base_env | {"GITHUB_TOKEN": "ghp_primary", "GITHUB_ACTOR_TOKEN": "ghp_actor"})
+        self.assertEqual(cfg_both.github_token, "ghp_primary")
+        self.assertEqual(cfg_both.github_actor_token, "ghp_actor")
+
+        # Verify Authorization: Bearer header is sent on GitHub reads and 403 rate-limit retries after reset.
+        seen_auth = []
+        sleeps = []
+
+        class _FakeOK:
+            status = 200
+            headers = {"X-RateLimit-Remaining": "4999", "X-RateLimit-Reset": str(int(time.time()) + 3600)}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _n=-1):
+                return b'{"login": "octocat"}'
+
+        call_count = {"n": 0}
+
+        def fake_open(req, timeout=15):
+            seen_auth.append(req.get_header("Authorization"))
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                hdrs = Message()
+                hdrs["X-RateLimit-Remaining"] = "0"
+                hdrs["X-RateLimit-Reset"] = str(int(time.time()) + 1)
+                raise HTTPError(req.full_url, 403, "rate limit exceeded", hdrs, io.BytesIO(b"{}"))
+            return _FakeOK()
+
+        with mock.patch.object(api, "_open_request", side_effect=fake_open), \
+                mock.patch.object(api.time, "sleep", side_effect=lambda s: sleeps.append(s)):
+            data = api.github_get_json("https://api.github.com/users/octocat", cfg_actor.effective_github_token)
+        self.assertEqual(data, {"login": "octocat"})
+        self.assertEqual(seen_auth, ["Bearer ghp_actor_only", "Bearer ghp_actor_only"])
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreater(sleeps[0], 0.0)
+
+        # 2) Long-reset 403 in post_weekly_if_due does NOT crash or mark the week posted (retries on next tick).
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        friday = datetime(2026, 11, 27, 15, 0, tzinfo=timezone.utc)
+
+        def fail_403(url, _tok, **_kwargs):
+            if "/orgs/" in url:
+                return []
+            raise api.TransientAPIError("api.github.com returned HTTP 403", retry_after=1800.0)
+
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fail_403):
+            result = post_weekly_if_due(cfg_actor, store, friday)
+        self.assertIsNone(result)
+        self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
+
+        # 3) Only one weekly scheduler: _run_loop never calls legacy poller.poll_once even if announcements_enabled=True.
+        stop_event = mock.Mock()
+        stop_event.is_set.return_value = True
+        cfg_legacy_on = Config(
+            "tok", "123", "456",
+            announcements_enabled=True,
+            merged_weekly_enabled=True,
+            pr_review_enabled=False,
+        )
+        with mock.patch("contributor_bot.main.poll_once") as legacy_poll, \
+                self.assertLogs(level="INFO") as logs:
+            _run_loop(cfg_legacy_on, stop_event, store=store, gateway=None)
+        legacy_poll.assert_not_called()
+        combined_logs = "\n".join(logs.output)
+        self.assertIn("Weekly contributor summary: friday 10:00 America/Toronto, destination 456", combined_logs)
+        self.assertNotIn("Weekly contributor roundup:", combined_logs)
 
 
 class SampleRoutingTests(unittest.TestCase):

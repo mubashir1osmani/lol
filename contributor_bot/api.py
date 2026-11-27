@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -174,6 +175,77 @@ def _validate_request(request: Request) -> None:
 class TransientAPIError(RuntimeError):
     """A temporary upstream failure; retry on the next poll."""
 
+    def __init__(self, message: str, *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+_github_rate_lock = threading.Lock()
+_github_rate_state: dict[str, float | int | None] = {"remaining": None, "reset": None}
+
+
+def reset_github_rate_limit_state() -> None:
+    """Test helper."""
+    with _github_rate_lock:
+        _github_rate_state["remaining"] = None
+        _github_rate_state["reset"] = None
+
+
+def github_rate_limit_status() -> tuple[int | None, float | None]:
+    """Return latest observed (X-RateLimit-Remaining, X-RateLimit-Reset epoch)."""
+    with _github_rate_lock:
+        rem = _github_rate_state["remaining"]
+        rst = _github_rate_state["reset"]
+    return (int(rem) if isinstance(rem, int) else None, float(rst) if isinstance(rst, (int, float)) else None)
+
+
+def _record_github_rate_headers(host: str | None, headers) -> None:
+    if host != "api.github.com" or headers is None:
+        return
+    raw_rem = headers.get("X-RateLimit-Remaining")
+    raw_reset = headers.get("X-RateLimit-Reset")
+    rem = None
+    rst = None
+    try:
+        if raw_rem is not None:
+            rem = int(raw_rem)
+    except (TypeError, ValueError):
+        rem = None
+    try:
+        if raw_reset is not None:
+            rst = float(raw_reset)
+    except (TypeError, ValueError):
+        rst = None
+    if rem is None and rst is None:
+        return
+    with _github_rate_lock:
+        if rem is not None:
+            _github_rate_state["remaining"] = rem
+        if rst is not None:
+            _github_rate_state["reset"] = rst
+
+
+def _rate_limit_delay(error: HTTPError, details: str, *, now: float | None = None) -> float | None:
+    retry_after = error.headers.get("Retry-After") if error.headers is not None else None
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except (ValueError, TypeError):
+            pass
+    if error.code == 429:
+        try:
+            return max(0.0, float(json.loads(details)["retry_after"]))
+        except (ValueError, TypeError, KeyError):
+            pass
+    reset_raw = error.headers.get("X-RateLimit-Reset") if error.headers is not None else None
+    if reset_raw is not None:
+        try:
+            current = time.time() if now is None else now
+            return max(0.0, float(reset_raw) - current) + 0.5
+        except (ValueError, TypeError):
+            pass
+    return None
+
 
 def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
     _validate_request(request)
@@ -183,35 +255,35 @@ def _http(request: Request, attempts: int = 2) -> tuple[int, Any, bytes]:
                 body = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(body) > MAX_RESPONSE_BYTES:
                     raise RuntimeError("API response exceeds the size limit")
+                _record_github_rate_headers(request.host, response.headers)
                 return response.status, response.headers, body
         except HTTPError as error:
             if error.code == 304:
+                _record_github_rate_headers(request.host, error.headers)
                 error.close()
                 return 304, error.headers, b""
             details = error.read(500).decode("utf-8", errors="replace")
+            _record_github_rate_headers(request.host, error.headers)
             error.close()
-            retryable = error.code in _RETRYABLE_STATUS or (
-                error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0"
+            has_retry_after = bool(error.headers and error.headers.get("Retry-After"))
+            github_rate_limited = error.code == 403 and (
+                (error.headers and error.headers.get("X-RateLimit-Remaining") == "0")
+                or has_retry_after
             )
+            retryable = error.code in _RETRYABLE_STATUS or github_rate_limited
             delay = 1.0 if error.code in {500, 502, 503, 504} else None
-            if error.code == 429:
-                # Discord's short per-channel cooldown is common during
-                # history pagination. Honor it so a large backfill can finish.
-                try:
-                    delay = float(error.headers.get("Retry-After") or json.loads(details)["retry_after"])
-                except (ValueError, TypeError, KeyError):
-                    delay = None
+            if error.code == 429 or github_rate_limited:
+                delay = _rate_limit_delay(error, details)
             if (
                 delay is not None and math.isfinite(delay) and 0 <= delay <= 60
                 and attempt + 1 < attempts
             ):
                 time.sleep(delay)
                 continue
-            raise (TransientAPIError if retryable else RuntimeError)(
-                # Do not log upstream bodies, which can echo credentials or
-                # other untrusted content. Status and host identify failures.
-                f"{request.host} returned HTTP {error.code}"
-            ) from error
+            message = f"{request.host} returned HTTP {error.code}"
+            if retryable:
+                raise TransientAPIError(message, retry_after=delay) from error
+            raise RuntimeError(message) from error
         except OSError as error:
             if attempt + 1 < attempts:
                 time.sleep(1)

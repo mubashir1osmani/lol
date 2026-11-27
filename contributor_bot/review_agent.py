@@ -271,7 +271,7 @@ def _json(payload: dict, limit: int | None = None) -> str:
 
 def _snapshot(ctx: ReviewContext):
     if ctx.snapshot is None:
-        ctx.snapshot = gather_snapshot(ctx.config.github_repository, ctx.number, ctx.config.github_token)
+        ctx.snapshot = gather_snapshot(ctx.config.github_repository, ctx.number, ctx.config.effective_github_token)
     return ctx.snapshot
 
 
@@ -279,7 +279,7 @@ def _files(ctx: ReviewContext) -> list:
     if ctx.files is None:
         payload = github_get_json(
             f"{GITHUB_API}/repos/{ctx.config.github_repository}/pulls/{ctx.number}/files?per_page=100",
-            ctx.config.github_token,
+            ctx.config.effective_github_token,
             pace=True,
         )
         if not isinstance(payload, list):
@@ -338,7 +338,7 @@ def tool_read_file(ctx: ReviewContext, args: dict) -> str:
     quoted = quote(path, safe="/")
     payload = github_get_json(
         f"{GITHUB_API}/repos/{ctx.config.github_repository}/contents/{quoted}?ref={sha}",
-        ctx.config.github_token,
+        ctx.config.effective_github_token,
         pace=True,
     )
     if not isinstance(payload, dict):
@@ -362,7 +362,7 @@ def tool_search_code(ctx: ReviewContext, args: dict) -> str:
     if not cleaned:
         return _json({"error": "query is required"})
     params = urlencode({"q": f"repo:{ctx.config.github_repository} {cleaned}", "per_page": 8})
-    payload = github_get_json(f"{GITHUB_API}/search/code?{params}", ctx.config.github_token, pace=True)
+    payload = github_get_json(f"{GITHUB_API}/search/code?{params}", ctx.config.effective_github_token, pace=True)
     items = payload.get("items") if isinstance(payload, dict) else None
     hits = []
     for item in items or []:
@@ -424,7 +424,7 @@ def tool_get_ci(ctx: ReviewContext, _args: dict) -> str:
             try:
                 notes = github_get_json(
                     f"{GITHUB_API}/repos/{ctx.config.github_repository}/check-runs/{run['id']}/annotations?per_page=20",
-                    ctx.config.github_token,
+                    ctx.config.effective_github_token,
                     pace=True,
                 )
             except Exception as error:

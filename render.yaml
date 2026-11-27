@@ -27,13 +27,12 @@ services:
       # No GitHub or Render credentials: public PRs can be read anonymously.
       - key: POLL_INTERVAL_MINUTES
         value: "5"
-      # Keep the first deployment quiet until the moderators-only test is done.
-      - key: ANNOUNCEMENTS_ENABLED
-        value: "false"
-      # Contributor roles stay off on this worker. Turning them on needs a
-      # public HTTPS port for the GitHub webhook and Discord interactions.
-      # See the README before setting CONTRIBUTOR_ROLES_ENABLED.
-      - key: ROUNDUP_TIMEZONE
+      # Weekly Friday 10:00 AM America/Toronto summary posts to ANNOUNCEMENTS_CHANNEL_ID.
+      - key: MERGED_WEEKLY_ENABLED
+        value: "true"
+      - key: MERGED_POST_WEEKDAY
+        value: friday
+      - key: MERGED_POST_TIME
+        value: "10:00"
+      - key: MERGED_POST_TIMEZONE
         value: America/Toronto
-      - key: ROUNDUP_TIME
-        value: "09:00"

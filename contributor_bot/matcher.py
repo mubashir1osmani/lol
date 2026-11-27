@@ -41,6 +41,7 @@ from .api import (
     TransientAPIError,
     fetch_guild_members,
     github_get_json,
+    github_rate_limit_status,
     search_guild_members,
 )
 from .config import is_discord_id
@@ -53,6 +54,7 @@ MAX_CANDIDATES_PER_AUTHOR = 3
 MAX_PAIRS_PER_BATCH = 30
 FUZZY_CANDIDATE_THRESHOLD = 0.72
 MATCH_CACHE_TTL_DAYS = 30
+GITHUB_USER_CACHE_TTL_DAYS = 7
 REST_MEMBERS_CACHE_TTL_SECONDS = 900.0
 GUILD_FETCH_TIMEOUT_SECONDS = 60.0
 
@@ -256,6 +258,27 @@ def _is_rate_limit_error(error: Exception) -> bool:
     return "HTTP 403" in text or "HTTP 429" in text or "rate limit" in text.lower()
 
 
+def _github_budget_available(*, sleep=time.sleep, clock=time.time) -> bool:
+    """Return True if GitHub API budget is available, waiting briefly when reset is imminent."""
+    remaining, reset = github_rate_limit_status()
+    if remaining is None or remaining > 2:
+        return True
+    now_ts = clock()
+    if reset is None or reset <= now_ts:
+        return True
+    delay = reset - now_ts + 0.25
+    if 0 < delay <= 60.0:
+        logging.info("GitHub rate limit low (remaining=%d); waiting %.1fs for reset", remaining, delay)
+        sleep(delay)
+        return True
+    logging.warning(
+        "GitHub rate limit nearly exhausted (remaining=%d, resets in %.0fs); deferring further profile lookups",
+        remaining,
+        delay,
+    )
+    return False
+
+
 def fetch_github_author_profile(
     login: str,
     repository: str,
@@ -264,9 +287,12 @@ def fetch_github_author_profile(
     *,
     user_id: int | None = None,
     getter=None,
+    store=None,
+    now: datetime | None = None,
 ) -> tuple[GitHubAuthorProfile, bool]:
-    """Fetch GitHub user profile + PR commit author names and email local parts."""
+    """Fetch GitHub user profile (with 7-day SQLite cache) + PR commit author names/email locals."""
     fetch = getter or github_get_json
+    moment = now or datetime.now(UTC)
     name = ""
     blog = ""
     twitter = ""
@@ -290,32 +316,68 @@ def fetch_github_author_profile(
         if cleaned.casefold() not in {n.casefold() for n in commit_names}:
             commit_names.append(cleaned)
 
+    used_cached_user = False
     if login and re.fullmatch(r"[A-Za-z0-9-]+", login):
-        try:
-            profile = fetch(f"{GITHUB_API}/users/{login}", token, pace=False)
-            if isinstance(profile, dict):
-                name = (profile.get("name") or "").strip() if isinstance(profile.get("name"), str) else ""
-                blog = (profile.get("blog") or "").strip() if isinstance(profile.get("blog"), str) else ""
-                twitter = (
-                    (profile.get("twitter_username") or "").strip().lstrip("@")
-                    if isinstance(profile.get("twitter_username"), str) else ""
-                )
-                bio = (profile.get("bio") or "").strip() if isinstance(profile.get("bio"), str) else ""
-                _add_email(profile.get("email"))
-        except Exception as error:
-            if _is_rate_limit_error(error):
+        cached_user = (
+            store.get_cached_github_user(login)
+            if store is not None and hasattr(store, "get_cached_github_user")
+            else None
+        )
+        if cached_user and _match_is_fresh(cached_user.get("fetched_at"), moment, ttl_days=GITHUB_USER_CACHE_TTL_DAYS):
+            used_cached_user = True
+            name = (cached_user.get("name") or "").strip()
+            blog = (cached_user.get("blog") or "").strip()
+            twitter = (cached_user.get("twitter_username") or "").strip().lstrip("@")
+            bio = (cached_user.get("bio") or "").strip()
+            cached_email_local = (cached_user.get("email_local") or "").strip()
+            if cached_email_local:
+                email_locals.append(cached_email_local)
+
+        if not used_cached_user:
+            if getter is None and not _github_budget_available():
                 rate_limited = True
-            logging.warning("Could not fetch GitHub profile for %s: %s", login, error)
+            else:
+                try:
+                    profile = fetch(f"{GITHUB_API}/users/{login}", token, pace=True)
+                    if isinstance(profile, dict):
+                        name = (profile.get("name") or "").strip() if isinstance(profile.get("name"), str) else ""
+                        blog = (profile.get("blog") or "").strip() if isinstance(profile.get("blog"), str) else ""
+                        twitter = (
+                            (profile.get("twitter_username") or "").strip().lstrip("@")
+                            if isinstance(profile.get("twitter_username"), str) else ""
+                        )
+                        bio = (profile.get("bio") or "").strip() if isinstance(profile.get("bio"), str) else ""
+                        _add_email(profile.get("email"))
+                        if store is not None and hasattr(store, "save_cached_github_user"):
+                            try:
+                                store.save_cached_github_user(
+                                    login,
+                                    name=name,
+                                    blog=blog,
+                                    twitter_username=twitter,
+                                    bio=bio,
+                                    email_local=email_locals[0] if email_locals else "",
+                                    fetched_at=iso(moment),
+                                )
+                            except Exception as cache_error:
+                                logging.warning("Could not cache GitHub profile for %s: %s", login, cache_error)
+                except Exception as error:
+                    if _is_rate_limit_error(error):
+                        rate_limited = True
+                    logging.warning("Could not fetch GitHub profile for %s: %s", login, error)
 
     if not rate_limited and repository and pull_numbers:
         for pr_number in pull_numbers[:2]:
             if not isinstance(pr_number, int) or pr_number <= 0:
                 continue
+            if getter is None and not _github_budget_available():
+                rate_limited = True
+                break
             try:
                 commits = fetch(
                     f"{GITHUB_API}/repos/{repository}/pulls/{pr_number}/commits?per_page=30",
                     token,
-                    pace=False,
+                    pace=True,
                 )
             except Exception as error:
                 if _is_rate_limit_error(error):
@@ -1273,6 +1335,8 @@ def match_community_contributors_with_diagnostics(
                     token,
                     user_id=group.get("user_id"),
                     getter=github_getter,
+                    store=store,
+                    now=moment,
                 )
                 if hit_limit:
                     rate_limited = True

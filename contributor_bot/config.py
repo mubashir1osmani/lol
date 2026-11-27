@@ -124,6 +124,10 @@ class Config:
     bot_status_rotate: bool = False
 
     @property
+    def effective_github_token(self) -> str | None:
+        return self.github_token or self.github_actor_token
+
+    @property
     def scope(self) -> dict[str, str]:
         return {
             "repository": self.github_repository.lower(),
@@ -186,12 +190,15 @@ def get_config(env: dict[str, str] | None = None) -> Config:
     elif review_settings is not None:
         webhook_secret = review_settings.get("github_webhook_secret")
 
+    actor_token = values.get("GITHUB_ACTOR_TOKEN", "").strip() or None
+    github_token = values.get("GITHUB_TOKEN", "").strip() or actor_token
+
     return Config(
         discord_token=token,
         contributions_channel_id=source,
         announcements_channel_id=destination,
         github_repository=repository,
-        github_token=values.get("GITHUB_TOKEN", "").strip() or None,
+        github_token=github_token,
         poll_interval_seconds=interval,
         state_file=values.get("STATE_FILE", "").strip() or ".data/contributors.json",
         github_discord_map={login.lower(): user_id for login, user_id in mapping.items()},

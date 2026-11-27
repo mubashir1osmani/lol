@@ -125,17 +125,21 @@ class Gateway:
             )
             if self._commands_synced or self._stop.is_set():
                 return
-            try:
-                synced = await sync_guild_commands(tree, discord, config)
-            except Exception:
-                logging.exception(
-                    "Could not sync slash commands to guild %s. "
-                    "Commands registered over REST stay in place.",
-                    config.discord_guild_id,
-                )
-                return
-            if synced:
-                self._commands_synced = True
+
+            async def _sync_commands() -> None:
+                try:
+                    synced = await sync_guild_commands(tree, discord, config)
+                except Exception:
+                    logging.exception(
+                        "Could not sync slash commands to guild %s. "
+                        "Commands registered over REST stay in place.",
+                        config.discord_guild_id,
+                    )
+                    return
+                if synced:
+                    self._commands_synced = True
+
+            asyncio.create_task(_sync_commands())
 
         @client.event
         async def on_disconnect():
@@ -155,10 +159,14 @@ class Gateway:
             channel_id = payload["channel_id"]
             channel_name = getattr(message.channel, "name", "") or ""
             payload["channel_name"] = channel_name
-            if config.pr_review_enabled and message_is_thread(message, store):
-                _start_worker(handle_thread_message, (config, store, payload), "review-followup")
-                return
             channel_type = channel_type_value(getattr(message.channel, "type", None))
+            if config.pr_review_enabled:
+                is_thread = channel_type in THREAD_CHANNEL_TYPES
+                if not is_thread:
+                    is_thread = await asyncio.to_thread(message_is_thread, message, store)
+                if is_thread:
+                    _start_worker(handle_thread_message, (config, store, payload), "review-followup")
+                    return
             if channel_type not in {0, 5}:
                 return
             in_review_channel = config.review_watch_all_channels or channel_id in config.review_channel_ids
@@ -260,11 +268,13 @@ def _start_weekly_task(discord, client, config, store) -> None:
     @merged_weekly_post.before_loop
     async def wait_until_ready():
         await client.wait_until_ready()
+        dest = (config.announcements_channel_id or "").strip() or "#announcements"
         logging.info(
-            "Weekly contributor summary scheduler active: %s %s %s",
+            "Weekly contributor summary scheduler active: %s %s %s, destination %s",
             day_label,
             config.merged_time,
             config.merged_timezone,
+            dest,
         )
 
     try:
@@ -536,28 +546,45 @@ def _interaction_payload(interaction, *, guild=None, loop=None) -> dict:
     return payload
 
 
+_DEFERRED_COMMAND_EPHEMERAL = {
+    "merged-this-week": True,
+    "my-prs": True,
+}
+
+
+def _is_unknown_interaction(error: Exception) -> bool:
+    return getattr(error, "code", None) == 10062
+
+
 async def _dispatch_command(discord, interaction, config: Config, store: Store | None, *, client=None) -> None:
+    data_raw = getattr(interaction, "data", None) or {}
+    cmd_name = data_raw.get("name") if isinstance(data_raw, dict) else ""
     try:
+        # Defer long-running commands as the very first await so nothing on the
+        # event loop (SQLite, HTTP, worker launch) can push past Discord's 3s window.
+        if cmd_name in _DEFERRED_COMMAND_EPHEMERAL and not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=_DEFERRED_COMMAND_EPHEMERAL[cmd_name])
+
         if store is None:
-            await interaction.response.send_message("this bot isn't ready for commands yet.", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("this bot isn't ready for commands yet.", ephemeral=True)
+            else:
+                await interaction.response.send_message("this bot isn't ready for commands yet.", ephemeral=True)
             return
+
         guild = getattr(interaction, "guild", None)
         if guild is None and client is not None and getattr(interaction, "guild_id", None) and hasattr(client, "get_guild"):
             try:
                 guild = client.get_guild(int(interaction.guild_id))
             except (TypeError, ValueError):
                 guild = None
-        response = handle_interaction(
-            config,
-            store,
-            _interaction_payload(interaction, guild=guild, loop=asyncio.get_running_loop()),
-        )
+
+        payload = _interaction_payload(interaction, guild=guild, loop=asyncio.get_running_loop())
+        response = await asyncio.to_thread(handle_interaction, config, store, payload)
         data = response.get("data") or {}
         content = data.get("content") or "ok"
         ephemeral = bool(data.get("flags", 0) & 64)
         if response.get("type") == 5:
-            # Ack within Discord's 3 second window. The long review edits this
-            # response when it finishes, including cooldown and budget notes.
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=ephemeral)
             return
@@ -565,7 +592,10 @@ async def _dispatch_command(discord, interaction, config: Config, store: Store |
             await interaction.followup.send(content, ephemeral=ephemeral)
             return
         await interaction.response.send_message(content, ephemeral=ephemeral)
-    except Exception:
+    except Exception as error:
+        if _is_unknown_interaction(error):
+            logging.warning("Interaction expired before acknowledgement (Discord 10062) for /%s", cmd_name or "unknown")
+            return
         logging.exception("Slash command failed")
         try:
             if interaction.response.is_done():
@@ -574,8 +604,11 @@ async def _dispatch_command(discord, interaction, config: Config, store: Store |
                 await interaction.response.send_message(
                     "couldn't run that command. try again in a bit.", ephemeral=True,
                 )
-        except Exception:
-            logging.exception("Could not send the slash-command error")
+        except Exception as send_error:
+            if _is_unknown_interaction(send_error):
+                logging.warning("Interaction expired before error reply (Discord 10062) for /%s", cmd_name or "unknown")
+            else:
+                logging.exception("Could not send the slash-command error")
 
 
 def _bind_command_tree(discord, client, config: Config, store: Store | None):

@@ -24,7 +24,7 @@ def ingest_number(config: Config, store: Store, number: int) -> bool:
 
     Returns False when the pull request is not a merged human contribution.
     """
-    pull = fetch_pull_request(config.github_repository, number, config.github_token)
+    pull = fetch_pull_request(config.github_repository, number, config.effective_github_token)
     user = pull.get("user") if isinstance(pull.get("user"), dict) else {}
     if not pull.get("merged") or _is_bot(user):
         return False
@@ -33,7 +33,7 @@ def ingest_number(config: Config, store: Store, number: int) -> bool:
     merged_raw = pull.get("merged_at")
     if not isinstance(login, str) or not isinstance(user_id, int) or not isinstance(merged_raw, str):
         raise RuntimeError(f"Merged PR #{number} is missing its author or merge time")
-    files = fetch_pull_files(config.github_repository, number, config.github_token)
+    files = fetch_pull_files(config.github_repository, number, config.effective_github_token)
     title = pull.get("title") if isinstance(pull.get("title"), str) else ""
     store.upsert_pull(
         repository=config.github_repository,
