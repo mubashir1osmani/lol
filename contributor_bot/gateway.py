@@ -585,13 +585,23 @@ def _interaction_payload(interaction, *, guild=None, loop=None) -> dict:
                 continue
             options.append({"name": name, "value": value})
     place = interaction_place(interaction)
+    member_payload: dict = {"user": {"id": str(interaction.user.id)}}
+    perms = getattr(interaction, "permissions", None)
+    if perms is None:
+        perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is not None:
+        raw_value = getattr(perms, "value", perms)
+        try:
+            member_payload["permissions"] = str(int(raw_value))
+        except (TypeError, ValueError):
+            pass
     payload = {
         "type": 2,
         "guild_id": str(interaction.guild_id or ""),
         "application_id": str(interaction.application_id or ""),
         "channel_id": place["channel_id"],
         "token": interaction.token,
-        "member": {"user": {"id": str(interaction.user.id)}},
+        "member": member_payload,
         "data": {"name": data.get("name"), "options": options},
         "channel": {"id": place["channel_id"], "type": place["channel_type"]},
     }
@@ -713,7 +723,8 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
         async def merged_this_week(interaction):
             await _dispatch_command(discord, interaction, config, store, client=client)
 
-        add(spec, merged_this_week)
+        restricted = app.default_permissions(manage_messages=True)(merged_this_week)
+        add(spec, restricted)
     return tree
 
 
