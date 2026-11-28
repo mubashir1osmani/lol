@@ -35,13 +35,16 @@ def answer_question(config, channel_id: str, text: str, *, complete=None) -> Non
     if now - _recent.get(channel_id, 0.0) < 20:
         return
     _recent[channel_id] = now
+    from .tracing import agent_span, build_trace_metadata
+
     model = config.review_classifier_model or config.review_model or "anthropic/claude-haiku-4-5"
+    safe_question = discord_safe(text)[:1500]
+    session_id = f"discord_qa:{channel_id}"
     if complete is None:
         from .review_llm import complete_litellm
-        from .tracing import build_trace_metadata
         metadata = build_trace_metadata(
             "discord_qa",
-            session_id=f"discord_qa:{channel_id}",
+            session_id=session_id,
             extra={"channel_id": str(channel_id)},
         )
         complete = lambda system, body: complete_litellm(
@@ -52,18 +55,25 @@ def answer_question(config, channel_id: str, text: str, *, complete=None) -> Non
             ],
             metadata=metadata,
         )
-    try:
-        reply = complete(_SYSTEM, discord_safe(text)[:1500])
-    except Exception as error:
-        logging.warning("Could not answer a server question: %s", error)
-        return
-    reply = discord_safe(reply or "").strip()
-    if not reply:
-        return
-    try:
-        post_message(channel_id, config.discord_token, {
-            "content": reply[:1900],
-            "allowed_mentions": {"parse": []},
-        })
-    except Exception as error:
-        logging.warning("Could not post a server answer: %s", error)
+    with agent_span(
+        "discord_qa",
+        session_id=session_id,
+        input_value=safe_question,
+        attributes={"discord.channel_id": str(channel_id)},
+    ) as span:
+        try:
+            reply = complete(_SYSTEM, safe_question)
+        except Exception as error:
+            logging.warning("Could not answer a server question: %s", error)
+            return
+        reply = discord_safe(reply or "").strip()
+        if not reply:
+            return
+        span.set_output(reply[:1900])
+        try:
+            post_message(channel_id, config.discord_token, {
+                "content": reply[:1900],
+                "allowed_mentions": {"parse": []},
+            })
+        except Exception as error:
+            logging.warning("Could not post a server answer: %s", error)

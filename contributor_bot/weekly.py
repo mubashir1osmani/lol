@@ -416,32 +416,43 @@ def summarize_pr_titles(
         },
         {"role": "user", "content": json.dumps(items_payload)},
     ]
-    try:
-        if summarizer is not None:
-            raw = summarizer(model, messages)
-        else:
-            from .review_llm import complete_litellm
-            from .tracing import build_trace_metadata
-            metadata = build_trace_metadata(
-                "weekly_summary",
-                session_id=f"weekly_summary:{len(pulls_by_num)}prs",
-            )
-            raw = complete_litellm(model, messages, timeout=llm_timeout, metadata=metadata)
-        start = raw.find("{")
-        end = raw.rfind("}")
-        parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}
-    except Exception as error:
-        logging.warning("PR title summarization fallback to deterministic cleanup: %s", error)
-        return fallbacks
+    from .tracing import agent_span, build_trace_metadata
 
-    if not isinstance(parsed, dict):
-        return fallbacks
-    summaries = dict(fallbacks)
-    for num, fallback in fallbacks.items():
-        candidate = parsed.get(str(num))
-        if isinstance(candidate, str) and candidate.strip():
-            summaries[num] = _sanitize_summary(candidate, fallback)
-    return summaries
+    session_id = f"weekly_summary:{len(pulls_by_num)}prs"
+    with agent_span(
+        "weekly_summary",
+        session_id=session_id,
+        input_value=items_payload,
+        attributes={"weekly.pr_count": len(pulls_by_num)},
+    ) as span:
+        try:
+            if summarizer is not None:
+                raw = summarizer(model, messages)
+            else:
+                from .review_llm import complete_litellm
+                metadata = build_trace_metadata(
+                    "weekly_summary",
+                    session_id=session_id,
+                )
+                raw = complete_litellm(model, messages, timeout=llm_timeout, metadata=metadata)
+            start = raw.find("{")
+            end = raw.rfind("}")
+            parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}
+        except Exception as error:
+            logging.warning("PR title summarization fallback to deterministic cleanup: %s", error)
+            span.set_output({"fallback": True, "pr_count": len(fallbacks)})
+            return fallbacks
+
+        if not isinstance(parsed, dict):
+            span.set_output({"fallback": True, "pr_count": len(fallbacks)})
+            return fallbacks
+        summaries = dict(fallbacks)
+        for num, fallback in fallbacks.items():
+            candidate = parsed.get(str(num))
+            if isinstance(candidate, str) and candidate.strip():
+                summaries[num] = _sanitize_summary(candidate, fallback)
+        span.set_output({str(k): v for k, v in summaries.items()})
+        return summaries
 
 
 def community_groups(

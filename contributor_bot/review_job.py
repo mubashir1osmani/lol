@@ -523,17 +523,25 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
     if not config.review_classify:
         numbers = should_review_message(message, config.github_repository, require_ask=config.review_require_ask)
         return bool(numbers), numbers
+    from .tracing import agent_span
+
     text = message.get("content") or ""
     channel_id = message.get("channel_id") or message.get("id") or ""
     session_id = f"pr_review_classifier:{channel_id}" if channel_id else None
-    asked = classify_review_request(
-        text,
-        config.github_repository,
-        complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
-    )
-    if not asked:
-        return False, []
-    return True, should_review_message(message, config.github_repository, require_ask=False)
+    with agent_span(
+        "pr_review_classifier",
+        session_id=session_id,
+        input_value=text[:800],
+        attributes={"discord.channel_id": str(channel_id)},
+    ) as span:
+        asked = classify_review_request(
+            text,
+            config.github_repository,
+            complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
+        )
+        numbers = should_review_message(message, config.github_repository, require_ask=False) if asked else []
+        span.set_output({"asked": asked, "numbers": numbers})
+        return asked, numbers
 
 
 def _mentioned_numbers_in_thread(text: str, repository: str, records: list[dict]) -> list[dict]:
