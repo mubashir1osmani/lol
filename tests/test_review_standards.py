@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import tempfile
@@ -32,6 +33,7 @@ from contributor_bot.reviews import (
     assess_gate,
     clean_review_text,
     discord_length,
+    extract_linked_issue_numbers,
     files_from_unified_diff,
     load_review_standards,
     normalize_verdict,
@@ -210,7 +212,12 @@ class StandardsDocTests(unittest.TestCase):
             self.assertGreater(len(path.read_text(encoding="utf-8").strip()), 100)
 
         standards = load_review_standards()
+        self.assertLess(
+            standards.index("## 1. Root-Cause Analysis First"),
+            standards.index("## 2. Put Code in the Right Layer"),
+        )
         for expected in (
+            "Root-Cause Analysis First",
             "litellm/llms/openai_like/providers.json",
             "litellm/llms/<provider>/<endpoint>/transformation.py",
             "litellm/__init__.py",
@@ -246,6 +253,10 @@ class StandardsDocTests(unittest.TestCase):
         self.assertIn("regression", prompt.lower())
         self.assertIn("inline (function-level) imports", prompt.lower())
         self.assertIn("standards_signals", prompt)
+        self.assertIn("get_issue", prompt)
+        self.assertIn("root-cause analysis", prompt.lower())
+        self.assertIn("patches around", prompt.lower())
+        self.assertIn("read_file", prompt)
 
 
 class OutputFormatTests(unittest.TestCase):
@@ -713,6 +724,204 @@ class StrictRuleChecksTests(unittest.TestCase):
         self.assertEqual(len(bullets), 3)
         self.assertLessEqual(len(bullets), MAX_REVIEW_BULLETS)
         self.assertTrue(any("no tests added or updated" in b for b in bullets))
+
+
+class RootCauseAnalysisTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = Store(str(Path(self.directory.name) / "roles.db"))
+        self.addCleanup(self.store.close)
+        self.config = replace(
+            Config("token", "123", "456", github_token="gh"),
+            pr_review_enabled=True,
+            review_channel_ids=("321",),
+            review_model="anthropic/claude-sonnet-4-5",
+            review_bot_logins=BOTS,
+            review_maintainer_role_id="555",
+            review_cooldown_seconds=600,
+            discord_guild_id="333",
+            discord_application_id="444",
+        )
+
+    def test_extract_linked_issue_numbers_and_get_issue_tool(self):
+        text = (
+            "Fixes #49102 and closes https://github.com/BerriAI/litellm/issues/49103. "
+            "Related to #49102 and PR #55110; ignores #1 and foo#99999."
+        )
+        nums = extract_linked_issue_numbers(text, "BerriAI/litellm", exclude_number=55110)
+        self.assertEqual(nums, [49103, 49102])
+
+        calls: list[str] = []
+
+        def fake_get(url, token, pace=False):
+            calls.append(url)
+            if url.endswith("/issues/49102"):
+                return {
+                    "number": 49102,
+                    "title": "Gemini tool calls crash with KeyError",
+                    "state": "open",
+                    "labels": [{"name": "bug"}],
+                    "body": "Traceback in litellm/llms/gemini/chat/transformation.py token=ghp_" + ("A" * 24),
+                }
+            if url.endswith("/issues/49102/comments?per_page=8"):
+                return [{"user": {"login": "reporter"}, "body": "Happens when functionCall omits args"}]
+            raise AssertionError(url)
+
+        ctx = ReviewContext(config=self.config, store=self.store, number=55110, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.github_get_json", side_effect=fake_get):
+            first = json.loads(execute_tool(ctx, "get_issue", {"number": 49102}))
+            second = json.loads(execute_tool(ctx, "get_issue", {"number": 49102}))
+            bad = json.loads(execute_tool(ctx, "get_issue", {"number": -5}))
+
+        self.assertEqual(first["number"], 49102)
+        self.assertEqual(first["labels"], ["bug"])
+        self.assertIn("[redacted]", first["body"])
+        self.assertEqual(first["comments"][0]["author"], "reporter")
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("error", bad)
+
+    def test_patch_around_fixture_puts_root_cause_bullet_first_with_real_fix_location(self):
+        patch_around_files = [
+            {
+                "filename": "litellm/main.py",
+                "status": "modified",
+                "additions": 6,
+                "deletions": 0,
+                "patch": (
+                    "@@ -410,2 +410,8 @@ def completion(model, messages, **kwargs):\n"
+                    "+    if custom_llm_provider == 'gemini':\n"
+                    "+        try:\n"
+                    "+            return _run_completion(model, messages, **kwargs)\n"
+                    "+        except KeyError:\n"
+                    "+            return ModelResponse()\n"
+                ),
+            },
+            {
+                "filename": "NOTES.md",
+                "status": "added",
+                "additions": 3,
+                "deletions": 0,
+                "patch": "@@ -0,0 +1,3 @@\n+# workaround notes\n",
+            },
+        ]
+        gemini_source = (
+            "class GoogleAIStudioGeminiConfig:\n"
+            "    def transform_response(self, raw_response):\n"
+            "        part = raw_response['candidates'][0]['content']['parts'][0]\n"
+            "        args = part['functionCall']['args']\n"
+            "        return args\n"
+        )
+        encoded_gemini = base64.b64encode(gemini_source.encode("utf-8")).decode("ascii")
+        snapshot = Snapshot(
+            number=55110,
+            title="Fix Gemini KeyError on empty tool call args",
+            head_sha=HEAD,
+            base_sha=BASE,
+            draft=False,
+            merged=False,
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            author_login="contrib",
+            author_id=7,
+            reviews=_clean_reviews(),
+            comments=[],
+            threads=[],
+            check_runs=[{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+            combined_state=None,
+            body="Fixes #49102. Catches KeyError in litellm/main.py for Gemini.",
+        )
+
+        def fake_get(url, token, pace=False):
+            if url.endswith("/pulls/55110/files?per_page=100"):
+                return patch_around_files
+            if url.endswith("/issues/49102"):
+                return {
+                    "number": 49102,
+                    "title": "Gemini tool calls crash with KeyError when args omitted",
+                    "state": "open",
+                    "labels": [{"name": "bug"}],
+                    "body": "KeyError: 'args' in litellm/llms/gemini/chat/transformation.py transform_response",
+                }
+            if url.endswith("/issues/49102/comments?per_page=8"):
+                return []
+            if "/contents/litellm/llms/gemini/chat/transformation.py" in url:
+                return {"encoding": "base64", "content": encoded_gemini}
+            raise AssertionError(url)
+
+        captured: dict = {}
+
+        def on_run(ctx: ReviewContext) -> None:
+            bundle = json.loads(execute_tool(ctx, "review_bundle", {}))
+            captured["linked_issues"] = bundle["linked_issues"]
+            issue = json.loads(execute_tool(ctx, "get_issue", {"number": bundle["linked_issues"][0]}))
+            diff = json.loads(execute_tool(ctx, "read_file_diff", {"path": "litellm/main.py"}))
+            upstream = json.loads(execute_tool(ctx, "read_file", {
+                "path": "litellm/llms/gemini/chat/transformation.py",
+                "ref": "base",
+            }))
+            captured["read_outside_diff"] = "transform_response" in upstream["text"]
+
+            findings: list[dict] = []
+            # Deliberately submit a style finding BEFORE the root_cause finding to verify hoisting to bullet #1.
+            findings.append({
+                "path": "litellm/main.py",
+                "line": 412,
+                "reason": "broad except KeyError returns an empty ModelResponse and hides real failures",
+            })
+            if (
+                "custom_llm_provider == 'gemini'" in diff["patch"]
+                and "transform_response" in issue["body"]
+                and "part['functionCall']['args']" in upstream["text"]
+            ):
+                findings.append({
+                    "path": "litellm/main.py",
+                    "line": 410,
+                    "root_cause": True,
+                    "reason": (
+                        "patches around the root cause with a gemini branch in litellm/main.py; "
+                        "real fix belongs in litellm/llms/gemini/chat/transformation.py:GoogleAIStudioGeminiConfig.transform_response"
+                    ),
+                })
+            tool_submit_verdict(ctx, {
+                "verdict": VERDICT_BELOW_STANDARDS,
+                "findings": findings,
+            })
+            captured["ctx"] = ctx
+
+        sdk, calls = _fake_sdk(on_run)
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=snapshot), \
+                mock.patch("contributor_bot.review_agent.github_get_json", side_effect=fake_get), \
+                mock.patch("contributor_bot.review_agent._load_sdk", return_value=sdk), \
+                mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]), \
+                mock.patch("contributor_bot.review_job.start_public_thread", return_value={"id": "900"}), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post, \
+                mock.patch("contributor_bot.api.post_issue_comment", side_effect=AssertionError("github write")):
+            result = perform_review(self.config, self.store, 55110, channel_id="321", message_id="654", source="new")
+
+        self.assertEqual(result["status"], "posted")
+        self.assertEqual(captured["linked_issues"], [49102])
+        self.assertTrue(captured["read_outside_diff"])
+        self.assertIn("Root-Cause Analysis", calls["instructions"])
+        self.assertEqual(captured["ctx"].verdict, VERDICT_BELOW_STANDARDS)
+        self.assertFalse(captured["ctx"].verdict_ready)
+
+        posted = post.call_args_list[0].args[2]["content"]
+        lines = posted.splitlines()
+        self.assertEqual(lines[0], VERDICT_BELOW_STANDARDS)
+        bullets = lines[1:]
+        self.assertLessEqual(len(bullets), MAX_REVIEW_BULLETS)
+        # Root-cause patch-around finding MUST be the top bullet (bullets[0]).
+        self.assertIn("patches around the root cause", bullets[0])
+        self.assertIn("litellm/llms/gemini/chat/transformation.py", bullets[0])
+        self.assertIn("transform_response", bullets[0])
+        # Deterministic checks (.md file + missing tests) still appear after it within the 5-bullet cap.
+        self.assertIn("NOTES.md", posted)
+        self.assertIn("no tests added or updated", posted)
+        self.assertIsNone(_EMOJI_RE.search(posted))
+        self.assertNotIn("<@&555>", "\n".join(call.args[2]["content"] for call in post.call_args_list))
 
 
 if __name__ == "__main__":
