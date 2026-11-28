@@ -206,6 +206,10 @@ class Gateway:
             if store is None:
                 return
             try:
+                store.note_member_activity(str(message.author.id), str(message.id))
+            except Exception:
+                logging.exception("Could not update member identity activity marker")
+            try:
                 raw_embeds = [
                     {"url": getattr(embed, "url", "") or ""}
                     for embed in (getattr(message, "embeds", None) or ())

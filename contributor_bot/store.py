@@ -219,6 +219,21 @@ CREATE TABLE IF NOT EXISTS job_locks (
     acquired_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS member_identity_notes (
+    discord_id TEXT PRIMARY KEY,
+    inferred_github_login TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    message_links_json TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL DEFAULT 0.0,
+    last_message_id TEXT NOT NULL DEFAULT '',
+    last_seen_message_id TEXT NOT NULL DEFAULT '',
+    messages_scanned INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_member_identity_notes_login
+    ON member_identity_notes(lower(inferred_github_login));
 """
 
 
@@ -1680,6 +1695,176 @@ class Store:
             return
         with self._lock:
             self._conn.execute("DELETE FROM match_attempts WHERE login = ?", (key,))
+            self._conn.commit()
+
+    @staticmethod
+    def _snowflake_int(raw: object) -> int:
+        text = str(raw or "").strip()
+        return int(text) if text.isdigit() else 0
+
+    @classmethod
+    def _decode_identity_note(cls, row) -> dict:
+        data = dict(row)
+        try:
+            ev = json.loads(data.get("evidence_json") or "[]")
+            evidence = [str(item) for item in ev if str(item).strip()] if isinstance(ev, list) else []
+        except ValueError:
+            evidence = []
+        try:
+            links = json.loads(data.get("message_links_json") or "[]")
+            message_links = [str(item) for item in links if str(item).strip()] if isinstance(links, list) else []
+        except ValueError:
+            message_links = []
+        last_scanned = str(data.get("last_message_id") or "").strip()
+        last_seen = str(data.get("last_seen_message_id") or "").strip()
+        needs_refresh = cls._snowflake_int(last_seen) > cls._snowflake_int(last_scanned)
+        raw_login = data.get("inferred_github_login")
+        inferred = str(raw_login).strip().lower() if isinstance(raw_login, str) and raw_login.strip() else None
+        return {
+            "discord_id": str(data["discord_id"]),
+            "inferred_github_login": inferred,
+            "evidence": evidence,
+            "message_links": message_links,
+            "confidence": float(data.get("confidence") or 0.0),
+            "last_message_id": last_scanned,
+            "last_seen_message_id": last_seen,
+            "messages_scanned": int(data.get("messages_scanned") or 0),
+            "updated_at": str(data.get("updated_at") or ""),
+            "needs_refresh": needs_refresh,
+        }
+
+    def get_member_identity_note(self, discord_id: str) -> dict | None:
+        uid = str(discord_id or "").strip()
+        if not is_discord_id(uid):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT discord_id, inferred_github_login, evidence_json, message_links_json,
+                       confidence, last_message_id, last_seen_message_id, messages_scanned, updated_at
+                FROM member_identity_notes
+                WHERE discord_id = ?
+                """,
+                (uid,),
+            ).fetchone()
+        return self._decode_identity_note(row) if row else None
+
+    def save_member_identity_note(
+        self,
+        discord_id: str,
+        *,
+        inferred_github_login: str | None,
+        evidence: list[str] | tuple[str, ...] = (),
+        message_links: list[str] | tuple[str, ...] = (),
+        confidence: float = 0.0,
+        last_message_id: str = "",
+        messages_scanned: int = 0,
+        updated_at: str,
+    ) -> None:
+        uid = str(discord_id or "").strip()
+        if not is_discord_id(uid):
+            return
+        inferred = (inferred_github_login or "").strip().lower() or None
+        clean_evidence = [str(item).strip()[:300] for item in evidence if str(item).strip()][:20]
+        clean_links = [str(item).strip()[:200] for item in message_links if str(item).strip()][:20]
+        scanned_id = str(last_message_id or "").strip()
+        if scanned_id and not is_discord_id(scanned_id):
+            scanned_id = ""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT last_seen_message_id FROM member_identity_notes WHERE discord_id = ?",
+                (uid,),
+            ).fetchone()
+            prev_seen = str(existing["last_seen_message_id"] or "") if existing else ""
+            seen_id = scanned_id if self._snowflake_int(scanned_id) >= self._snowflake_int(prev_seen) else prev_seen
+            self._conn.execute(
+                """
+                INSERT INTO member_identity_notes (
+                    discord_id, inferred_github_login, evidence_json, message_links_json,
+                    confidence, last_message_id, last_seen_message_id, messages_scanned, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(discord_id) DO UPDATE SET
+                    inferred_github_login = excluded.inferred_github_login,
+                    evidence_json = excluded.evidence_json,
+                    message_links_json = excluded.message_links_json,
+                    confidence = excluded.confidence,
+                    last_message_id = excluded.last_message_id,
+                    last_seen_message_id = excluded.last_seen_message_id,
+                    messages_scanned = excluded.messages_scanned,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    uid,
+                    inferred,
+                    json.dumps(clean_evidence),
+                    json.dumps(clean_links),
+                    float(confidence),
+                    scanned_id,
+                    seen_id,
+                    max(0, int(messages_scanned)),
+                    str(updated_at),
+                ),
+            )
+            self._conn.commit()
+
+    def note_member_activity(self, discord_id: str, message_id: str) -> bool:
+        """Advance ``last_seen_message_id`` on an existing ``member_identity_notes`` row when a new message arrives."""
+        uid = str(discord_id or "").strip()
+        mid = str(message_id or "").strip()
+        if not is_discord_id(uid) or not is_discord_id(mid):
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_seen_message_id FROM member_identity_notes WHERE discord_id = ?",
+                (uid,),
+            ).fetchone()
+            if not row:
+                return False
+            if self._snowflake_int(mid) <= self._snowflake_int(row["last_seen_message_id"]):
+                return False
+            self._conn.execute(
+                "UPDATE member_identity_notes SET last_seen_message_id = ? WHERE discord_id = ?",
+                (mid, uid),
+            )
+            self._conn.commit()
+            return True
+
+    def member_identity_notes_for_login(self, github_login: str) -> list[dict]:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT discord_id, inferred_github_login, evidence_json, message_links_json,
+                       confidence, last_message_id, last_seen_message_id, messages_scanned, updated_at
+                FROM member_identity_notes
+                WHERE lower(inferred_github_login) = ?
+                ORDER BY confidence DESC, updated_at DESC
+                """,
+                (key,),
+            ).fetchall()
+        return [self._decode_identity_note(row) for row in rows]
+
+    def all_member_identity_notes(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT discord_id, inferred_github_login, evidence_json, message_links_json,
+                       confidence, last_message_id, last_seen_message_id, messages_scanned, updated_at
+                FROM member_identity_notes
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        return [self._decode_identity_note(row) for row in rows]
+
+    def delete_member_identity_note(self, discord_id: str) -> None:
+        uid = str(discord_id or "").strip()
+        if not is_discord_id(uid):
+            return
+        with self._lock:
+            self._conn.execute("DELETE FROM member_identity_notes WHERE discord_id = ?", (uid,))
             self._conn.commit()
 
     def acquire_lease(

@@ -199,11 +199,22 @@ the same automatic matcher as the weekly summary:
      (name similarity `>= 0.50` to GitHub name/login, ownership language like
      `my PR` / `I opened`, or same X/website). Posters who linked PRs by 2+
      different GitHub authors are rejected.
-  4. **List-wise LLM** (`MATCH_MODEL`, falling back to `REVIEW_MODEL` or
+  4. **Message evidence (`member_identity_notes`)**: when a Discord member's
+     `username` / `global_name` does not match a GitHub login and no GitHub
+     profile is linked to them, scans that member's guild messages for PR/issue
+     links, explicit GitHub profile/fork URLs or handles, ownership statements
+     (`my PR`, `I opened`, etc.), and discussed code paths/PR topics against
+     real merged-PR authors. Findings are persisted per member in SQLite
+     (`member_identity_notes`: `discord_id`, `inferred_github_login` or `NULL`,
+     evidence snippets, message links, `confidence`, `updated_at`) so future
+     runs reuse them without re-scanning and refresh only when new messages
+     arrive. Message evidence still requires a real merged LiteLLM PR author
+     (GitHub stays the source of truth) and respects strict 1-to-1 matching.
+  5. **List-wise LLM** (`MATCH_MODEL`, falling back to `REVIEW_MODEL` or
      `anthropic/claude-sonnet-4-5`): only when full enrichment is present, over
-     the top-5 guild candidates plus explicit `"none of these"`, requiring
-     `>= 2` independent signals AND confidence `>= 0.85` (no single-signal
-     accepts).
+     the top-5 guild candidates plus explicit `"none of these"` (including
+     corroborating message-evidence signals), requiring `>= 2` independent
+     signals AND confidence `>= 0.85` (no single-signal accepts).
   Strict 1-to-1 bijection is enforced between Discord members and GitHub logins
   (conflicts grant nothing and log a warning). Confirmed matches are cached in
   SQLite for 30 days, and definitive non-matches are negatively cached in

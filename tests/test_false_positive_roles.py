@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from contributor_bot.api import TransientAPIError
+from contributor_bot.api import TransientAPIError, search_guild_messages
 from contributor_bot.config import Config, get_config
 from contributor_bot.interactions import role_slash_commands
 from contributor_bot.matcher import (
@@ -15,7 +15,9 @@ from contributor_bot.matcher import (
     GitHubAuthorProfile,
     PRLinkPosterEvidence,
     _cached_github_profile,
+    analyze_member_messages,
     match_community_contributors_with_diagnostics,
+    scan_member_message_evidence,
     score_author_against_members,
     validate_pr_link_poster_match,
 )
@@ -807,6 +809,589 @@ class SilentAnnouncementsLeaseLockAndBootRevalidationTests(unittest.TestCase):
         # Runs only once!
         self.assertFalse(should_run_grants_revalidation(self.config, self.store))
         self.assertIsNone(revalidate_all_grants_on_boot(self.config, self.store, members=guild_members, now=self.now))
+
+
+class MessageEvidenceTests(unittest.TestCase):
+    """Message-evidence matching & durable member_identity_notes tests."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = get_config(_roles_env(self.tmp.name, DISCORD_GUILD_ID="333000000000000000"))
+        self.store = Store(Path(self.tmp.name) / "bot.db")
+        self.now = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_search_guild_messages_supports_author_id_and_min_id(self):
+        captured: list[str] = []
+
+        def fake_http(request, attempts=2, timeout=15.0, max_retry_delay=15.0):
+            captured.append(request.full_url)
+            return 200, {}, b'{"messages": [], "total_results": 0}'
+
+        with mock.patch("contributor_bot.api._http", side_effect=fake_http):
+            res = search_guild_messages(
+                "333000000000000000",
+                "",
+                "bot-tok",
+                author_id="900000000000000001",
+                min_id="800000000000000001",
+                offset=25,
+            )
+        self.assertEqual(res["total_results"], 0)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("/guilds/333000000000000000/messages/search?", captured[0])
+        self.assertIn("author_id=900000000000000001", captured[0])
+        self.assertIn("min_id=800000000000000001", captured[0])
+        self.assertIn("offset=25", captured[0])
+        self.assertNotIn("content=", captured[0])
+
+        with self.assertRaises(ValueError):
+            search_guild_messages("333000000000000000", "", "bot-tok")
+        with self.assertRaises(ValueError):
+            search_guild_messages("333000000000000000", "", "bot-tok", author_id="not-a-snowflake")
+        with self.assertRaises(ValueError):
+            search_guild_messages("333000000000000000", "hello", "bot-tok", min_id="bad")
+
+    def test_member_identity_notes_store_persistence_and_activity_refresh(self):
+        uid = "900000000000000010"
+        self.assertIsNone(self.store.get_member_identity_note(uid))
+        # note_member_activity does not create notes for never-scanned members.
+        self.assertFalse(self.store.note_member_activity(uid, "500000000000000001"))
+
+        self.store.save_member_identity_note(
+            uid,
+            inferred_github_login=None,
+            evidence=[],
+            message_links=[],
+            confidence=0.0,
+            last_message_id="500000000000000010",
+            messages_scanned=3,
+            updated_at=iso(self.now),
+        )
+        note = self.store.get_member_identity_note(uid)
+        self.assertIsNotNone(note)
+        self.assertIsNone(note["inferred_github_login"])
+        self.assertFalse(note["needs_refresh"])
+
+        # Older or equal message IDs do not trigger refresh.
+        self.assertFalse(self.store.note_member_activity(uid, "500000000000000010"))
+        self.assertFalse(self.store.note_member_activity(uid, "500000000000000005"))
+        self.assertFalse(self.store.get_member_identity_note(uid)["needs_refresh"])
+
+        # Newer message arrives -> marks needs_refresh = True.
+        self.assertTrue(self.store.note_member_activity(uid, "500000000000000025"))
+        stale = self.store.get_member_identity_note(uid)
+        self.assertTrue(stale["needs_refresh"])
+        self.assertEqual(stale["last_seen_message_id"], "500000000000000025")
+
+        # Resaving up to the new message clears needs_refresh and indexes login lookup.
+        self.store.save_member_identity_note(
+            uid,
+            inferred_github_login="Alice-Dev",
+            evidence=["github_handle_claim:alice-dev: my github is alice-dev"],
+            message_links=["https://discord.com/channels/333000000000000000/444000000000000000/500000000000000025"],
+            confidence=0.95,
+            last_message_id="500000000000000025",
+            messages_scanned=4,
+            updated_at=iso(self.now + timedelta(minutes=5)),
+        )
+        refreshed = self.store.get_member_identity_note(uid)
+        self.assertEqual(refreshed["inferred_github_login"], "alice-dev")
+        self.assertFalse(refreshed["needs_refresh"])
+        by_login = self.store.member_identity_notes_for_login("ALICE-DEV")
+        self.assertEqual(len(by_login), 1)
+        self.assertEqual(by_login[0]["discord_id"], uid)
+
+    def test_message_evidence_matches_self_claimed_handle_and_persists_note(self):
+        uid = "900000000000000020"
+        members = [_member(uid, "skywalker99", "Sky Walker")]
+        groups = [{"login": "alice-dev", "user_id": 201, "pulls": [{"number": 501, "title": "Fix cohere"}]}]
+        gql = _stub_gql_from_nodes({"alice-dev": _gql_user_node("alice-dev", name="Alice Chen")})
+
+        search_calls: list[tuple[str, str, int]] = []
+
+        def fake_search(guild_id, author_id, offset):
+            search_calls.append((guild_id, author_id, offset))
+            return {
+                "total_results": 1,
+                "messages": [[
+                    {
+                        "id": "600000000000000001",
+                        "channel_id": "444000000000000001",
+                        "author": {"id": uid},
+                        "content": "Hey team, my github is @alice-dev!",
+                    },
+                    # Surrounding context message by another user MUST be ignored!
+                    {
+                        "id": "600000000000000002",
+                        "channel_id": "444000000000000001",
+                        "author": {"id": "900000000000000099"},
+                        "content": "my github is someone-else",
+                    },
+                ]],
+            }
+
+        matched, skipped, details, _diag = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now,
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search,
+        )
+        self.assertEqual(skipped, 0)
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["discord_id"], uid)
+        self.assertEqual(matched[0]["match_method"], "message_evidence")
+        self.assertGreaterEqual(matched[0]["match_confidence"], 0.90)
+        self.assertTrue(any("alice-dev" in e for e in details[0].evidence))
+        self.assertTrue(any("https://discord.com/channels/333000000000000000/444000000000000001/600000000000000001" in e for e in details[0].evidence))
+        self.assertEqual(len(search_calls), 1)
+
+        note = self.store.get_member_identity_note(uid)
+        self.assertIsNotNone(note)
+        self.assertEqual(note["inferred_github_login"], "alice-dev")
+        self.assertAlmostEqual(note["confidence"], 0.95)
+        self.assertEqual(
+            note["message_links"],
+            ["https://discord.com/channels/333000000000000000/444000000000000001/600000000000000001"],
+        )
+
+    def test_message_evidence_fork_and_profile_urls_ignore_third_party_repos(self):
+        uid = "900000000000000021"
+        third_party = analyze_member_messages(
+            uid,
+            [{
+                "id": "600000000000000010",
+                "channel_id": "444000000000000001",
+                "author": {"id": uid},
+                "content": "See https://github.com/openai/openai-python/issues/99 and https://github.com/BerriAI/litellm",
+            }],
+            "BerriAI/litellm",
+            guild_id="333000000000000000",
+        )
+        self.assertIsNone(third_party["inferred_github_login"])
+        self.assertEqual(third_party["confidence"], 0.0)
+
+        fork_res = analyze_member_messages(
+            uid,
+            [{
+                "id": "600000000000000011",
+                "channel_id": "444000000000000001",
+                "author": {"id": uid},
+                "content": "Pushed branch to https://github.com/fork-coder/litellm/tree/fix-stream",
+            }],
+            "BerriAI/litellm",
+            guild_id="333000000000000000",
+        )
+        self.assertEqual(fork_res["inferred_github_login"], "fork-coder")
+        self.assertGreaterEqual(fork_res["confidence"], 0.95)
+
+    def test_message_evidence_ownership_pr_link_and_multi_author_rejection(self):
+        uid_owner = "900000000000000022"
+        uid_reviewer = "900000000000000023"
+        pr_map = {510: "pr-author-a", 511: "pr-author-b"}
+
+        owned = analyze_member_messages(
+            uid_owner,
+            [{
+                "id": "600000000000000020",
+                "channel_id": "444000000000000001",
+                "author": {"id": uid_owner},
+                "content": "I opened https://github.com/BerriAI/litellm/pull/510 to fix retries",
+            }],
+            "BerriAI/litellm",
+            guild_id="333000000000000000",
+            pr_number_to_author=pr_map,
+        )
+        self.assertEqual(owned["inferred_github_login"], "pr-author-a")
+        self.assertGreaterEqual(owned["confidence"], 0.90)
+
+        reviewer = analyze_member_messages(
+            uid_reviewer,
+            [
+                {
+                    "id": "600000000000000021",
+                    "channel_id": "444000000000000001",
+                    "author": {"id": uid_reviewer},
+                    "content": "I opened https://github.com/BerriAI/litellm/pull/510",
+                },
+                {
+                    "id": "600000000000000022",
+                    "channel_id": "444000000000000001",
+                    "author": {"id": uid_reviewer},
+                    "content": "Also check https://github.com/BerriAI/litellm/pull/511",
+                },
+            ],
+            "BerriAI/litellm",
+            guild_id="333000000000000000",
+            pr_number_to_author=pr_map,
+        )
+        self.assertIsNone(reviewer["inferred_github_login"])
+        self.assertEqual(reviewer["confidence"], 0.0)
+        self.assertTrue(reviewer["is_multi_author"])
+
+    def test_message_evidence_reuses_persisted_note_and_refreshes_only_on_new_message(self):
+        uid = "900000000000000024"
+        members = [_member(uid, "randomhandle42", "Random Person")]
+        groups = [{"login": "merged-alice", "user_id": 204, "pulls": [{"number": 700, "title": "Add groq"}]}]
+        gql = _stub_gql_from_nodes({"merged-alice": _gql_user_node("merged-alice", name="Alice Doe")})
+
+        mailbox: list[dict] = [{
+            "id": "700000000000000100",
+            "channel_id": "444000000000000002",
+            "author": {"id": uid},
+            "content": "hello everyone, just hanging out",
+        }]
+        scans: list[str] = []
+
+        def fake_search(guild_id, author_id, offset):
+            scans.append(author_id)
+            return {"total_results": len(mailbox), "messages": [[m] for m in mailbox]}
+
+        # Run 1: scans once, finds nothing, persists NULL note + 7d negative cache.
+        matched1, skipped1, _, _ = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now,
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search,
+        )
+        self.assertEqual(matched1, [])
+        self.assertEqual(skipped1, 1)
+        self.assertEqual(len(scans), 1)
+        note1 = self.store.get_member_identity_note(uid)
+        self.assertIsNotNone(note1)
+        self.assertIsNone(note1["inferred_github_login"])
+        self.assertFalse(note1["needs_refresh"])
+
+        # Run 2 (no new messages): ZERO Discord scans!
+        matched2, skipped2, _, diag2 = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now + timedelta(hours=2),
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search,
+        )
+        self.assertEqual(matched2, [])
+        self.assertEqual(skipped2, 1)
+        self.assertEqual(len(scans), 1)  # Still 1: reused persisted note!
+        self.assertEqual(dict(diag2.skip_reasons).get("cached_negative"), 1)
+
+        # New message arrives: gateway records activity -> marks needs_refresh = True!
+        new_mid = "700000000000000200"
+        mailbox.append({
+            "id": new_mid,
+            "channel_id": "444000000000000002",
+            "author": {"id": uid},
+            "content": "Here's my PR https://github.com/BerriAI/litellm/pull/700",
+        })
+        self.assertTrue(self.store.note_member_activity(uid, new_mid))
+        self.assertTrue(self.store.get_member_identity_note(uid)["needs_refresh"])
+
+        # Run 3: refreshes ONLY that member, invalidates negative cache, and matches!
+        matched3, skipped3, _, _ = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now + timedelta(hours=3),
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search,
+        )
+        self.assertEqual(len(scans), 2)
+        self.assertEqual(skipped3, 0)
+        self.assertEqual(len(matched3), 1)
+        self.assertEqual(matched3[0]["discord_id"], uid)
+        self.assertEqual(matched3[0]["match_method"], "message_evidence")
+        note3 = self.store.get_member_identity_note(uid)
+        self.assertEqual(note3["inferred_github_login"], "merged-alice")
+        self.assertFalse(note3["needs_refresh"])
+
+        # Run 4 (no new messages, even if confirmed match cleared): reuses note with 0 scans!
+        self.store.delete_confirmed_match("merged-alice")
+        matched4, _, _, _ = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now + timedelta(hours=4),
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search,
+        )
+        self.assertEqual(len(scans), 2)  # Zero additional scans!
+        self.assertEqual(len(matched4), 1)
+        self.assertEqual(matched4[0]["discord_id"], uid)
+
+    def test_message_evidence_github_source_of_truth_no_role_for_non_author(self):
+        uid = "900000000000000025"
+        members = [_member(uid, "wannabe_contrib", "Wannabe")]
+        # Only real merged-PR author is "real-author"; "fake-no-prs" has 0 merged LiteLLM PRs!
+        groups = [{"login": "real-author", "user_id": 205, "pulls": [{"number": 710, "title": "Fix"}]}]
+        gql = _stub_gql_from_nodes({"real-author": _gql_user_node("real-author", name="Real Author")})
+
+        def fake_search(guild_id, author_id, offset):
+            return {
+                "total_results": 1,
+                "messages": [[{
+                    "id": "700000000000000300",
+                    "channel_id": "444000000000000003",
+                    "author": {"id": uid},
+                    "content": "my github is fake-no-prs",
+                }]],
+            }
+
+        matched, skipped, _, _ = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now,
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search,
+        )
+        # Note is persisted for future reuse, but NO match / NO role granted because fake-no-prs has 0 merged PRs!
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
+        note = self.store.get_member_identity_note(uid)
+        self.assertIsNotNone(note)
+        self.assertEqual(note["inferred_github_login"], "fake-no-prs")
+        self.assertEqual(self.store.grants_for_discord(uid), [])
+
+    def test_message_evidence_enforces_strict_one_to_one_matching(self):
+        # Case A: Two Discord members both claim the same merged-PR author -> grant nothing to either!
+        uid1 = "900000000000000026"
+        uid2 = "900000000000000027"
+        members = [
+            _member(uid1, "claimant_one", "Claimant One"),
+            _member(uid2, "claimant_two", "Claimant Two"),
+        ]
+        groups = [{"login": "contested-author", "user_id": 206, "pulls": [{"number": 720, "title": "Fix"}]}]
+        gql = _stub_gql_from_nodes({"contested-author": _gql_user_node("contested-author", name="Contested")})
+
+        def fake_search_two(guild_id, author_id, offset):
+            return {
+                "total_results": 1,
+                "messages": [[{
+                    "id": f"7000000000000004{author_id[-2:]}",
+                    "channel_id": "444000000000000004",
+                    "author": {"id": author_id},
+                    "content": "my github is contested-author",
+                }]],
+            }
+
+        matched, skipped, _, diag = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now,
+            members=members,
+            graphql_caller=gql,
+            message_searcher=fake_search_two,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
+        self.assertEqual(dict(diag.skip_reasons).get("discord_id_conflict"), 1)
+
+        # Case B: One Discord member already linked to bob-dev claims alice-dev -> grant nothing for alice-dev!
+        uid3 = "900000000000000028"
+        self.assertIsNone(self.store.link_account(uid3, "bob-dev", 999, iso(self.now)))
+        self.store.save_member_identity_note(
+            uid3,
+            inferred_github_login="alice-unique",
+            evidence=["github_handle_claim:alice-unique"],
+            message_links=[],
+            confidence=0.95,
+            last_message_id="700000000000000500",
+            messages_scanned=1,
+            updated_at=iso(self.now),
+        )
+        groups_b = [{"login": "alice-unique", "user_id": 208, "pulls": [{"number": 721, "title": "Fix"}]}]
+        gql_b = _stub_gql_from_nodes({"alice-unique": _gql_user_node("alice-unique", name="Alice Unique")})
+        matched_b, skipped_b, _, diag_b = match_community_contributors_with_diagnostics(
+            groups_b,
+            self.config,
+            self.store,
+            now=self.now,
+            members=[_member(uid3, "already_linked", "Already Linked")],
+            graphql_caller=gql_b,
+        )
+        self.assertEqual(matched_b, [])
+        self.assertEqual(skipped_b, 1)
+        self.assertEqual(dict(diag_b.skip_reasons).get("discord_id_conflict"), 1)
+
+    def test_message_evidence_code_discussion_corroborates_llm_without_single_signal_auto_accept(self):
+        uid = "900000000000000029"
+        members = [_member(uid, "kiran_ml", "Kiran Rao")]
+        groups = [{
+            "login": "krao-gh",
+            "user_id": 209,
+            "pulls": [{
+                "number": 730,
+                "title": "Add Cohere rerank telemetry handler",
+                "files": ["litellm/llms/cohere/rerank_telemetry.py"],
+            }],
+        }]
+        gql = _stub_gql_from_nodes({"krao-gh": _gql_user_node("krao-gh", name="Kiran Rao")})
+
+        def fake_search(guild_id, author_id, offset):
+            return {
+                "total_results": 1,
+                "messages": [[{
+                    "id": "700000000000000600",
+                    "channel_id": "444000000000000005",
+                    "author": {"id": uid},
+                    "content": "Discussing litellm/llms/cohere/rerank_telemetry.py edge cases in the rerank telemetry handler",
+                }]],
+            }
+
+        # Without LLM: code discussion alone is stored as corroborating (< 0.90) and does NOT auto-accept!
+        cleared_env = {
+            k: ""
+            for k in ("TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "LITELLM_API_KEY")
+        }
+        with mock.patch.dict("os.environ", cleared_env, clear=False):
+            matched_no_llm, skipped_no_llm, _, _ = match_community_contributors_with_diagnostics(
+                groups,
+                self.config,
+                self.store,
+                now=self.now,
+                members=members,
+                graphql_caller=gql,
+                message_searcher=fake_search,
+            )
+        self.assertEqual(matched_no_llm, [])
+        self.assertEqual(skipped_no_llm, 1)
+        note = self.store.get_member_identity_note(uid)
+        self.assertIsNotNone(note)
+        self.assertEqual(note["inferred_github_login"], "krao-gh")
+        self.assertLess(note["confidence"], 0.90)
+        self.assertTrue(any("code_path:litellm/llms/cohere/rerank_telemetry.py" in e for e in note["evidence"]))
+
+        # With LLM: message_evidence signal is passed into the LLM prompt so >= 2 independent signals succeed!
+        self.store.delete_match_attempt("krao-gh")
+        prompts_seen: list[str] = []
+
+        def fake_llm(model, messages):
+            prompts_seen.append(str(messages[-1]["content"]))
+            return json.dumps({
+                "discord_id": uid,
+                "confidence": 0.91,
+                "evidence": ["exact_name:Kiran Rao", "message_evidence:code_path:litellm/llms/cohere/rerank_telemetry.py"],
+                "reason": "Full name and discussed PR code path both match",
+            })
+
+        matched_llm, skipped_llm, _, _ = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now + timedelta(minutes=1),
+            members=members,
+            graphql_caller=gql,
+            llm_complete=fake_llm,
+        )
+        self.assertEqual(skipped_llm, 0)
+        self.assertEqual(len(matched_llm), 1)
+        self.assertEqual(matched_llm[0]["discord_id"], uid)
+        self.assertTrue(any("message_evidence:" in p for p in prompts_seen))
+
+    def test_boot_revalidation_keeps_valid_message_evidence_grant_and_revokes_unbacked_one(self):
+        now_iso = iso(self.now)
+        uid_good = "900000000000000030"
+        uid_bad = "900000000000000031"
+
+        self.store.upsert_pull(
+            repository="BerriAI/litellm",
+            number=801,
+            github_user_id=801,
+            github_login="msg-good-author",
+            merged_at=now_iso,
+            title="Fix streaming",
+            labels=[],
+            files=["litellm/main.py"],
+        )
+        self.store.upsert_pull(
+            repository="BerriAI/litellm",
+            number=802,
+            github_user_id=802,
+            github_login="msg-unbacked-author",
+            merged_at=now_iso,
+            title="Fix logging",
+            labels=[],
+            files=["litellm/main.py"],
+        )
+        self.store.save_confirmed_match(
+            "msg-good-author",
+            uid_good,
+            method="message_evidence",
+            confidence=0.95,
+            matched_at=now_iso,
+            github_user_id=801,
+            evidence=("github_handle_claim:msg-good-author",),
+        )
+        self.store.save_member_identity_note(
+            uid_good,
+            inferred_github_login="msg-good-author",
+            evidence=["github_handle_claim:msg-good-author"],
+            message_links=["https://discord.com/channels/333000000000000000/444/555"],
+            confidence=0.95,
+            last_message_id="555000000000000000",
+            messages_scanned=1,
+            updated_at=now_iso,
+        )
+        self.store.record_grant(uid_good, "contributor", "Contributor", now_iso)
+
+        # uid_bad has a message_evidence match/grant but NO member_identity_notes backing it!
+        self.store.save_confirmed_match(
+            "msg-unbacked-author",
+            uid_bad,
+            method="message_evidence",
+            confidence=0.95,
+            matched_at=now_iso,
+            github_user_id=802,
+            evidence=("stale",),
+        )
+        self.store.record_grant(uid_bad, "contributor", "Contributor", now_iso)
+
+        guild_members = [
+            _member(uid_good, "unrelated_nick_1", "Person One"),
+            _member(uid_bad, "unrelated_nick_2", "Person Two"),
+        ]
+        gql = _stub_gql_from_nodes({
+            "msg-good-author": _gql_user_node("msg-good-author", name="Good Author"),
+            "msg-unbacked-author": _gql_user_node("msg-unbacked-author", name="Bad Author"),
+        })
+        cleared_env = {
+            k: ""
+            for k in ("TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "LITELLM_API_KEY")
+        }
+        with mock.patch.dict("os.environ", cleared_env, clear=False), \
+             mock.patch("contributor_bot.rewards.remove_member_role"), \
+             mock.patch("contributor_bot.rewards.post_message") as post_msg:
+            res = revalidate_all_grants_on_boot(
+                self.config,
+                self.store,
+                members=guild_members,
+                now=self.now,
+                org_members_fetcher=lambda o, t: frozenset(),
+                graphql_caller=gql,
+            )
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res.checked, 2)
+        self.assertEqual(res.kept, 1)
+        self.assertEqual(res.revoked, 1)
+        post_msg.assert_not_called()
+        self.assertEqual(self.store.grant_keys(uid_good), {"contributor"})
+        self.assertEqual(self.store.grants_for_discord(uid_bad), [])
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ from .api import (
     github_graphql,
     github_rate_limit_status,
     search_guild_members,
+    search_guild_messages,
 )
 from .config import is_discord_id
 from .schedule import UTC, iso, parse_time
@@ -58,6 +59,11 @@ LLM_MIN_SIGNALS = 2
 LLM_MULTI_SIGNAL_THRESHOLD = LLM_CONFIDENCE_THRESHOLD
 PR_LINK_POSTER_CONFIDENCE = 0.92
 PR_LINK_POSTER_NAME_SIMILARITY_THRESHOLD = 0.50
+MESSAGE_EVIDENCE_CLAIM_CONFIDENCE = 0.95
+MESSAGE_EVIDENCE_OWNERSHIP_CONFIDENCE = 0.92
+MESSAGE_EVIDENCE_STRONG_THRESHOLD = 0.90
+MEMBER_MESSAGE_SCAN_MAX_PAGES = 2
+MAX_MEMBER_MESSAGE_SCANS_PER_RUN = 25
 MAX_CANDIDATES_PER_AUTHOR = 5
 FUZZY_CANDIDATE_THRESHOLD = 0.72
 MATCH_CACHE_TTL_DAYS = 30
@@ -108,6 +114,57 @@ _PR_LINK_OWNERSHIP_RE = re.compile(
     r"\b(?:my\s+pr|i\s+(?:opened|made|raised|submitted))\b",
     re.IGNORECASE,
 )
+_MSG_OWNERSHIP_RE = re.compile(
+    r"\b(?:my\s+(?:pr|pull\s+request|fix)|i\s+(?:opened|made|raised|submitted)|"
+    r"i\s+(?:created|pushed|wrote|fixed)\s+(?:a|the|this)?\s*(?:pr|pull\s+request|#\d+)|"
+    r"here(?:'s| is)\s+my\s+(?:pr|pull\s+request|fix))\b",
+    re.IGNORECASE,
+)
+_GITHUB_PR_OR_ISSUE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(pull|issues)/([1-9][0-9]*)\b",
+    re.IGNORECASE,
+)
+_GITHUB_PROFILE_OR_REPO_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)(?:/([A-Za-z0-9_.-]+)(?:/[^\s)\]>]*)?)?(?=$|[\s)\]>,.;:!?'\"`#?])",
+    re.IGNORECASE,
+)
+_GITHUB_SELF_HANDLE_RE = re.compile(
+    r"(?:"
+    r"\bmy\s+(?:github|gh)(?:\s+(?:username|handle|account|profile|id))?\s*(?:is|:|=)\s*|"
+    r"\b(?:github|gh)(?:\s+(?:username|handle|account|profile))\s*(?:is|:|=)\s*|"
+    r"\b(?:github|gh)\s*[:=]\s*"
+    r")@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\b",
+    re.IGNORECASE,
+)
+_GITHUB_IM_ON_GH_RE = re.compile(
+    r"\bi(?:'m| am)\s+@?([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)\s+on\s+(?:github|gh)\b",
+    re.IGNORECASE,
+)
+_HASH_PR_NUM_RE = re.compile(r"(?<![A-Za-z0-9])#([1-9][0-9]{1,6})\b")
+_CODE_PATH_RE = re.compile(
+    r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+\.(?:py|ts|tsx|js|jsx|go|rs|yaml|yml|json|sql))\b"
+)
+_GITHUB_RESERVED_PATHS = frozenset({
+    "about", "actions", "apps", "blob", "codespaces", "collections", "commit",
+    "commits", "compare", "copilot", "customer-stories", "discussions", "enterprise",
+    "events", "explore", "features", "gist", "issues", "join", "login", "marketplace",
+    "new", "notifications", "orgs", "packages", "pricing", "projects", "pull", "pulls",
+    "raw", "readme", "releases", "search", "security", "settings", "sponsors", "team",
+    "topics", "tree", "trending", "users", "wiki",
+})
+_GENERIC_CODE_BASENAMES = frozenset({
+    "__init__.py", "main.py", "utils.py", "types.py", "config.py", "index.ts", "index.js",
+    "package.json", "pyproject.toml", "setup.py", "readme.md", "conftest.py",
+})
+_CODE_TITLE_STOPWORDS = frozenset({
+    "a", "an", "and", "add", "adds", "adding", "allow", "also", "are", "as", "at", "be",
+    "bug", "by", "can", "change", "changes", "chore", "code", "default", "do", "docs",
+    "does", "feat", "feature", "file", "files", "fix", "fixes", "fixing", "for", "from",
+    "get", "handle", "has", "have", "in", "into", "is", "issue", "it", "its", "litellm",
+    "make", "model", "models", "more", "new", "not", "of", "on", "only", "or", "pr",
+    "pull", "refactor", "remove", "request", "return", "set", "should", "support", "test",
+    "tests", "that", "the", "this", "to", "update", "updates", "use", "using", "when", "with",
+})
 _GENERIC_WEBSITE_HOSTS = frozenset({
     "github.com", "gist.github.com", "gitlab.com", "bitbucket.org",
     "linkedin.com", "twitter.com", "x.com", "bsky.app", "mastodon.social",
@@ -2558,12 +2615,527 @@ def disambiguate_candidates(
     return winners
 
 
+def _snowflake_int(raw: object) -> int:
+    text = str(raw or "").strip()
+    return int(text) if text.isdigit() else 0
+
+
+def _flatten_search_messages(payload: object, discord_id: str) -> list[dict]:
+    """Extract messages authored by ``discord_id`` from a Discord search response (or flat list)."""
+    raw_messages: list[dict] = []
+    if isinstance(payload, dict):
+        groups = payload.get("messages")
+        if isinstance(groups, list):
+            for entry in groups:
+                if isinstance(entry, list):
+                    for item in entry:
+                        if isinstance(item, dict):
+                            raw_messages.append(item)
+                elif isinstance(entry, dict):
+                    raw_messages.append(entry)
+    elif isinstance(payload, list):
+        for entry in payload:
+            if isinstance(entry, list):
+                for item in entry:
+                    if isinstance(item, dict):
+                        raw_messages.append(item)
+            elif isinstance(entry, dict):
+                raw_messages.append(entry)
+
+    seen_ids: set[str] = set()
+    authored: list[dict] = []
+    for msg in raw_messages:
+        author = msg.get("author")
+        if isinstance(author, dict):
+            author_uid = str(author.get("id") or "").strip()
+            if author_uid and author_uid != discord_id:
+                continue
+        msg_id = str(msg.get("id") or "").strip()
+        if msg_id:
+            if msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+        authored.append(msg)
+    return authored
+
+
+def _discord_message_link(guild_id: str | None, channel_id: object, message_id: object) -> str:
+    gid = str(guild_id or "").strip()
+    cid = str(channel_id or "").strip()
+    mid = str(message_id or "").strip()
+    if is_discord_id(gid) and is_discord_id(cid) and is_discord_id(mid):
+        return f"https://discord.com/channels/{gid}/{cid}/{mid}"
+    return ""
+
+
+def _distinctive_title_tokens(title: str) -> set[str]:
+    tokens = {
+        tok.lower()
+        for tok in re.findall(r"[A-Za-z0-9_.-]{4,}", title or "")
+        if tok.lower() not in _CODE_TITLE_STOPWORDS and not tok.isdigit()
+    }
+    return tokens
+
+
+def _collect_author_pr_context(
+    groups: list[dict],
+    store,
+    repository: str,
+) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
+    """Collect changed code paths and PR titles per lowercase GitHub author login."""
+    files_by_login: dict[str, set[str]] = {}
+    titles_by_login: dict[str, list[str]] = {}
+
+    def _add_pull_meta(login_key: str, title: object, files: object) -> None:
+        if isinstance(title, str) and title.strip():
+            titles = titles_by_login.setdefault(login_key, [])
+            cleaned_title = title.strip()
+            if cleaned_title not in titles:
+                titles.append(cleaned_title)
+        if isinstance(files, (list, tuple, set)):
+            dest = files_by_login.setdefault(login_key, set())
+            for raw_path in files:
+                path = str(raw_path or "").strip().lstrip("./")
+                if not path or "/" not in path:
+                    continue
+                basename = path.rsplit("/", 1)[-1].lower()
+                if basename in _GENERIC_CODE_BASENAMES:
+                    continue
+                dest.add(path.lower())
+
+    for group in groups:
+        login_key = str(group.get("login") or "").strip().lower()
+        if not login_key:
+            continue
+        for p in group.get("pulls", ()):
+            if isinstance(p, dict):
+                _add_pull_meta(login_key, p.get("title"), p.get("files"))
+        if store is not None and repository:
+            uid = group.get("user_id")
+            try:
+                rows: list[dict] = []
+                if isinstance(uid, int) and uid > 0 and hasattr(store, "pulls_for_author"):
+                    rows = store.pulls_for_author(repository, uid)
+                elif hasattr(store, "pulls_for_author_login"):
+                    rows = store.pulls_for_author_login(repository, group["login"])
+                for row in rows:
+                    _add_pull_meta(login_key, row.get("title"), row.get("files"))
+            except Exception:
+                pass
+    return files_by_login, titles_by_login
+
+
+def analyze_member_messages(
+    discord_id: str,
+    messages: list[dict],
+    repository: str,
+    *,
+    guild_id: str | None = None,
+    pr_number_to_author: dict[int, str] | None = None,
+    author_pr_files: dict[str, set[str]] | None = None,
+    author_pr_titles: dict[str, list[str]] | None = None,
+    multi_author_ids: frozenset[str] | set[str] = frozenset(),
+) -> dict:
+    """Analyze a Discord member's guild messages for GitHub identity evidence.
+
+    Extracts:
+    - Explicit self-claimed GitHub handles / profile URLs / fork URLs of the tracked repo
+    - Tracked-repo PR/issue links paired with ownership statements ('my PR', 'I opened', ...)
+    - Code paths and PR topics discussed that align with a merged-PR author's changes
+    """
+    pr_map = pr_number_to_author or {}
+    files_map = author_pr_files or {}
+    titles_map = author_pr_titles or {}
+    repo_org, repo_name = ("", "")
+    if "/" in (repository or ""):
+        raw_org, raw_name = repository.split("/", 1)
+        repo_org = raw_org.strip().lower()
+        repo_name = raw_name.strip().lower()
+
+    # Invert non-generic changed file paths -> authors who touched them uniquely.
+    file_to_authors: dict[str, set[str]] = {}
+    for login_key, paths in files_map.items():
+        for path in paths:
+            file_to_authors.setdefault(path.lower(), set()).add(login_key)
+    title_tokens_by_author: dict[str, set[str]] = {}
+    for login_key, titles in titles_map.items():
+        toks: set[str] = set()
+        for title in titles:
+            toks.update(_distinctive_title_tokens(title))
+        if toks:
+            title_tokens_by_author[login_key] = toks
+
+    authored = _flatten_search_messages(messages, discord_id)
+    max_msg_id = ""
+    claimed_logins: dict[str, list[tuple[str, str]]] = {}
+    owned_pr_authors: dict[str, list[tuple[str, str]]] = {}
+    linked_pr_authors: dict[str, list[tuple[str, str]]] = {}
+    code_hits_by_author: dict[str, list[tuple[str, str]]] = {}
+    tracked_pr_links_found: list[tuple[int, str, str, str]] = []
+    generic_snippets: list[tuple[str, str]] = []
+
+    def _snippet(text: str) -> str:
+        return " ".join(text.split())[:180]
+
+    for msg in authored:
+        mid = str(msg.get("id") or "").strip()
+        cid = str(msg.get("channel_id") or "").strip()
+        if _snowflake_int(mid) > _snowflake_int(max_msg_id):
+            max_msg_id = mid
+        link = _discord_message_link(guild_id, cid, mid)
+
+        parts: list[str] = []
+        content = str(msg.get("content") or "").strip()
+        if content:
+            parts.append(content)
+        for embed in msg.get("embeds") or ():
+            if isinstance(embed, dict):
+                for key in ("url", "title", "description"):
+                    val = str(embed.get(key) or "").strip()
+                    if val:
+                        parts.append(val)
+        text = "\n".join(parts).strip()
+        if not text:
+            continue
+        snippet = _snippet(content or text)
+        has_ownership = bool(_MSG_OWNERSHIP_RE.search(text))
+
+        # 1. Explicit self-claimed GitHub handle ("my github is @foo", "github: foo", "I'm foo on github").
+        for pattern in (_GITHUB_SELF_HANDLE_RE, _GITHUB_IM_ON_GH_RE):
+            for match in pattern.finditer(text):
+                handle = match.group(1).strip().lower()
+                if handle and handle not in _GITHUB_RESERVED_PATHS and handle != repo_org:
+                    claimed_logins.setdefault(handle, []).append((f"github_handle_claim:{handle}: {snippet}", link))
+
+        # 2. Standalone GitHub profile URLs (github.com/<login>) or tracked-repo fork URLs (github.com/<login>/<repo>).
+        for match in _GITHUB_PROFILE_OR_REPO_URL_RE.finditer(text):
+            owner = match.group(1).strip().lower()
+            repo_part = (match.group(2) or "").strip().lower()
+            if not owner or owner in _GITHUB_RESERVED_PATHS or owner == repo_org:
+                continue
+            if not repo_part:
+                claimed_logins.setdefault(owner, []).append((f"github_profile_url:github.com/{owner}: {snippet}", link))
+            elif repo_name and repo_part == repo_name:
+                claimed_logins.setdefault(owner, []).append((f"github_fork_url:github.com/{owner}/{repo_name}: {snippet}", link))
+
+        # 3. PR and issue links in the tracked repository (+ #NNN refs when accompanied by ownership wording).
+        msg_pr_nums: set[int] = set()
+        for match in _GITHUB_PR_OR_ISSUE_RE.finditer(text):
+            m_org = match.group(1).strip().lower()
+            m_repo = match.group(2).strip().lower()
+            kind = match.group(3).strip().lower()
+            num = int(match.group(4))
+            if repo_org and repo_name and (m_org != repo_org or m_repo != repo_name):
+                continue
+            if kind == "pull":
+                msg_pr_nums.add(num)
+                if mid and cid:
+                    tracked_pr_links_found.append((num, cid, mid, snippet))
+            elif kind == "issues":
+                generic_snippets.append((f"issue_link:#{num}: {snippet}", link))
+
+        if has_ownership:
+            for match in _HASH_PR_NUM_RE.finditer(text):
+                num = int(match.group(1))
+                if num in pr_map:
+                    msg_pr_nums.add(num)
+
+        for num in sorted(msg_pr_nums):
+            author_login = pr_map.get(num)
+            if not author_login:
+                generic_snippets.append((f"pr_link:#{num}: {snippet}", link))
+                continue
+            linked_pr_authors.setdefault(author_login, []).append((f"pr_link:#{num}: {snippet}", link))
+            if has_ownership:
+                owned_pr_authors.setdefault(author_login, []).append(
+                    (f"pr_ownership:#{num}: {snippet}", link)
+                )
+
+        # 4. Code paths and distinctive PR topic discussion.
+        mentioned_paths = {
+            m.group(1).strip().lstrip("./").lower()
+            for m in _CODE_PATH_RE.finditer(text)
+            if m.group(1).rsplit("/", 1)[-1].lower() not in _GENERIC_CODE_BASENAMES
+        }
+        for path in sorted(mentioned_paths):
+            owners = file_to_authors.get(path, set())
+            if len(owners) == 1:
+                sole_author = next(iter(owners))
+                code_hits_by_author.setdefault(sole_author, []).append(
+                    (f"code_path:{path}: {snippet}", link)
+                )
+
+        if title_tokens_by_author and (mentioned_paths or has_ownership or "pr" in text.lower() or "fix" in text.lower()):
+            msg_tokens = _distinctive_title_tokens(text)
+            if len(msg_tokens) >= 2:
+                overlap_hits: list[tuple[str, set[str]]] = []
+                for author_login, author_toks in title_tokens_by_author.items():
+                    shared = msg_tokens & author_toks
+                    if len(shared) >= 2:
+                        overlap_hits.append((author_login, shared))
+                if len(overlap_hits) == 1:
+                    sole_author, shared = overlap_hits[0]
+                    code_hits_by_author.setdefault(sole_author, []).append(
+                        (f"code_topic:{','.join(sorted(shared)[:4])}: {snippet}", link)
+                    )
+
+    is_multi_author = (discord_id in multi_author_ids) or (len(linked_pr_authors) >= 2)
+
+    def _pack_items(items: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+        ev_out: list[str] = []
+        links_out: list[str] = []
+        for ev_text, ev_link in items:
+            if ev_text and ev_text not in ev_out:
+                ev_out.append(ev_text)
+            if ev_link and ev_link not in links_out:
+                links_out.append(ev_link)
+        return ev_out[:12], links_out[:12]
+
+    inferred_login: str | None = None
+    confidence = 0.0
+    chosen_items: list[tuple[str, str]] = []
+
+    if len(claimed_logins) == 1:
+        sole_login = next(iter(claimed_logins))
+        inferred_login = sole_login
+        confidence = MESSAGE_EVIDENCE_CLAIM_CONFIDENCE
+        chosen_items.extend(claimed_logins[sole_login])
+        chosen_items.extend(owned_pr_authors.get(sole_login, ()))
+        chosen_items.extend(code_hits_by_author.get(sole_login, ())[:3])
+    elif len(claimed_logins) >= 2:
+        inferred_login = None
+        confidence = 0.0
+        chosen_items.append((f"conflicting_github_claims:{','.join(sorted(claimed_logins)[:4])}", ""))
+    elif not is_multi_author and len(owned_pr_authors) == 1:
+        sole_login = next(iter(owned_pr_authors))
+        inferred_login = sole_login
+        confidence = MESSAGE_EVIDENCE_OWNERSHIP_CONFIDENCE
+        chosen_items.extend(owned_pr_authors[sole_login])
+        chosen_items.extend(code_hits_by_author.get(sole_login, ())[:3])
+    elif not is_multi_author:
+        corroborating_authors = set(linked_pr_authors.keys()) | set(code_hits_by_author.keys())
+        if len(corroborating_authors) == 1:
+            sole_login = next(iter(corroborating_authors))
+            inferred_login = sole_login
+            has_pr_link = sole_login in linked_pr_authors
+            has_code = sole_login in code_hits_by_author
+            confidence = 0.70 if (has_pr_link and has_code) else 0.55
+            chosen_items.extend(linked_pr_authors.get(sole_login, ()))
+            chosen_items.extend(code_hits_by_author.get(sole_login, ()))
+        elif generic_snippets:
+            chosen_items.extend(generic_snippets[:5])
+    else:
+        chosen_items.append((f"multi_author_poster:{len(linked_pr_authors)}_authors", ""))
+
+    evidence, message_links = _pack_items(chosen_items)
+    return {
+        "discord_id": discord_id,
+        "inferred_github_login": inferred_login,
+        "evidence": evidence,
+        "message_links": message_links,
+        "confidence": confidence,
+        "last_message_id": max_msg_id,
+        "messages_scanned": len(authored),
+        "is_multi_author": is_multi_author,
+        "tracked_pr_links": tracked_pr_links_found,
+    }
+
+
+def scan_member_message_evidence(
+    discord_id: str,
+    guild_id: str | None,
+    discord_token: str | None,
+    repository: str,
+    *,
+    store=None,
+    now: datetime | None = None,
+    pr_number_to_author: dict[int, str] | None = None,
+    author_pr_files: dict[str, set[str]] | None = None,
+    author_pr_titles: dict[str, list[str]] | None = None,
+    multi_author_ids: frozenset[str] | set[str] = frozenset(),
+    pr_link_messages_for_member: list[dict] | None = None,
+    message_searcher=None,
+    allow_live_search: bool = False,
+    max_pages: int = MEMBER_MESSAGE_SCAN_MAX_PAGES,
+    sleep_fn=time.sleep,
+) -> dict | None:
+    """Return a durable ``member_identity_notes`` record for ``discord_id``.
+
+    Reuses the persisted SQLite note without calling Discord when no newer messages
+    have arrived since ``last_message_id``. Scans via ``message_searcher`` (or
+    ``search_guild_messages(..., author_id=discord_id)`` when ``allow_live_search``
+    is True) on first inspection or when ``needs_refresh`` is set.
+    """
+    uid = str(discord_id or "").strip()
+    if not is_discord_id(uid):
+        return None
+    moment = now or datetime.now(tz=UTC)
+    moment_iso = iso(moment)
+
+    existing = None
+    if store is not None and hasattr(store, "get_member_identity_note"):
+        try:
+            existing = store.get_member_identity_note(uid)
+        except Exception as error:
+            logging.warning("Could not read member_identity_notes for %s: %s", uid, error)
+
+    newest_pr_link_mid = ""
+    for row in pr_link_messages_for_member or ():
+        mid = str(row.get("message_id") or "").strip()
+        if _snowflake_int(mid) > _snowflake_int(newest_pr_link_mid):
+            newest_pr_link_mid = mid
+
+    needs_refresh = existing is None or bool(existing.get("needs_refresh"))
+    if existing is not None and _snowflake_int(newest_pr_link_mid) > _snowflake_int(existing.get("last_message_id")):
+        needs_refresh = True
+
+    if existing is not None and not needs_refresh:
+        return existing
+
+    can_search = message_searcher is not None or (
+        allow_live_search and bool(guild_id) and is_discord_id(str(guild_id)) and bool(discord_token)
+    )
+    if not can_search:
+        return existing
+
+    search_fn = message_searcher
+    fetched_messages: list[dict] = []
+    scan_failed = False
+    for page in range(max(1, int(max_pages))):
+        offset = page * 25
+        try:
+            if search_fn is not None:
+                payload = search_fn(str(guild_id or ""), uid, offset)
+            else:
+                payload = search_guild_messages(
+                    str(guild_id),
+                    "",
+                    str(discord_token),
+                    author_id=uid,
+                    offset=offset,
+                    sleep_fn=sleep_fn,
+                )
+        except Exception as error:
+            logging.warning("Message-evidence scan failed for discord_id=%s (offset=%d): %s", uid, offset, error)
+            scan_failed = True
+            break
+        page_msgs = _flatten_search_messages(payload, uid)
+        if not page_msgs:
+            break
+        fetched_messages.extend(page_msgs)
+        total_results = payload.get("total_results") if isinstance(payload, dict) else None
+        if len(page_msgs) < 25 or (isinstance(total_results, int) and offset + 25 >= total_results):
+            break
+
+    if scan_failed and not fetched_messages:
+        return existing
+
+    # Fold in already-captured pr_link_posters messages for this member so we never lose them.
+    seen_ids = {str(m.get("id") or "") for m in fetched_messages if m.get("id")}
+    for row in pr_link_messages_for_member or ():
+        mid = str(row.get("message_id") or "").strip()
+        if mid and mid in seen_ids:
+            continue
+        text = str(row.get("message_text") or "").strip()
+        pr_num = row.get("pr_number")
+        if repository and isinstance(pr_num, int) and pr_num > 0 and f"/pull/{pr_num}" not in text:
+            text = f"{text} https://github.com/{repository}/pull/{pr_num}".strip()
+        fetched_messages.append({
+            "id": mid,
+            "channel_id": str(row.get("channel_id") or ""),
+            "author": {"id": uid},
+            "content": text,
+        })
+
+    analysis = analyze_member_messages(
+        uid,
+        fetched_messages,
+        repository,
+        guild_id=guild_id,
+        pr_number_to_author=pr_number_to_author,
+        author_pr_files=author_pr_files,
+        author_pr_titles=author_pr_titles,
+        multi_author_ids=multi_author_ids,
+    )
+
+    last_msg_id = analysis["last_message_id"]
+    if existing is not None:
+        if _snowflake_int(existing.get("last_message_id")) > _snowflake_int(last_msg_id):
+            last_msg_id = str(existing.get("last_message_id") or "")
+        # If new messages were seen via gateway and search returned messages, mark up to seen if scanned >= seen.
+        if not last_msg_id and existing.get("last_seen_message_id"):
+            last_msg_id = str(existing.get("last_seen_message_id") or "")
+
+    # Record any newly discovered tracked-repo PR links in pr_link_posters as well.
+    if store is not None and repository and hasattr(store, "record_pr_link_poster"):
+        for pr_num, cid, mid, snippet in analysis.get("tracked_pr_links", ()):
+            try:
+                store.record_pr_link_poster(
+                    repository,
+                    pr_num,
+                    uid,
+                    cid,
+                    mid,
+                    snippet,
+                    posted_at=moment_iso,
+                )
+            except Exception:
+                pass
+
+    if store is not None and hasattr(store, "save_member_identity_note"):
+        try:
+            store.save_member_identity_note(
+                uid,
+                inferred_github_login=analysis["inferred_github_login"],
+                evidence=analysis["evidence"],
+                message_links=analysis["message_links"],
+                confidence=analysis["confidence"],
+                last_message_id=last_msg_id,
+                messages_scanned=analysis["messages_scanned"],
+                updated_at=moment_iso,
+            )
+            saved = store.get_member_identity_note(uid)
+            if saved is not None:
+                return saved
+        except Exception as error:
+            logging.warning("Could not persist member_identity_notes for %s: %s", uid, error)
+
+    return {
+        "discord_id": uid,
+        "inferred_github_login": analysis["inferred_github_login"],
+        "evidence": analysis["evidence"],
+        "message_links": analysis["message_links"],
+        "confidence": analysis["confidence"],
+        "last_message_id": last_msg_id,
+        "last_seen_message_id": last_msg_id,
+        "messages_scanned": analysis["messages_scanned"],
+        "updated_at": moment_iso,
+        "needs_refresh": False,
+    }
+
+
+def _member_matches_any_github_login(member: DiscordMemberInfo, author_logins: set[str]) -> bool:
+    """Return True when the member's Discord username or global_name directly matches a GitHub login."""
+    strict_logins = {normalize_strict(login) for login in author_logins if normalize_strict(login)}
+    for raw in (member.username, member.global_name):
+        cleaned = (raw or "").strip()
+        if not cleaned:
+            continue
+        if cleaned.lower() in author_logins:
+            return True
+        strict = normalize_strict(cleaned)
+        if strict and strict in strict_logins:
+            return True
+    return False
+
+
 def _compute_attempt_signature(
     profile: GitHubAuthorProfile,
     candidates: list[CandidatePair],
     pr_link_rows: list[dict],
+    identity_notes: list[dict] | None = None,
 ) -> str:
-    """Stable SHA-256 signature over profile, candidate shortlist, and PR-link poster rows."""
+    """Stable SHA-256 signature over profile, candidate shortlist, PR-link rows, and member identity notes."""
     payload = {
         "profile": {
             "login": profile.login.casefold(),
@@ -2586,6 +3158,17 @@ def _compute_attempt_signature(
         "pr_links": sorted(
             [int(r.get("pr_number") or 0), str(r.get("discord_id") or ""), str(r.get("message_id") or "")]
             for r in pr_link_rows
+        ),
+        "identity_notes": sorted(
+            [
+                str(n.get("discord_id") or ""),
+                str(n.get("inferred_github_login") or ""),
+                round(float(n.get("confidence") or 0.0), 2),
+                str(n.get("last_message_id") or ""),
+                str(n.get("last_seen_message_id") or ""),
+                str(n.get("updated_at") or ""),
+            ]
+            for n in (identity_notes or ())
         ),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2692,6 +3275,8 @@ def match_community_contributors_with_diagnostics(
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
+    message_searcher=None,
+    allow_live_message_search: bool | None = None,
     skip_github_enrichment: bool = False,
     deadline: float | None = None,
     recent_poster_ids: set[str] | frozenset[str] | None = None,
@@ -2946,6 +3531,74 @@ def match_community_contributors_with_diagnostics(
                 continue
             eligible_pending.append(group)
 
+        # Prepare message-evidence context & refresh any stale durable member_identity_notes
+        # (only when new messages have arrived since the member was last scanned).
+        author_pr_files, author_pr_titles = _collect_author_pr_context(groups, store, repository)
+        pr_link_rows_by_member: dict[str, list[dict]] = {}
+        for row in all_repo_pr_links:
+            uid = str(row.get("discord_id") or "").strip()
+            if is_discord_id(uid):
+                pr_link_rows_by_member.setdefault(uid, []).append(row)
+
+        live_message_search = (
+            (members is None if allow_live_message_search is None else bool(allow_live_message_search))
+            and bool(guild_id)
+            and is_discord_id(str(guild_id))
+            and bool(discord_token)
+        )
+        can_scan_messages = message_searcher is not None or live_message_search
+        scans_used = 0
+        identity_notes_by_member: dict[str, dict] = {}
+        if store is not None and hasattr(store, "all_member_identity_notes"):
+            try:
+                for note in store.all_member_identity_notes():
+                    uid = str(note.get("discord_id") or "")
+                    if not is_discord_id(uid):
+                        continue
+                    pr_rows_m = pr_link_rows_by_member.get(uid, ())
+                    newest_pr_mid = max(
+                        (_snowflake_int(r.get("message_id")) for r in pr_rows_m),
+                        default=0,
+                    )
+                    stale = bool(note.get("needs_refresh")) or (
+                        newest_pr_mid > _snowflake_int(note.get("last_message_id"))
+                    )
+                    if (
+                        stale
+                        and can_scan_messages
+                        and uid in member_by_id
+                        and uid not in excluded_staff_ids
+                        and scans_used < MAX_MEMBER_MESSAGE_SCANS_PER_RUN
+                    ):
+                        refreshed = scan_member_message_evidence(
+                            uid,
+                            str(guild_id) if guild_id else None,
+                            discord_token,
+                            repository,
+                            store=store,
+                            now=moment,
+                            pr_number_to_author=pr_number_to_author,
+                            author_pr_files=author_pr_files,
+                            author_pr_titles=author_pr_titles,
+                            multi_author_ids=multi_author_ids,
+                            pr_link_messages_for_member=list(pr_rows_m),
+                            message_searcher=message_searcher,
+                            allow_live_search=live_message_search,
+                            sleep_fn=sleep_fn,
+                        )
+                        scans_used += 1
+                        if refreshed is not None:
+                            note = refreshed
+                    identity_notes_by_member[uid] = note
+            except Exception as error:
+                logging.warning("Could not load member_identity_notes: %s", error)
+
+        identity_notes_by_login: dict[str, list[dict]] = {}
+        for note in identity_notes_by_member.values():
+            inferred = (note.get("inferred_github_login") or "").strip().casefold()
+            if inferred:
+                identity_notes_by_login.setdefault(inferred, []).append(note)
+
         # Precompute full-pool scoring + negative-cache check for every enriched author so
         # identical no_match attempts skip BOTH Pass 1 and Pass 2 LLM calls for 7 days.
         cached_negative_keys: set[str] = set()
@@ -2965,7 +3618,12 @@ def match_community_contributors_with_diagnostics(
                 rejected_discord_ids=rejected_by_login.get(login_key, set()),
             )
             full_scores_cache[login_key] = (full_strong, full_cands)
-            sig = _compute_attempt_signature(profile, full_cands, pr_link_rows_by_login.get(login_key, []))
+            sig = _compute_attempt_signature(
+                profile,
+                full_cands,
+                pr_link_rows_by_login.get(login_key, []),
+                identity_notes_by_login.get(login_key, []),
+            )
             attempt_signatures[login_key] = sig
             if (
                 full_strong is None
@@ -3009,15 +3667,14 @@ def match_community_contributors_with_diagnostics(
                 return True
             return _profile_has_enrichment_data(profiles_by_login.get(login_key))
 
-        # Pass 1: priority pool (joined within 7 days / recent posters).
+        # Tiers (a)-(c): deterministic strong matches first (priority pool, then full pool).
         if use_priority_pool and recent_index is not None:
-            recent_candidates: list[CandidatePair] = []
             for group in eligible_pending:
                 login_key = group["login"].strip().casefold()
                 if login_key in resolved or login_key in cached_negative_keys:
                     continue
                 profile = profiles_by_login[login_key]
-                strong, candidates = score_author_against_members(
+                strong, _candidates = score_author_against_members(
                     profile,
                     recent_members,
                     member_index=recent_index,
@@ -3030,7 +3687,239 @@ def match_community_contributors_with_diagnostics(
                     member, method, confidence = strong
                     resolved[login_key] = (group, member.discord_id, method, confidence)
                     evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
-                elif candidates and _llm_allowed(login_key):
+
+        for group in eligible_pending:
+            login_key = group["login"].strip().casefold()
+            if login_key in resolved or login_key in cached_negative_keys:
+                continue
+            strong, _candidates = full_scores_cache[login_key]
+            if strong is not None:
+                member, method, confidence = strong
+                resolved[login_key] = (group, member.discord_id, method, confidence)
+                evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
+
+        # Message-evidence step: for Discord members whose username/global_name does not
+        # match a GitHub login and who are not yet linked to a GitHub profile, reuse durable
+        # member_identity_notes or scan their guild messages (PR/issue links, GitHub URLs/handles,
+        # ownership statements, code discussion) against real merged-PR authors.
+        unmatched_groups = [
+            g for g in eligible_pending
+            if g["login"].strip().casefold() not in resolved
+            and g["login"].strip().casefold() not in cached_negative_keys
+        ]
+        if unmatched_groups:
+            unmatched_login_set = {g["login"].strip().casefold() for g in unmatched_groups}
+            all_author_logins = {g["login"].strip().lower() for g in groups}
+
+            already_mapped_discord_ids: set[str] = {uid for (_g, uid, _m, _c) in resolved.values()}
+            for m_uid in manual_map.values():
+                if is_discord_id(str(m_uid)):
+                    already_mapped_discord_ids.add(str(m_uid))
+            if store is not None:
+                if hasattr(store, "all_links"):
+                    try:
+                        for row in store.all_links():
+                            if is_discord_id(str(row.get("discord_id") or "")):
+                                already_mapped_discord_ids.add(str(row["discord_id"]))
+                    except Exception:
+                        pass
+                if hasattr(store, "all_confirmed_matches"):
+                    try:
+                        for row in store.all_confirmed_matches():
+                            if is_discord_id(str(row.get("discord_id") or "")):
+                                already_mapped_discord_ids.add(str(row["discord_id"]))
+                    except Exception:
+                        pass
+
+            # Build prioritized list of unlinked, non-staff members to scan if uncached.
+            ordered_member_ids: list[str] = []
+            seen_member_ids: set[str] = set()
+
+            def _enqueue_member(uid: str) -> None:
+                if (
+                    not is_discord_id(uid)
+                    or uid in seen_member_ids
+                    or uid not in member_by_id
+                    or uid in excluded_staff_ids
+                    or uid in already_mapped_discord_ids
+                ):
+                    return
+                member = member_by_id[uid]
+                if _member_matches_any_github_login(member, all_author_logins):
+                    return
+                seen_member_ids.add(uid)
+                ordered_member_ids.append(uid)
+
+            # 1. Members who already have a persisted note pointing to an unmatched author.
+            for login_key in unmatched_login_set:
+                for note in identity_notes_by_login.get(login_key, ()):
+                    _enqueue_member(str(note.get("discord_id") or ""))
+            # 2. Candidate shortlist + PR-link posters for unmatched authors.
+            for login_key in unmatched_login_set:
+                for cand in full_scores_cache[login_key][1]:
+                    _enqueue_member(cand.member.discord_id)
+                for ev in pr_link_evidence_by_login.get(login_key, ()):
+                    _enqueue_member(ev.discord_id)
+            # 3. Priority-pool recent members, then remaining unmatched guild members.
+            for member in recent_members:
+                _enqueue_member(member.discord_id)
+            for member in guild_members:
+                _enqueue_member(member.discord_id)
+
+            for uid in ordered_member_ids:
+                existing_note = identity_notes_by_member.get(uid)
+                pr_rows_m = pr_link_rows_by_member.get(uid, ())
+                newest_pr_mid = max((_snowflake_int(r.get("message_id")) for r in pr_rows_m), default=0)
+                needs_scan = (
+                    existing_note is None
+                    or bool(existing_note.get("needs_refresh"))
+                    or newest_pr_mid > _snowflake_int(existing_note.get("last_message_id"))
+                )
+                if not needs_scan:
+                    continue
+                if not can_scan_messages or scans_used >= MAX_MEMBER_MESSAGE_SCANS_PER_RUN:
+                    continue
+                scanned = scan_member_message_evidence(
+                    uid,
+                    str(guild_id) if guild_id else None,
+                    discord_token,
+                    repository,
+                    store=store,
+                    now=moment,
+                    pr_number_to_author=pr_number_to_author,
+                    author_pr_files=author_pr_files,
+                    author_pr_titles=author_pr_titles,
+                    multi_author_ids=multi_author_ids,
+                    pr_link_messages_for_member=list(pr_rows_m),
+                    message_searcher=message_searcher,
+                    allow_live_search=live_message_search,
+                    sleep_fn=sleep_fn,
+                )
+                scans_used += 1
+                if scanned is not None:
+                    identity_notes_by_member[uid] = scanned
+
+            # Rebuild login -> notes mapping after any fresh scans.
+            identity_notes_by_login = {}
+            for uid, note in identity_notes_by_member.items():
+                if uid not in member_by_id or uid in excluded_staff_ids:
+                    continue
+                inferred = (note.get("inferred_github_login") or "").strip().casefold()
+                if inferred:
+                    identity_notes_by_login.setdefault(inferred, []).append(note)
+
+            # Evaluate strong deterministic message_evidence matches and corroborating LLM signals.
+            msg_conflict_logins: set[str] = set()
+            for group in unmatched_groups:
+                login_key = group["login"].strip().casefold()
+                notes_for_login = [
+                    n for n in identity_notes_by_login.get(login_key, ())
+                    if (login_key, str(n["discord_id"])) not in rejected_pairs
+                    and str(n["discord_id"]) not in multi_author_ids
+                ]
+                if not notes_for_login:
+                    continue
+
+                # Refresh attempt signature so future runs reflect newly learned message notes.
+                profile = profiles_by_login[login_key]
+                attempt_signatures[login_key] = _compute_attempt_signature(
+                    profile,
+                    full_scores_cache[login_key][1],
+                    pr_link_rows_by_login.get(login_key, []),
+                    notes_for_login,
+                )
+
+                strong_notes = [
+                    n for n in notes_for_login
+                    if float(n.get("confidence") or 0.0) >= MESSAGE_EVIDENCE_STRONG_THRESHOLD
+                ]
+                if len(strong_notes) == 1:
+                    chosen = strong_notes[0]
+                    uid = str(chosen["discord_id"])
+                    conf = float(chosen["confidence"])
+                    resolved[login_key] = (group, uid, "message_evidence", conf)
+                    ev_items: list[str] = []
+                    for item in chosen.get("evidence") or ():
+                        if item not in ev_items:
+                            ev_items.append(str(item))
+                    for link in chosen.get("message_links") or ():
+                        tagged = f"msg_link:{link}"
+                        if tagged not in ev_items:
+                            ev_items.append(tagged)
+                    evidence_by_login[login_key] = tuple(ev_items[:8]) or (f"message_evidence:{login_key}->{uid}",)
+                    continue
+                if len(strong_notes) >= 2:
+                    msg_conflict_logins.add(login_key)
+                    claimants = sorted(str(n["discord_id"]) for n in strong_notes)
+                    logging.warning(
+                        "1-to-1 message_evidence conflict for github_login=%s (discord_ids=%s); granting nothing",
+                        group["login"],
+                        claimants,
+                    )
+                    skip_reason_by_login[login_key] = "discord_id_conflict"
+                    skip_meta_by_login[login_key] = (
+                        max(float(n.get("confidence") or 0.0) for n in strong_notes),
+                        f"1-to-1 conflict: multiple members claimed {group['login']} ({claimants})",
+                    )
+                    continue
+
+                # Non-strong corroborating message evidence (e.g. code paths / PR topic / non-ownership link):
+                # attach as an extra signal on CandidatePair so Tier (d) LLM can evaluate it alongside
+                # GitHub profile signals under the >= 2 signals & >= 0.85 confidence rule.
+                full_strong, existing_cands = full_scores_cache[login_key]
+                cand_by_uid = {c.member.discord_id: c for c in existing_cands}
+                updated = False
+                for note in notes_for_login:
+                    uid = str(note["discord_id"])
+                    note_conf = float(note.get("confidence") or 0.0)
+                    ev_list = list(note.get("evidence") or ())
+                    if note_conf <= 0.0 or not ev_list:
+                        continue
+                    msg_signal = f"message_evidence:{ev_list[0][:100]}"
+                    if uid in cand_by_uid:
+                        old_c = cand_by_uid[uid]
+                        if msg_signal not in old_c.signals:
+                            cand_by_uid[uid] = CandidatePair(
+                                profile=old_c.profile,
+                                member=old_c.member,
+                                heuristic_score=round(min(0.95, max(old_c.heuristic_score, note_conf) + 0.10), 4),
+                                signals=old_c.signals + (msg_signal,),
+                            )
+                            updated = True
+                    elif uid in member_by_id:
+                        cand_by_uid[uid] = CandidatePair(
+                            profile=profile,
+                            member=member_by_id[uid],
+                            heuristic_score=round(note_conf, 4),
+                            signals=(msg_signal,),
+                        )
+                        updated = True
+                if updated:
+                    merged_cands = sorted(
+                        cand_by_uid.values(),
+                        key=lambda c: (-c.heuristic_score, c.member.discord_id),
+                    )[:MAX_CANDIDATES_PER_AUTHOR]
+                    full_scores_cache[login_key] = (full_strong, merged_cands)
+
+        # Tier (d): List-wise LLM selection over remaining unmatched enriched authors.
+        # Pass 1: priority pool candidates.
+        if use_priority_pool and recent_index is not None:
+            recent_candidates: list[CandidatePair] = []
+            for group in eligible_pending:
+                login_key = group["login"].strip().casefold()
+                if login_key in resolved or login_key in cached_negative_keys or skip_reason_by_login.get(login_key) == "discord_id_conflict":
+                    continue
+                profile = profiles_by_login[login_key]
+                _strong, candidates = score_author_against_members(
+                    profile,
+                    recent_members,
+                    member_index=recent_index,
+                    pr_link_posters=pr_link_evidence_by_login.get(login_key),
+                    excluded_discord_ids=excluded_staff_ids,
+                    multi_author_ids=multi_author_ids,
+                    rejected_discord_ids=rejected_by_login.get(login_key, set()),
+                )
+                if candidates and _llm_allowed(login_key):
                     recent_candidates.extend(candidates)
 
             if recent_candidates:
@@ -3052,18 +3941,14 @@ def match_community_contributors_with_diagnostics(
                         if login_key in recent_ev:
                             evidence_by_login[login_key] = recent_ev[login_key]
 
-        # Pass 2: full member list fallback ONLY for authors still unmatched after Pass 1.
+        # Pass 2: full member list LLM fallback ONLY for authors still unmatched after Pass 1.
         full_candidates: list[CandidatePair] = []
         for group in eligible_pending:
             login_key = group["login"].strip().casefold()
-            if login_key in resolved or login_key in cached_negative_keys:
+            if login_key in resolved or login_key in cached_negative_keys or skip_reason_by_login.get(login_key) == "discord_id_conflict":
                 continue
-            strong, candidates = full_scores_cache[login_key]
-            if strong is not None:
-                member, method, confidence = strong
-                resolved[login_key] = (group, member.discord_id, method, confidence)
-                evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
-            elif candidates and _llm_allowed(login_key):
+            _strong, candidates = full_scores_cache[login_key]
+            if candidates and _llm_allowed(login_key):
                 full_candidates.extend(candidates)
             elif candidates:
                 top_h = candidates[0].heuristic_score
@@ -3304,6 +4189,8 @@ def match_community_contributors(
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
+    message_searcher=None,
+    allow_live_message_search: bool | None = None,
     skip_github_enrichment: bool = False,
     org_members: frozenset[str] = frozenset(),
     sleep_fn=time.sleep,
@@ -3324,6 +4211,8 @@ def match_community_contributors(
         haiku_complete=haiku_complete,
         rest_fetcher=rest_fetcher,
         rest_searcher=rest_searcher,
+        message_searcher=message_searcher,
+        allow_live_message_search=allow_live_message_search,
         skip_github_enrichment=skip_github_enrichment,
         org_members=org_members,
         sleep_fn=sleep_fn,

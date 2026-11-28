@@ -33,6 +33,7 @@ from .config import Config, is_discord_id
 from .matcher import (
     LLM_CONFIDENCE_THRESHOLD,
     LLM_MIN_SIGNALS,
+    MESSAGE_EVIDENCE_STRONG_THRESHOLD,
     GitHubAuthorProfile,
     _MemberIndex,
     _cached_github_profile,
@@ -514,6 +515,8 @@ def _match_authors(
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
+    message_searcher=None,
+    allow_live_message_search: bool | None = None,
     deadline: float | None = None,
     org_members: frozenset[str] = frozenset(),
     sleep_fn=time.sleep,
@@ -574,6 +577,8 @@ def _match_authors(
             haiku_complete=haiku_complete,
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
+            message_searcher=message_searcher,
+            allow_live_message_search=allow_live_message_search,
             deadline=deadline,
             org_members=org_members,
             sleep_fn=sleep_fn,
@@ -801,6 +806,7 @@ def poll_merged_prs_for_roles(
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
+    message_searcher=None,
     announcement_chunk_limit: int = ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
     sleep_fn=time.sleep,
 ) -> RolesPollResult | None:
@@ -995,6 +1001,8 @@ def poll_merged_prs_for_roles(
             haiku_complete=haiku_complete,
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
+            message_searcher=message_searcher,
+            allow_live_message_search=(members is None),
             deadline=deadline,
             org_members=org_members,
             sleep_fn=sleep_fn,
@@ -1325,6 +1333,7 @@ def run_roles_backfill(
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
+    message_searcher=None,
     announce_summary: bool = True,
     sleep_fn=time.sleep,
 ) -> BackfillResult | None:
@@ -1529,6 +1538,8 @@ def run_roles_backfill(
             haiku_complete=haiku_complete,
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
+            message_searcher=message_searcher,
+            allow_live_message_search=(members is None),
             deadline=deadline,
             org_members=org_members,
             sleep_fn=sleep_fn,
@@ -1957,6 +1968,26 @@ def revalidate_all_grants_on_boot(
                             reason = f"tier_verified:{strong[1]}"
                         else:
                             reason = f"strong_matched_other_member:{strong[0].discord_id}"
+                    elif (
+                        hasattr(store, "member_identity_notes_for_login")
+                        and discord_id not in excluded_staff_ids
+                        and discord_id not in multi_author_ids
+                        and any(
+                            str(n.get("discord_id") or "") == discord_id
+                            and float(n.get("confidence") or 0.0) >= MESSAGE_EVIDENCE_STRONG_THRESHOLD
+                            for n in store.member_identity_notes_for_login(login)
+                        )
+                        and len([
+                            n for n in store.member_identity_notes_for_login(login)
+                            if str(n.get("discord_id") or "") in member_by_id
+                            and str(n.get("discord_id") or "") not in excluded_staff_ids
+                            and str(n.get("discord_id") or "") not in multi_author_ids
+                            and float(n.get("confidence") or 0.0) >= MESSAGE_EVIDENCE_STRONG_THRESHOLD
+                        ]) == 1
+                    ):
+                        note = store.get_member_identity_note(discord_id)
+                        passed = True
+                        reason = f"message_evidence_verified:conf={float((note or {}).get('confidence') or 0.0):.2f}"
                     elif not skip_github_enrichment and not _profile_has_enrichment_data(profile):
                         reason = "no_enrichment_for_llm"
                     elif discord_id not in {c.member.discord_id for c in candidates}:
