@@ -23,11 +23,13 @@ DIFF_MAX_CHUNKS = 3
 _SYSTEM_BASE = (
     "You review pull requests for BerriAI/litellm. "
     "Your notes are posted in Discord only. Do not approve, request changes, or sound like a GitHub review. "
-    "Write like a busy senior maintainer on Discord: plain, direct, lowercase is fine. "
+    "Write like a busy senior maintainer on Discord: plain, direct, constructive, lowercase is fine. "
     "No praise padding, no 'Great PR!', no headings, no emojis, no em-dashes, no hedging, and no summary of what the PR does. "
     "Return one JSON object and nothing else, with keys "
     f"verdict (one of: '{VERDICT_LOOKS_GOOD}', '{VERDICT_NEEDS_WORK}', '{VERDICT_BELOW_STANDARDS}') "
-    "and findings (0 to 5 short objects {path, line, reason} naming the file/line and specific standard broken; empty array when looks good). "
+    "and findings (0 to 5 short objects {path, line, reason, suggestion}; empty array when looks good). "
+    "For non-clean verdicts, every finding must include a concrete non-empty suggestion saying what the PR should do instead "
+    "(exact file, class/function, or change, keeping problem + fix to one or two short sentences). "
     "No markdown fences."
 )
 

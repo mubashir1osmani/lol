@@ -3,7 +3,8 @@
 Proposed replacement/extension for `BerriAI/litellm/AGENTS.md`. Encodes architecture, code-quality standards, and local lint/test gates.
 
 ## Architecture and Placement
-- Put provider logic under `litellm/llms/<provider>/<endpoint>/` implementing the base config under `litellm/llms/base_llm/<endpoint>/` (for example `litellm/llms/base_llm/chat/transformation.py`, `litellm/llms/base_llm/batches/`, `litellm/llms/base_llm/audio_transcription/`).
+- For OpenAI-compatible providers, register them in `litellm/llms/openai_like/providers.json` (loaded by `litellm/llms/openai_like/json_loader.py` and `dynamic_config.py`) plus `model_prices_and_context_window.json` rather than writing a custom Python provider package.
+- Put standalone (non-OpenAI-compatible) provider logic under `litellm/llms/<provider>/<endpoint>/transformation.py` implementing the base config under `litellm/llms/base_llm/<endpoint>/` (for example `litellm/llms/base_llm/chat/transformation.py`, `litellm/llms/base_llm/batches/`, `litellm/llms/base_llm/audio_transcription/`).
 - Do not add provider-specific top-level SDK exports to `litellm/__init__.py` when standard unified endpoints or pass-through apply.
 - Do not dump provider branches or one-off helpers into `litellm/main.py`, `litellm/utils.py`, or `litellm/proxy/proxy_server.py`.
 - Call public dispatch entry points (`litellm.completion`, `litellm.responses.dispatch.responses`, `litellm.messages.anthropic_messages`), not internal un-dispatched functions (`.github/linters/ruff-strict.toml` `TID251`).
@@ -29,8 +30,10 @@ Proposed replacement/extension for `BerriAI/litellm/AGENTS.md`. Encodes architec
   - Keep functions simple and readable: max 1 `for` + 1 `if` per comprehension (`LIT014`), complexity <= 15 (`C901`), <= 5 args (`PLR0913`), line length <= 120. No clever nested dict-unpacking spreads or `print()` (`T20`).
 
 ## Comments, Diffs, and Writing Style
-- Do not add comments unless they explain genuinely non-obvious business logic, a tool directive with a reason, or an unavoidable TODO/FIXME with an issue link. Never leave dead or commented-out code.
-- Keep PRs small and focused on one logical change. Do not reformat untouched files or bundle unrelated Terraform, README, or generated schema churn.
+- Say no to comments in code unless strictly required for a non-obvious invariant, a tool directive with a reason, or an unavoidable TODO/FIXME with an issue link. Never leave dead or commented-out code.
+- Put imports at module top level; do not add inline (function-level) imports unless required by lint or circular-import rules.
+- Do not add or change `.md` files unless explicitly required; keep the codebase free of AI-generated markdown files.
+- Keep PRs small and focused on one logical change. Watch for regressions when touching shared code paths, defaults, or signatures, and include regression tests. Do not reformat untouched files or bundle unrelated Terraform, README, or generated schema churn.
 - Fill out PR descriptions plainly and accurately; never leave template placeholders behind.
 - In docs, PR text, and user-facing messages: use plain, direct engineering language. No emojis, no em-dashes, no "It's not X, it's Y", no fluff or hype.
 

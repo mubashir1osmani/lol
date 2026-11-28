@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import tempfile
@@ -13,6 +14,7 @@ from unittest import mock
 from contributor_bot.config import Config
 from contributor_bot.review_agent import (
     SYSTEM_PROMPT,
+    TOOLS,
     ReviewContext,
     build_system_prompt,
     execute_tool,
@@ -28,13 +30,22 @@ from contributor_bot.reviews import (
     VERDICT_BELOW_STANDARDS,
     VERDICT_LOOKS_GOOD,
     VERDICT_NEEDS_WORK,
+    analyze_pr_files,
     assess_gate,
     clean_review_text,
     discord_length,
+    extract_linked_issue_numbers,
+    files_from_unified_diff,
+    findings_missing_suggestions,
+    format_finding_bullet,
     load_review_standards,
     normalize_verdict,
     render_review,
     resolve_verdict,
+    scan_md_files,
+    scan_missing_tests,
+    scan_patch_added_comments,
+    scan_patch_inline_imports,
 )
 from contributor_bot.store import Store
 
@@ -204,8 +215,14 @@ class StandardsDocTests(unittest.TestCase):
             self.assertGreater(len(path.read_text(encoding="utf-8").strip()), 100)
 
         standards = load_review_standards()
+        self.assertLess(
+            standards.index("## 1. Root-Cause Analysis First"),
+            standards.index("## 2. Put Code in the Right Layer"),
+        )
         for expected in (
-            "litellm/llms/<provider>/<endpoint>/",
+            "Root-Cause Analysis First",
+            "litellm/llms/openai_like/providers.json",
+            "litellm/llms/<provider>/<endpoint>/transformation.py",
             "litellm/__init__.py",
             "litellm/main.py",
             "litellm/llms/custom_httpx/http_handler.py",
@@ -214,6 +231,11 @@ class StandardsDocTests(unittest.TestCase):
             ".github/linters/ruff-strict.toml",
             "tests/unit/AGENTS.md",
             "httpx._types",
+            "No `.md` files in PRs",
+            "No inline (function-level) imports",
+            "Say no to comments in code",
+            "credentials to test it",
+            "regression tests",
         ):
             self.assertIn(expected, standards)
 
@@ -229,6 +251,22 @@ class StandardsDocTests(unittest.TestCase):
         self.assertIn("no emojis", prompt.lower())
         self.assertIn("no headings", prompt.lower())
         self.assertIn("model_prices_and_context_window.json", prompt)
+        self.assertIn("litellm/llms/openai_like/providers.json", prompt)
+        self.assertIn("do not have credentials to test it", prompt.lower())
+        self.assertIn("regression", prompt.lower())
+        self.assertIn("inline (function-level) imports", prompt.lower())
+        self.assertIn("standards_signals", prompt)
+        self.assertIn("get_issue", prompt)
+        self.assertIn("root-cause analysis", prompt.lower())
+        self.assertIn("patches around", prompt.lower())
+        self.assertIn("read_file", prompt)
+        self.assertIn('"suggestion"', prompt)
+        self.assertIn("BaseBatchesConfig", prompt)
+
+        submit_tool = next(t for t in TOOLS if t["function"]["name"] == "submit_verdict")
+        finding_schema = submit_tool["function"]["parameters"]["properties"]["findings"]["items"]
+        self.assertIn("suggestion", finding_schema["properties"])
+        self.assertIn("suggestion", finding_schema["required"])
 
 
 class OutputFormatTests(unittest.TestCase):
@@ -301,14 +339,135 @@ class OutputFormatTests(unittest.TestCase):
         payload = json.dumps({
             "verdict": "doesn't meet our standards",
             "findings": [
-                {"path": "litellm/__init__.py", "line": 1694, "reason": "exports provider-specific gnani_batch at top level"},
-                {"path": "litellm/llms/gnani/batches/jobs.py", "line": 11, "reason": "imports private httpx._types"},
+                {
+                    "path": "litellm/__init__.py",
+                    "line": 1694,
+                    "reason": "exports bespoke gnani_batch at top level",
+                    "suggestion": "Drop it and implement a BaseBatchesConfig in litellm/llms/gnani/batches/transformation.py.",
+                },
+                {
+                    "path": "litellm/llms/gnani/batches/jobs.py",
+                    "line": 11,
+                    "reason": "imports private httpx._types",
+                    "suggestion": "Use HTTPHandler from litellm/llms/custom_httpx/http_handler.py instead.",
+                },
             ],
         })
         parsed = parse_review_json(payload)
         self.assertEqual(parsed["verdict"], VERDICT_BELOW_STANDARDS)
         self.assertEqual(len(parsed["findings"]), 2)
-        self.assertIn("litellm/__init__.py:1694", parsed["findings"][0])
+        self.assertEqual(
+            parsed["findings"][0],
+            "litellm/__init__.py:1694: exports bespoke gnani_batch at top level. "
+            "Drop it and implement a BaseBatchesConfig in litellm/llms/gnani/batches/transformation.py.",
+        )
+        self.assertIn("HTTPHandler", parsed["findings"][1])
+
+    def test_format_finding_bullet_combines_problem_and_suggestion(self):
+        bullet = format_finding_bullet({
+            "path": "litellm/__init__.py",
+            "line": 1694,
+            "reason": "exports bespoke gnani_batch at top level",
+            "suggestion": (
+                "Drop it and implement a BaseBatchesConfig in "
+                "litellm/llms/gnani/batches/transformation.py so "
+                'litellm.create_batch(custom_llm_provider="gnani") works.'
+            ),
+        })
+        self.assertEqual(
+            bullet,
+            "litellm/__init__.py:1694: exports bespoke gnani_batch at top level. "
+            "Drop it and implement a BaseBatchesConfig in "
+            "litellm/llms/gnani/batches/transformation.py so "
+            'litellm.create_batch(custom_llm_provider="gnani") works.',
+        )
+        # Existing trailing period does not create double punctuation.
+        punctuated = format_finding_bullet({
+            "path": "litellm/main.py",
+            "line": 10,
+            "reason": "patches around bug in shared code.",
+            "suggestion": "Move the fix into litellm/llms/foo/chat/transformation.py.",
+        })
+        self.assertNotIn("..", punctuated)
+        self.assertIn("litellm/main.py:10: patches around bug in shared code. Move the fix into", punctuated)
+
+    def test_submit_verdict_requires_suggestion_for_non_clean_findings(self):
+        self.assertEqual(findings_missing_suggestions(VERDICT_LOOKS_GOOD, []), [])
+        self.assertEqual(
+            findings_missing_suggestions(
+                VERDICT_NEEDS_WORK,
+                [
+                    {"path": "litellm/a.py", "line": 1, "reason": "bad import"},
+                    {"path": "litellm/b.py", "line": 2, "reason": "bad helper", "suggestion": "Use core_helpers."},
+                    {"path": "litellm/c.py", "line": 3, "reason": "bad route", "suggestion": "   "},
+                ],
+            ),
+            [0, 2],
+        )
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        config = replace(
+            Config("token", "123", "456", github_token="gh"),
+            pr_review_enabled=True,
+            review_channel_ids=("321",),
+            review_model="anthropic/claude-sonnet-4-5",
+            review_bot_logins=BOTS,
+            review_maintainer_role_id="555",
+        )
+        snapshot = Snapshot(
+            number=55200,
+            title="fix something",
+            head_sha=HEAD,
+            base_sha=BASE,
+            draft=False,
+            merged=False,
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            author_login="contrib",
+            author_id=7,
+            reviews=_clean_reviews(),
+            comments=[],
+            threads=[],
+            check_runs=[{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+            combined_state=None,
+        )
+        ctx = ReviewContext(config=config, store=store, number=55200, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=snapshot), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
+            rejected = json.loads(tool_submit_verdict(ctx, {
+                "verdict": VERDICT_BELOW_STANDARDS,
+                "findings": [
+                    {"path": "litellm/main.py", "line": 12, "reason": "adds provider branch in main.py"},
+                ],
+            }))
+            self.assertIn("error", rejected)
+            self.assertEqual(rejected["missing_suggestion_indices"], [0])
+            self.assertFalse(ctx.verdict_posted)
+            post.assert_not_called()
+
+            accepted = json.loads(tool_submit_verdict(ctx, {
+                "verdict": VERDICT_BELOW_STANDARDS,
+                "findings": [
+                    {
+                        "path": "litellm/main.py",
+                        "line": 12,
+                        "reason": "adds provider branch in main.py",
+                        "suggestion": "Move the branch into litellm/llms/acme/chat/transformation.py.",
+                    },
+                ],
+            }))
+        self.assertEqual(accepted["verdict"], VERDICT_BELOW_STANDARDS)
+        self.assertTrue(ctx.verdict_posted)
+        posted = post.call_args_list[0].args[2]["content"]
+        self.assertIn(
+            "- litellm/main.py:12: adds provider branch in main.py. "
+            "Move the branch into litellm/llms/acme/chat/transformation.py.",
+            posted,
+        )
 
 
 def _inspect_fixture_against_standards(ctx: ReviewContext) -> None:
@@ -325,31 +484,52 @@ def _inspect_fixture_against_standards(ctx: ReviewContext) -> None:
             findings.append({
                 "path": path,
                 "line": 1694,
-                "reason": "exports bespoke top-level gnani_batch/agnani_batch instead of using the standard batch transformation layer",
+                "reason": "exports bespoke gnani_batch/agnani_batch at top level",
+                "suggestion": (
+                    "Drop them from litellm/__init__.py and implement a BaseBatchesConfig in "
+                    "litellm/llms/gnani/batches/transformation.py so "
+                    'litellm.create_batch(custom_llm_provider="gnani") works.'
+                ),
             })
         if "httpx._types" in patch or ".client.send(" in patch:
             findings.append({
                 "path": path,
                 "line": 11,
-                "reason": "imports private httpx._types and bypasses LiteLLM HTTPHandler and exception mapping",
+                "reason": "imports private httpx._types and calls raw .client.send() bypassing LiteLLM HTTP plumbing",
+                "suggestion": (
+                    "Route requests through HTTPHandler/AsyncHTTPHandler from "
+                    "litellm/llms/custom_httpx/http_handler.py and map errors via litellm/llms/base_llm/base_utils.py."
+                ),
             })
         if "/{endpoint:path}" in patch and "dict[str, object]" in patch:
             findings.append({
                 "path": path,
                 "line": 22,
-                "reason": "catch-all regex router with response_model=dict[str, object] and TypeAdapter hack instead of explicit typed FastAPI routes",
+                "reason": "catch-all /{endpoint:path} regex router with response_model=dict[str, object] and TypeAdapter hack",
+                "suggestion": (
+                    "Replace it with explicit FastAPI routes and typed Pydantic request/response models "
+                    "under litellm/proxy/."
+                ),
             })
         if path.endswith("pass_through_endpoints.py") and "upstream_headers_filter" in patch:
             findings.append({
                 "path": path,
                 "line": 1734,
-                "reason": "mutates shared pass_through_request signature and spans Terraform/README/generated schema churn for one provider",
+                "reason": "mutates shared pass_through_request signature and bundles Terraform, README.md, and generated schema churn",
+                "suggestion": (
+                    "Revert pass_through_endpoints.py, deploy/, README.md, and schema.d.ts; "
+                    "scope this PR to Gnani batch transformation and add unit tests."
+                ),
             })
     if "[insert handwritten description here]" in (bundle.get("body_preview") or ""):
         findings.append({
             "path": "litellm/llms/gnani/batches/jobs.py",
             "line": 24,
-            "reason": "hardcodes provider URL with PureWindowsPath/dict-unpacking hacks and leaves unfilled PR template placeholder",
+            "reason": "hardcodes API URL with PureWindowsPath/nested dict-unpacking hacks and leaves unfilled PR template placeholder",
+            "suggestion": (
+                "Read the base URL from litellm/llms/gnani/common_utils.py, use os.path.basename "
+                "with plain dict assignment, and replace the placeholder in the PR body."
+            ),
         })
     tool_submit_verdict(ctx, {
         "verdict": VERDICT_BELOW_STANDARDS if len(findings) >= 2 else VERDICT_LOOKS_GOOD,
@@ -429,12 +609,24 @@ class PR54805UglyCodeFixtureTests(unittest.TestCase):
         self.assertEqual(lines[0], VERDICT_BELOW_STANDARDS)
 
         bullets = lines[1:]
-        self.assertGreaterEqual(len(bullets), 3)
-        self.assertLessEqual(len(bullets), MAX_REVIEW_BULLETS)
+        self.assertEqual(len(bullets), MAX_REVIEW_BULLETS)
         self.assertTrue(all(line.startswith("- ") for line in bullets))
-        self.assertIn("litellm/__init__.py:1694", review_msg)
-        self.assertIn("litellm/llms/gnani/batches/jobs.py:11", review_msg)
-        self.assertIn("litellm/proxy/pass_through_endpoints/gnani_batch.py:22", review_msg)
+        self.assertIn("litellm/__init__.py:1694:", bullets[0])
+        self.assertIn("BaseBatchesConfig", bullets[0])
+        self.assertIn("litellm/llms/gnani/batches/transformation.py", bullets[0])
+        self.assertIn("litellm/llms/gnani/batches/jobs.py:11:", bullets[1])
+        self.assertIn("HTTPHandler/AsyncHTTPHandler", bullets[1])
+        self.assertIn("litellm/proxy/pass_through_endpoints/gnani_batch.py:22:", bullets[2])
+        self.assertIn("explicit FastAPI routes", bullets[2])
+        self.assertIn("litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:1734:", bullets[3])
+        self.assertIn("Revert pass_through_endpoints.py", bullets[3])
+        self.assertIn("litellm/llms/gnani/batches/jobs.py:24:", bullets[4])
+        self.assertIn("litellm/llms/gnani/common_utils.py", bullets[4])
+        # Every bullet must pair the problem with a concrete fix sentence (no truncation).
+        for bullet in bullets:
+            self.assertNotIn("...", bullet)
+            self.assertIn(". ", bullet)
+        self.assertLessEqual(discord_length(review_msg), 2000)
 
         self.assertIsNone(_EMOJI_RE.search(review_msg))
         self.assertNotIn("—", review_msg)
@@ -445,6 +637,490 @@ class PR54805UglyCodeFixtureTests(unittest.TestCase):
             self.assertNotIn(praise, lowered)
         self.assertNotIn("<@&555>", "\n".join(contents))
         self.assertTrue(all(call.kwargs.get("mention_roles") in (None, []) for call in post.call_args_list))
+
+
+class StrictRuleChecksTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = Store(str(Path(self.directory.name) / "roles.db"))
+        self.addCleanup(self.store.close)
+        self.config = replace(
+            Config("token", "123", "456", github_token="gh"),
+            pr_review_enabled=True,
+            review_channel_ids=("321",),
+            review_model="anthropic/claude-sonnet-4-5",
+            review_bot_logins=BOTS,
+            review_maintainer_role_id="555",
+            review_cooldown_seconds=600,
+            discord_guild_id="333",
+            discord_application_id="444",
+        )
+
+    def _green_snapshot(self, *, diff: str = "") -> Snapshot:
+        return Snapshot(
+            number=55001,
+            title="fix helper",
+            head_sha=HEAD,
+            base_sha=BASE,
+            draft=False,
+            merged=False,
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            author_login="contrib",
+            author_id=7,
+            reviews=_clean_reviews(),
+            comments=[],
+            threads=[],
+            check_runs=[{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+            combined_state=None,
+            diff=diff,
+        )
+
+    def test_rule1_added_comments_detected_and_directives_ignored(self):
+        patch = (
+            "@@ -10,2 +10,13 @@ def transform(payload):\n"
+            "     x = 1\n"
+            "+    # increment counter by one\n"
+            "+    x += 1  # bump x\n"
+            "+    y = '# not a comment inside string'\n"
+            "+    z = x  # pyright: ignore[reportUnknownVariableType]  # sdk returns Any\n"
+            "+    w = x  # noqa: E501\n"
+            "+    # TODO(#1234): remove after migration\n"
+            '+    doc = """\n'
+            "+    # comment inside triple-quoted docstring\n"
+            '+    """\n'
+        )
+        found = scan_patch_added_comments("litellm/llms/foo/chat/transformation.py", patch)
+        self.assertEqual([item["line"] for item in found], [11, 12])
+        self.assertIn("increment counter", found[0]["text"])
+        self.assertIn("bump x", found[1]["text"])
+
+    def test_rule2_md_files_deterministically_flagged_and_block_looks_good(self):
+        files = [
+            {"filename": "NOTES.md", "status": "added", "patch": "@@ -0,0 +1 @@\n+# AI notes\n"},
+            {"filename": "docs/GUIDE.md", "status": "modified", "patch": "@@ -1 +1 @@\n+updated\n"},
+            {"filename": "OLD_AI_SLOP.md", "status": "removed", "patch": ""},
+            {"filename": "tests/unit/test_ok.py", "status": "modified", "patch": "@@ -1 +1 @@\n+assert True\n"},
+        ]
+        md_findings = scan_md_files(files)
+        self.assertEqual([item["path"] for item in md_findings], ["NOTES.md", "docs/GUIDE.md"])
+        self.assertTrue(all(item.get("suggestion") for item in md_findings))
+
+        ctx = ReviewContext(config=self.config, store=self.store, number=55001, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._green_snapshot()), \
+                mock.patch("contributor_bot.review_agent.github_get_json", return_value=files), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
+            bundle = json.loads(execute_tool(ctx, "review_bundle", {}))
+            self.assertEqual(bundle["standards_signals"]["md_files"], ["NOTES.md", "docs/GUIDE.md"])
+            # Even if the model tries to say "looks good", deterministic .md check blocks it.
+            verdict_res = json.loads(tool_submit_verdict(ctx, {"verdict": VERDICT_LOOKS_GOOD, "findings": []}))
+            ping_res = json.loads(tool_ping_maintainer(ctx, {}))
+
+        self.assertEqual(verdict_res["verdict"], VERDICT_NEEDS_WORK)
+        self.assertFalse(verdict_res["ready"])
+        self.assertIn("refusing", ping_res["error"])
+        posted = post.call_args_list[0].args[2]["content"]
+        self.assertTrue(posted.startswith("needs work\n- "))
+        self.assertIn("NOTES.md", posted)
+        self.assertNotIn("OLD_AI_SLOP.md", posted)
+
+    def test_rule2_md_files_caught_via_unified_diff_fallback(self):
+        diff = (
+            "diff --git a/SUMMARY.md b/SUMMARY.md\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/SUMMARY.md\n"
+            "@@ -0,0 +1 @@\n"
+            "+# generated summary\n"
+        )
+        entries = files_from_unified_diff(diff)
+        self.assertEqual(entries[0]["filename"], "SUMMARY.md")
+        self.assertEqual(entries[0]["status"], "added")
+        ctx = ReviewContext(config=self.config, store=self.store, number=55001, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._green_snapshot(diff=diff)), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}):
+            res = json.loads(tool_submit_verdict(ctx, {"verdict": VERDICT_LOOKS_GOOD, "findings": []}))
+        self.assertEqual(res["verdict"], VERDICT_NEEDS_WORK)
+        self.assertFalse(res["ready"])
+        self.assertTrue(any("SUMMARY.md" in reason for reason in res["reasons"]))
+
+    def test_rule3_and_rule4_and_rule5_signals_in_review_bundle(self):
+        files = [
+            {
+                "filename": "litellm/llms/acme/chat/transformation.py",
+                "status": "added",
+                "patch": "@@ -0,0 +1,4 @@\n+# custom client\n+class AcmeConfig:\n+    pass\n",
+            },
+            {
+                "filename": "litellm/llms/openai_like/providers.json",
+                "status": "modified",
+                "patch": "@@ -1 +1 @@\n+{}\n",
+            },
+            {
+                "filename": "litellm/main.py",
+                "status": "modified",
+                "patch": "@@ -100,2 +100,3 @@\n+    default_timeout = 5\n",
+            },
+        ]
+        analysis = analyze_pr_files(files)
+        self.assertEqual(analysis["new_provider_dirs"], ["acme"])
+        self.assertTrue(analysis["touches_openai_like_providers_json"])
+        self.assertEqual(analysis["shared_paths_touched"], ["litellm/main.py"])
+        self.assertTrue(analysis["missing_tests"])
+        self.assertEqual(len(analysis["added_comments"]), 1)
+        self.assertEqual(analysis["added_comments"][0]["path"], "litellm/llms/acme/chat/transformation.py")
+
+        ctx = ReviewContext(config=self.config, store=self.store, number=55001, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._green_snapshot()), \
+                mock.patch("contributor_bot.review_agent.github_get_json", return_value=files):
+            bundle = json.loads(execute_tool(ctx, "review_bundle", {}))
+        signals = bundle["standards_signals"]
+        self.assertEqual(signals["new_provider_dirs"], ["acme"])
+        self.assertEqual(signals["shared_paths_touched"], ["litellm/main.py"])
+        self.assertTrue(signals["missing_tests"])
+
+    def test_rule5_missing_tests_deterministically_blocks_looks_good(self):
+        code_only = [
+            {"filename": "litellm/utils.py", "status": "modified", "patch": "@@ -1 +1 @@\n+x = 1\n"},
+        ]
+        missing = scan_missing_tests(code_only)
+        self.assertEqual(len(missing), 1)
+        self.assertTrue(missing[0].get("suggestion"))
+        with_tests = code_only + [
+            {"filename": "tests/unit/test_utils.py", "status": "modified", "patch": "@@ -1 +1 @@\n+assert True\n"},
+        ]
+        self.assertEqual(scan_missing_tests(with_tests), [])
+
+        ctx = ReviewContext(config=self.config, store=self.store, number=55001, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._green_snapshot()), \
+                mock.patch("contributor_bot.review_agent.github_get_json", return_value=code_only), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
+            execute_tool(ctx, "review_bundle", {})
+            res = json.loads(tool_submit_verdict(ctx, {"verdict": VERDICT_LOOKS_GOOD, "findings": []}))
+        self.assertEqual(res["verdict"], VERDICT_NEEDS_WORK)
+        self.assertFalse(res["ready"])
+        self.assertIn("no tests added or updated", post.call_args_list[0].args[2]["content"])
+
+    def test_rule6_inline_imports_deterministically_flagged_with_exemptions(self):
+        patch = (
+            "@@ -1,4 +1,22 @@\n"
+            "+import os\n"
+            "+if TYPE_CHECKING:\n"
+            "+    from litellm.types.utils import ModelResponse\n"
+            "+try:\n"
+            "+    import uvloop\n"
+            "+except ImportError:\n"
+            "+    import asyncio\n"
+            "+def handle_request():\n"
+            "+    import json\n"
+            "+    from litellm.utils import get_model_info\n"
+            "+    from litellm.main import completion  # circular import\n"
+            "+    import litellm  # noqa: PLC0415\n"
+            '+    snippet = """\n'
+            "+    import fake_in_docstring\n"
+            '+    """\n'
+        )
+        found = scan_patch_inline_imports("litellm/llms/foo/chat/transformation.py", patch)
+        self.assertEqual([item["line"] for item in found], [9, 10])
+        self.assertTrue(all("inline import" in item["reason"] for item in found))
+        self.assertTrue(all(item.get("suggestion") for item in found))
+
+        # Hunk starting inside an existing TYPE_CHECKING block should stay exempt.
+        tc_hunk = (
+            "@@ -12,2 +12,3 @@ if TYPE_CHECKING:\n"
+            "     from typing import Any\n"
+            "+    from httpx import Client\n"
+        )
+        self.assertEqual(scan_patch_inline_imports("litellm/llms/foo/types.py", tc_hunk), [])
+
+        # End-to-end: green CI + tests present + LLM says looks good, still blocked by inline import!
+        files = [
+            {"filename": "litellm/llms/foo/chat/transformation.py", "status": "modified", "patch": patch},
+            {"filename": "tests/unit/llms/foo/test_transformation.py", "status": "added", "patch": "@@ -0,0 +1 @@\n+assert True\n"},
+        ]
+        ctx = ReviewContext(config=self.config, store=self.store, number=55001, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._green_snapshot()), \
+                mock.patch("contributor_bot.review_agent.github_get_json", return_value=files), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
+            bundle = json.loads(execute_tool(ctx, "review_bundle", {}))
+            self.assertEqual(len(bundle["standards_signals"]["inline_imports"]), 2)
+            res = json.loads(tool_submit_verdict(ctx, {"verdict": VERDICT_LOOKS_GOOD, "findings": []}))
+            ping = json.loads(tool_ping_maintainer(ctx, {}))
+
+        self.assertEqual(res["verdict"], VERDICT_NEEDS_WORK)
+        self.assertFalse(res["ready"])
+        self.assertIn("refusing", ping["error"])
+        posted = post.call_args_list[0].args[2]["content"]
+        self.assertIn("litellm/llms/foo/chat/transformation.py:9", posted)
+        self.assertIn("inline import", posted)
+
+    def test_deterministic_findings_deduplicate_against_agent_findings_and_respect_5_bullet_cap(self):
+        gate = assess_gate(
+            bots=BOTS,
+            head_sha=HEAD,
+            draft=False,
+            merged=False,
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            reviews=_clean_reviews(),
+            comments=[],
+            threads=[],
+            check_runs=[{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+            combined_state=None,
+        )
+        agent_findings = [
+            {
+                "path": "NOTES.md",
+                "line": None,
+                "reason": "no .md files in PRs",
+                "suggestion": "Remove AI-generated markdown file from the PR.",
+            },
+            {
+                "path": "litellm/foo.py",
+                "line": 14,
+                "reason": "inline import inside function",
+                "suggestion": "Move the import to module top level.",
+            },
+        ]
+        det_findings = [
+            {
+                "path": "NOTES.md",
+                "line": None,
+                "reason": "no .md files in PRs",
+                "suggestion": "Remove this markdown file from the PR.",
+                "rule": "no_md_files",
+            },
+            {
+                "path": "litellm/foo.py",
+                "line": 14,
+                "reason": "inline import inside function",
+                "suggestion": "Move this import to module top level, or mark it with # circular import if it breaks a cycle.",
+                "rule": "no_inline_imports",
+            },
+            {
+                "path": "litellm/foo.py",
+                "line": None,
+                "reason": "no tests added or updated",
+                "suggestion": "Add unit tests under tests/unit/ (and e2e coverage where applicable) for this change.",
+                "rule": "missing_tests",
+            },
+        ]
+        verdict, ready, bullets = resolve_verdict(
+            gate,
+            requested_verdict=VERDICT_NEEDS_WORK,
+            findings=agent_findings,
+            deterministic_findings=det_findings,
+        )
+        self.assertEqual(verdict, VERDICT_NEEDS_WORK)
+        self.assertFalse(ready)
+        # NOTES.md and litellm/foo.py:14 are deduplicated; missing_tests is appended -> 3 bullets total.
+        self.assertEqual(len(bullets), 3)
+        self.assertLessEqual(len(bullets), MAX_REVIEW_BULLETS)
+        self.assertTrue(any("no tests added or updated" in b for b in bullets))
+
+
+class RootCauseAnalysisTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = Store(str(Path(self.directory.name) / "roles.db"))
+        self.addCleanup(self.store.close)
+        self.config = replace(
+            Config("token", "123", "456", github_token="gh"),
+            pr_review_enabled=True,
+            review_channel_ids=("321",),
+            review_model="anthropic/claude-sonnet-4-5",
+            review_bot_logins=BOTS,
+            review_maintainer_role_id="555",
+            review_cooldown_seconds=600,
+            discord_guild_id="333",
+            discord_application_id="444",
+        )
+
+    def test_extract_linked_issue_numbers_and_get_issue_tool(self):
+        text = (
+            "Fixes #49102 and closes https://github.com/BerriAI/litellm/issues/49103. "
+            "Related to #49102 and PR #55110; ignores #1 and foo#99999."
+        )
+        nums = extract_linked_issue_numbers(text, "BerriAI/litellm", exclude_number=55110)
+        self.assertEqual(nums, [49103, 49102])
+
+        calls: list[str] = []
+
+        def fake_get(url, token, pace=False):
+            calls.append(url)
+            if url.endswith("/issues/49102"):
+                return {
+                    "number": 49102,
+                    "title": "Gemini tool calls crash with KeyError",
+                    "state": "open",
+                    "labels": [{"name": "bug"}],
+                    "body": "Traceback in litellm/llms/gemini/chat/transformation.py token=ghp_" + ("A" * 24),
+                }
+            if url.endswith("/issues/49102/comments?per_page=8"):
+                return [{"user": {"login": "reporter"}, "body": "Happens when functionCall omits args"}]
+            raise AssertionError(url)
+
+        ctx = ReviewContext(config=self.config, store=self.store, number=55110, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.github_get_json", side_effect=fake_get):
+            first = json.loads(execute_tool(ctx, "get_issue", {"number": 49102}))
+            second = json.loads(execute_tool(ctx, "get_issue", {"number": 49102}))
+            bad = json.loads(execute_tool(ctx, "get_issue", {"number": -5}))
+
+        self.assertEqual(first["number"], 49102)
+        self.assertEqual(first["labels"], ["bug"])
+        self.assertIn("[redacted]", first["body"])
+        self.assertEqual(first["comments"][0]["author"], "reporter")
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("error", bad)
+
+    def test_patch_around_fixture_puts_root_cause_bullet_first_with_real_fix_location(self):
+        patch_around_files = [
+            {
+                "filename": "litellm/main.py",
+                "status": "modified",
+                "additions": 6,
+                "deletions": 0,
+                "patch": (
+                    "@@ -410,2 +410,8 @@ def completion(model, messages, **kwargs):\n"
+                    "+    if custom_llm_provider == 'gemini':\n"
+                    "+        try:\n"
+                    "+            return _run_completion(model, messages, **kwargs)\n"
+                    "+        except KeyError:\n"
+                    "+            return ModelResponse()\n"
+                ),
+            },
+            {
+                "filename": "NOTES.md",
+                "status": "added",
+                "additions": 3,
+                "deletions": 0,
+                "patch": "@@ -0,0 +1,3 @@\n+# workaround notes\n",
+            },
+        ]
+        gemini_source = (
+            "class GoogleAIStudioGeminiConfig:\n"
+            "    def transform_response(self, raw_response):\n"
+            "        part = raw_response['candidates'][0]['content']['parts'][0]\n"
+            "        args = part['functionCall']['args']\n"
+            "        return args\n"
+        )
+        encoded_gemini = base64.b64encode(gemini_source.encode("utf-8")).decode("ascii")
+        snapshot = Snapshot(
+            number=55110,
+            title="Fix Gemini KeyError on empty tool call args",
+            head_sha=HEAD,
+            base_sha=BASE,
+            draft=False,
+            merged=False,
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            author_login="contrib",
+            author_id=7,
+            reviews=_clean_reviews(),
+            comments=[],
+            threads=[],
+            check_runs=[{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+            combined_state=None,
+            body="Fixes #49102. Catches KeyError in litellm/main.py for Gemini.",
+        )
+
+        def fake_get(url, token, pace=False):
+            if url.endswith("/pulls/55110/files?per_page=100"):
+                return patch_around_files
+            if url.endswith("/issues/49102"):
+                return {
+                    "number": 49102,
+                    "title": "Gemini tool calls crash with KeyError when args omitted",
+                    "state": "open",
+                    "labels": [{"name": "bug"}],
+                    "body": "KeyError: 'args' in litellm/llms/gemini/chat/transformation.py transform_response",
+                }
+            if url.endswith("/issues/49102/comments?per_page=8"):
+                return []
+            if "/contents/litellm/llms/gemini/chat/transformation.py" in url:
+                return {"encoding": "base64", "content": encoded_gemini}
+            raise AssertionError(url)
+
+        captured: dict = {}
+
+        def on_run(ctx: ReviewContext) -> None:
+            bundle = json.loads(execute_tool(ctx, "review_bundle", {}))
+            captured["linked_issues"] = bundle["linked_issues"]
+            issue = json.loads(execute_tool(ctx, "get_issue", {"number": bundle["linked_issues"][0]}))
+            diff = json.loads(execute_tool(ctx, "read_file_diff", {"path": "litellm/main.py"}))
+            upstream = json.loads(execute_tool(ctx, "read_file", {
+                "path": "litellm/llms/gemini/chat/transformation.py",
+                "ref": "base",
+            }))
+            captured["read_outside_diff"] = "transform_response" in upstream["text"]
+
+            findings: list[dict] = []
+            # Deliberately submit a style finding BEFORE the root_cause finding to verify hoisting to bullet #1.
+            findings.append({
+                "path": "litellm/main.py",
+                "line": 412,
+                "reason": "broad except KeyError returns an empty ModelResponse and hides real failures",
+                "suggestion": "Remove the try/except wrapper from litellm/main.py so unexpected errors surface cleanly.",
+            })
+            if (
+                "custom_llm_provider == 'gemini'" in diff["patch"]
+                and "transform_response" in issue["body"]
+                and "part['functionCall']['args']" in upstream["text"]
+            ):
+                findings.append({
+                    "path": "litellm/main.py",
+                    "line": 410,
+                    "root_cause": True,
+                    "reason": "patches around the root cause with a gemini branch in litellm/main.py",
+                    "suggestion": (
+                        "Remove the Gemini branch from litellm/main.py and default missing functionCall args "
+                        "with .get('args', {}) in litellm/llms/gemini/chat/transformation.py:"
+                        "GoogleAIStudioGeminiConfig.transform_response."
+                    ),
+                })
+            tool_submit_verdict(ctx, {
+                "verdict": VERDICT_BELOW_STANDARDS,
+                "findings": findings,
+            })
+            captured["ctx"] = ctx
+
+        sdk, calls = _fake_sdk(on_run)
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=snapshot), \
+                mock.patch("contributor_bot.review_agent.github_get_json", side_effect=fake_get), \
+                mock.patch("contributor_bot.review_agent._load_sdk", return_value=sdk), \
+                mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]), \
+                mock.patch("contributor_bot.review_job.start_public_thread", return_value={"id": "900"}), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post, \
+                mock.patch("contributor_bot.api.post_issue_comment", side_effect=AssertionError("github write")):
+            result = perform_review(self.config, self.store, 55110, channel_id="321", message_id="654", source="new")
+
+        self.assertEqual(result["status"], "posted")
+        self.assertEqual(captured["linked_issues"], [49102])
+        self.assertTrue(captured["read_outside_diff"])
+        self.assertIn("Root-Cause Analysis", calls["instructions"])
+        self.assertEqual(captured["ctx"].verdict, VERDICT_BELOW_STANDARDS)
+        self.assertFalse(captured["ctx"].verdict_ready)
+
+        posted = post.call_args_list[0].args[2]["content"]
+        lines = posted.splitlines()
+        self.assertEqual(lines[0], VERDICT_BELOW_STANDARDS)
+        bullets = lines[1:]
+        self.assertLessEqual(len(bullets), MAX_REVIEW_BULLETS)
+        # Root-cause patch-around finding MUST be the top bullet (bullets[0]).
+        self.assertIn("patches around the root cause", bullets[0])
+        self.assertIn("litellm/llms/gemini/chat/transformation.py", bullets[0])
+        self.assertIn("transform_response", bullets[0])
+        # Deterministic checks (.md file + missing tests) still appear after it within the 5-bullet cap.
+        self.assertIn("NOTES.md", posted)
+        self.assertIn("no tests added or updated", posted)
+        self.assertIsNone(_EMOJI_RE.search(posted))
+        self.assertNotIn("<@&555>", "\n".join(call.args[2]["content"] for call in post.call_args_list))
 
 
 if __name__ == "__main__":

@@ -147,6 +147,8 @@ class NetworkBoundaryTests(unittest.TestCase):
         sha = "a" * 40
         urls = [
             "https://api.github.com/repos/BerriAI/litellm/pulls/12/comments?per_page=100",
+            "https://api.github.com/repos/BerriAI/litellm/issues/49102",
+            "https://api.github.com/repos/BerriAI/litellm/issues/49102/comments?per_page=8",
             f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/check-runs?per_page=100",
             f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/status",
             "https://api.github.com/repos/BerriAI/litellm/contents/litellm/proxy/server.py?ref=" + sha,
@@ -184,6 +186,11 @@ class NetworkBoundaryTests(unittest.TestCase):
                 api._http(Request(
                     "https://api.github.com/repos/BerriAI/litellm/contents/../secrets",
                     method="GET",
+                ))
+            with self.assertRaises(ValueError):
+                api._http(Request(
+                    "https://api.github.com/repos/BerriAI/litellm/issues/49102",
+                    method="PATCH",
                 ))
             blocked.assert_not_called()
 
