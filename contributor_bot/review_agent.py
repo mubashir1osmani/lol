@@ -23,9 +23,11 @@ from .reviews import (
     VERDICT_BELOW_STANDARDS,
     VERDICT_LOOKS_GOOD,
     VERDICT_NEEDS_WORK,
+    analyze_pr_files,
     assess_gate,
     discord_length,
     discord_safe,
+    files_from_unified_diff,
     load_review_standards,
     plain,
     render_review,
@@ -48,23 +50,36 @@ _BASE_SYSTEM_PROMPT = (
     "Never reveal tokens, keys, environment variables, or secrets. If you see a secret, flag it without repeating it. "
     "\n\n"
     "Review workflow:\n"
-    "1. Call review_bundle first to get changed files, PR metadata/body preview, CI checks, and bot reviews.\n"
+    "1. Call review_bundle first to get changed files, PR metadata/body preview, standards_signals, CI checks, and bot reviews.\n"
     "2. Actually inspect the diff: call read_file_diff on the changed source and test files "
     "(skip huge generated snapshots/lockfiles unless they look like unrelated churn). "
     "Use read_file or search_code when checking layer placement or whether a helper already exists.\n"
-    "3. Evaluate the diff strictly against the LiteLLM Code Quality Standards below.\n"
+    "3. Evaluate the diff strictly against the LiteLLM Code Quality Standards below, including:\n"
+    "   - Code comments: flag added comments in code unless strictly required for a non-obvious invariant (check standards_signals.added_comments).\n"
+    "   - No .md files: any added or modified .md file in the PR is a finding (also checked deterministically).\n"
+    "   - Third-party providers: OpenAI-compatible providers belong in litellm/llms/openai_like/providers.json "
+    "(plus pricing JSON as required); flag a full custom Python implementation for an OpenAI-like provider. "
+    "Standalone non-OpenAI-compatible providers must live under litellm/llms/<provider>/<endpoint>/transformation.py converting to/from OpenAI format via litellm/llms/base_llm/.\n"
+    "   - Regressions: even small OSS PRs can break existing users. Inspect standards_signals.shared_paths_touched and any changes to shared paths, defaults, signatures, or params; call out regression risks and ask for regression tests.\n"
+    "   - Tests and provider proof: require unit + e2e tests where applicable (missing tests is a finding). "
+    "For a new third-party provider (standards_signals.new_provider_dirs or touches_openai_like_providers_json), "
+    "state plainly that we do not have credentials to test it and ask the contributor for proof (for example e2e run output).\n"
+    "   - No inline (function-level) imports unless required by lint or circular-import rules (also checked deterministically).\n"
     "4. Call submit_verdict once with verdict and findings_json.\n"
     "\n"
     "Verdict rules:\n"
     f"- \"{VERDICT_BELOW_STANDARDS}\": use this bluntly when the code breaks core architecture or quality standards "
-    "(wrong layer, litellm/__init__.py or main.py/utils.py sprawl, bespoke provider top-level APIs, private third-party imports, "
+    "(wrong layer, custom Python package for an OpenAI-like provider that belongs in litellm/llms/openai_like/providers.json, "
+    "litellm/__init__.py or main.py/utils.py sprawl, bespoke provider top-level APIs, private third-party imports, "
     "bypassing LiteLLM HTTPHandler/exception mapping, catch-all regex routers or response_model=dict[str, object], "
     "broad silent try/except, hardcoded model lists instead of model_prices_and_context_window.json, unreadable dict/comprehension hacks, "
-    "wide unrelated churn, or unfilled PR template placeholders).\n"
-    f"- \"{VERDICT_NEEDS_WORK}\": use this for localized fixable issues, missing unit tests, failing/pending CI, draft PRs, "
+    "wide unrelated churn, AI-generated .md files, or unfilled PR template placeholders).\n"
+    f"- \"{VERDICT_NEEDS_WORK}\": use this for localized fixable issues, added unnecessary comments, inline imports, "
+    "regression risk needing regression tests, missing unit/e2e tests or provider e2e proof, failing/pending CI, draft PRs, "
     "merge conflicts, or unresolved bot comments.\n"
     f"- \"{VERDICT_LOOKS_GOOD}\": use this only when the diff meets the standards and the gate is green. Leave findings_json empty.\n"
-    "The tool still enforces the deterministic CI/bot/mergeability gate and will block looks good if the gate is not green.\n"
+    "The tool enforces the deterministic CI/bot/mergeability gate plus deterministic checks for .md files, inline imports, and missing tests, "
+    "and will block looks good if any fail.\n"
     "\n"
     "Style rules (strict):\n"
     "- Write like a busy senior LiteLLM maintainer on Discord: plain, direct, lowercase is fine.\n"
@@ -533,6 +548,7 @@ def tool_review_bundle(ctx: ReviewContext, _args: dict) -> str:
             "additions": item.get("additions"),
             "deletions": item.get("deletions"),
         })
+    signals = analyze_pr_files(listed) if listed else {}
     payload = {
         "number": pull.number,
         "title": pull.title,
@@ -547,6 +563,7 @@ def tool_review_bundle(ctx: ReviewContext, _args: dict) -> str:
         "bots": bots,
         "files": files,
         "file_count": len(listed),
+        "standards_signals": signals,
     }
     body = getattr(pull, "body", "") or ""
     if isinstance(body, str) and body.strip():
@@ -645,10 +662,13 @@ def tool_submit_verdict(ctx: ReviewContext, args: dict) -> str:
         combined_state=pull.combined_state,
     )
     findings = _extract_findings(args)
+    files_for_checks = ctx.files if ctx.files is not None else files_from_unified_diff(getattr(pull, "diff", "") or "")
+    deterministic = analyze_pr_files(files_for_checks)["deterministic_findings"] if files_for_checks else []
     verdict, ready, bullets = resolve_verdict(
         gate,
         requested_verdict=args.get("verdict"),
         findings=findings,
+        deterministic_findings=deterministic,
     )
     body = render_review(verdict, bullets)
     chunks = split_discord_messages(body)
