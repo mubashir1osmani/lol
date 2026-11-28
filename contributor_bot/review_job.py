@@ -6,14 +6,16 @@ repeat work.
 """
 
 import logging
+import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .ack import acknowledge_message
 from .routing import decide, explicit_review
 from .triggers import apply_triggers
 from .api import (
+    TransientAPIError,
     edit_original_interaction,
     fetch_latest_message_id,
     fetch_channel_messages,
@@ -31,19 +33,54 @@ from .reviews import (
     should_review_message,
     wants_recheck,
 )
-from .schedule import UTC, iso
+from .schedule import UTC, iso, parse_time
 from .store import Store
+
+_DISCORD_EPOCH_MS = 1420070400000
+_RECOVERY_LOOKBACK_HOURS = 24
+_RECOVERY_MAX_ATTEMPTS = 3
+_HASH_PR_RE = re.compile(r"(?<![A-Za-z0-9])#([1-9][0-9]{0,7})\b")
 
 _inflight: set[tuple[str, int]] = set()
 _inflight_guard = threading.Lock()
+_message_locks: dict[tuple[str, str], threading.Lock] = {}
+_message_locks_guard = threading.Lock()
 
 
 class ReviewError(RuntimeError):
     """A failure safe to show in Discord. The message is written by this bot."""
 
 
+def _message_lock(channel_id: str, message_id: str) -> threading.Lock:
+    key = (str(channel_id), str(message_id))
+    with _message_locks_guard:
+        if len(_message_locks) > 1000:
+            _message_locks.clear()
+        lock = _message_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _message_locks[key] = lock
+        return lock
+
+
 def _spawn(target) -> None:
-    threading.Thread(target=target, name="pr-review", daemon=True).start()
+    def _runner() -> None:
+        try:
+            target()
+        except Exception:
+            logging.exception("Review worker failed")
+
+    threading.Thread(target=_runner, name="pr-review", daemon=True).start()
+
+
+def _spawn_review(number: int, fn) -> None:
+    def _task() -> None:
+        try:
+            fn()
+        except Exception:
+            logging.exception("PR review worker crashed for #%s", number)
+
+    _spawn(_task)
 
 
 def _try_lock(repository: str, number: int) -> bool:
@@ -77,28 +114,65 @@ def _ensure_thread(config: Config, store: Store, number: int, channel_id: str, m
         return record["thread_id"]
     if not is_discord_id(channel_id) or not is_discord_id(message_id):
         raise ReviewError("couldn't tell which message to thread.")
+    with _message_lock(channel_id, message_id):
+        record = store.review_thread(repository, number)
+        if record:
+            return record["thread_id"]
+        existing_on_message = store.review_thread_by_message(channel_id, message_id)
+        if existing_on_message:
+            thread_id = existing_on_message["thread_id"]
+        else:
+            try:
+                thread = start_public_thread(channel_id, message_id, config.discord_token, f"pr {number} review")
+            except RuntimeError as error:
+                if "HTTP 403" in str(error):
+                    logging.error(
+                        "Could not open a review thread in channel %s: %s. "
+                        "The bot needs Create Public Threads and Send Messages in Threads.",
+                        channel_id, error,
+                    )
+                    raise ReviewError(
+                        "couldn't open a thread. the bot needs create public threads and send messages in threads."
+                    ) from error
+                logging.error("Could not open a review thread for #%s: %s", number, error)
+                raise ReviewError("couldn't open a thread on that message.") from error
+            thread_id = thread["id"]
+        now = iso(datetime.now(UTC))
+        store.save_review_thread(
+            repository=repository,
+            number=number,
+            channel_id=channel_id,
+            message_id=message_id,
+            thread_id=thread_id,
+            created_at=now,
+        )
+        return thread_id
+
+
+def _record_request_outcome(
+    store: Store,
+    repository: str,
+    number: int,
+    message_id: str | None,
+    *,
+    status: str,
+    error: str = "",
+    increment_attempts: bool = False,
+) -> None:
+    if not message_id or not is_discord_id(message_id):
+        return
     try:
-        thread = start_public_thread(channel_id, message_id, config.discord_token, f"pr {number} review")
-    except RuntimeError as error:
-        if "HTTP 403" in str(error):
-            logging.error(
-                "Could not open a review thread in channel %s: %s. "
-                "The bot needs Create Public Threads and Send Messages in Threads.",
-                channel_id, error,
-            )
-            raise ReviewError("couldn't open a thread. the bot needs create public threads and send messages in threads.") from error
-        logging.error("Could not open a review thread for #%s: %s", number, error)
-        raise ReviewError("couldn't open a thread on that message.") from error
-    now = iso(datetime.now(UTC))
-    store.save_review_thread(
-        repository=repository,
-        number=number,
-        channel_id=channel_id,
-        message_id=message_id,
-        thread_id=thread["id"],
-        created_at=now,
-    )
-    return thread["id"]
+        store.mark_review_request(
+            repository,
+            number,
+            message_id,
+            status,
+            error=error,
+            updated_at=iso(datetime.now(UTC)),
+            increment_attempts=increment_attempts,
+        )
+    except Exception:
+        logging.warning("Could not update review_requests status for #%s (msg %s)", number, message_id)
 
 
 def perform_review(
@@ -118,6 +192,12 @@ def perform_review(
         return _perform_review(
             config, store, number, channel_id=channel_id, message_id=message_id, source=source,
         )
+    except Exception as error:
+        logging.exception("Unexpected error during PR review for #%s (%s)", number, source)
+        _record_request_outcome(
+            store, repository, number, message_id, status="failed", error=str(error), increment_attempts=True,
+        )
+        return {"status": "error", "thread_id": None, "detail": "the reviewer hit an error. try /recheck in a bit."}
     finally:
         _unlock(repository, number)
 
@@ -125,6 +205,7 @@ def perform_review(
 def _perform_review(config, store, number, *, channel_id, message_id, source) -> dict:
     repository = config.github_repository
     record = store.review_thread(repository, number)
+    request_message_id = message_id if is_discord_id(message_id) else (record["message_id"] if record else None)
     remaining = cooldown_remaining(record, config.review_cooldown_seconds, datetime.now(UTC))
     if remaining:
         minutes = max(1, (remaining + 59) // 60)
@@ -132,6 +213,8 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         if record:
             detail = f"checked recently. see <#{record['thread_id']}>. try again in {minutes}m."
         logging.info("PR review for #%s skipped (%s); cooldown %ss", number, source, remaining)
+        if record and record.get("last_reviewed_at"):
+            _record_request_outcome(store, repository, number, request_message_id, status="done")
         if source == "recheck" and record:
             try:
                 _post(record["thread_id"], config.discord_token, detail)
@@ -141,6 +224,9 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
     day = datetime.now(UTC).date().isoformat()
     if not store.claim_daily_run(day, config.review_daily_run_budget):
         detail = "ran out of budget for today. try again tomorrow."
+        _record_request_outcome(
+            store, repository, number, request_message_id, status="failed", error=detail, increment_attempts=True,
+        )
         if record:
             try:
                 _post(record["thread_id"], config.discord_token, detail)
@@ -153,6 +239,9 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
     try:
         thread_id = _ensure_thread(config, store, number, thread_channel or "", thread_message or "")
     except ReviewError as error:
+        _record_request_outcome(
+            store, repository, number, request_message_id, status="failed", error=str(error), increment_attempts=True,
+        )
         return {"status": "error", "thread_id": None, "detail": str(error)}
     try:
         history = ""
@@ -163,10 +252,14 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         if source != "watch" and (config.github_actor_token or config.review_dry_run):
             apply_triggers(config, store, number, lambda text: _post(thread_id, config.discord_token, text))
         result = run_review_session(config, store, number, thread_id, mode="review", history=history)
-    except Exception:
+    except Exception as error:
         logging.exception("Review agent failed for #%s", number)
+        _record_request_outcome(
+            store, repository, number, request_message_id, status="failed", error=str(error), increment_attempts=True,
+        )
         return {"status": "error", "thread_id": thread_id, "detail": "the reviewer hit an error. try /recheck in a bit."}
     store.mark_review_done(repository, number, iso(datetime.now(UTC)), result.head_sha or "")
+    _record_request_outcome(store, repository, number, request_message_id, status="done", increment_attempts=True)
     if result.verdict_posted:
         logging.info(
             "Posted a %s review for #%s in thread %s",
@@ -226,14 +319,14 @@ def _review_command(config: Config, store: Store, payload: dict) -> dict:
         if remaining:
             minutes = max(1, (remaining + 59) // 60)
             return _ephemeral(f"checked recently. see <#{record['thread_id']}>. try again in {minutes}m.")
-        _spawn(lambda: perform_review(config, store, number, source="recheck"))
+        _spawn_review(number, lambda: perform_review(config, store, number, source="recheck"))
         extra = ""
         if len(numbers) > 1:
             extra = " i only take one url per command."
         return _ephemeral(f"updating the review in <#{record['thread_id']}>.{extra}")
     token = payload.get("token") if isinstance(payload.get("token"), str) else ""
     application_id = str(payload.get("application_id") or "")
-    _spawn(lambda: _finish_new_command(config, store, number, channel_id, application_id, token))
+    _spawn_review(number, lambda: _finish_new_command(config, store, number, channel_id, application_id, token))
     return _defer(ephemeral=False)
 
 
@@ -350,7 +443,7 @@ def _recheck_command(config: Config, store: Store, payload: dict) -> dict:
     application_id = str(payload.get("application_id") or "")
     # Defer first (type 5). The agent run follows up by editing this response,
     # so Discord gets an ack inside 3 seconds and the user sees the outcome.
-    _spawn(lambda: _finish_recheck(config, store, number, application_id, token))
+    _spawn_review(number, lambda: _finish_recheck(config, store, number, application_id, token))
     return _defer(ephemeral=True)
 
 
@@ -409,7 +502,7 @@ def schedule_webhook_recheck(config: Config, store: Store, event: str, payload: 
     record = store.review_thread(config.github_repository, number)
     if not record:
         return
-    _spawn(lambda: perform_review(config, store, number, source="webhook"))
+    _spawn_review(number, lambda: perform_review(config, store, number, source="webhook"))
 
 
 def _classify_complete(config: Config, system: str, text: str) -> str:
@@ -436,6 +529,19 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
     return True, should_review_message(message, config.github_repository, require_ask=False)
 
 
+def _mentioned_numbers_in_thread(text: str, repository: str, records: list[dict]) -> list[dict]:
+    known = {int(rec["number"]): rec for rec in records}
+    mentioned: list[int] = []
+    for num in should_review_message({"content": text, "author": {"bot": False}}, repository, require_ask=False):
+        if num in known and num not in mentioned:
+            mentioned.append(num)
+    for match in _HASH_PR_RE.finditer(text or ""):
+        num = int(match.group(1))
+        if num in known and num not in mentioned:
+            mentioned.append(num)
+    return [known[num] for num in mentioned]
+
+
 def handle_thread_message(config: Config, store: Store, message: dict) -> None:
     """Answer a follow-up inside a review thread, or re-review when they say they fixed it."""
     if not config.pr_review_enabled:
@@ -444,16 +550,27 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
     if author.get("bot") or message.get("webhook_id"):
         return
     channel_id = str(message.get("channel_id") or "")
-    record = store.review_thread_by_discord(channel_id) if is_discord_id(channel_id) else None
-    if not record or record["repository"].lower() != config.github_repository.lower():
+    records = [
+        rec for rec in (store.review_threads_by_discord(channel_id) if is_discord_id(channel_id) else [])
+        if rec["repository"].lower() == config.github_repository.lower()
+    ]
+    if not records:
         return
-    number = int(record["number"])
     text = message.get("content") or ""
     message_id = message.get("id")
+    matched = _mentioned_numbers_in_thread(text, config.github_repository, records) if len(records) > 1 else []
     if wants_recheck(text):
         _ack(config, channel_id, message_id, message)
-        perform_review(config, store, number, source="recheck")
+        targets = matched or records
+        if len(targets) == 1:
+            perform_review(config, store, int(targets[0]["number"]), source="recheck")
+        else:
+            for rec in targets:
+                num = int(rec["number"])
+                _spawn_review(num, lambda num=num: perform_review(config, store, num, source="recheck"))
         return
+    record = matched[0] if matched else records[0]
+    number = int(record["number"])
     remaining = cooldown_remaining(
         {"last_reviewed_at": record.get("last_followup_at")},
         config.review_followup_cooldown_seconds,
@@ -481,12 +598,17 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
 
 
 def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
+    message_id = str(message.get("id") or "")
+    if channel_id in config.review_channel_ids and is_discord_id(message_id):
+        try:
+            store.advance_review_cursor(channel_id, message_id)
+        except Exception:
+            logging.warning("Could not advance review cursor for channel %s", channel_id)
     text = message.get("content") or ""
     if not explicit_review(text, config.github_repository):
         _answer_if_decided(config, channel_id, message)
         return
     asked, numbers = message_decision(config, message)
-    message_id = str(message.get("id") or "")
     if asked and not numbers:
         _ack(config, channel_id, message_id, message)
         _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
@@ -502,14 +624,37 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
         planned.append((number, record))
     if not planned:
         return
+    now_iso = iso(datetime.now(UTC))
+    if is_discord_id(channel_id) and is_discord_id(message_id):
+        for number, record in planned:
+            try:
+                store.upsert_review_request(
+                    repository=config.github_repository,
+                    number=number,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    status="pending",
+                    source="recheck" if record else "new",
+                    now_iso=now_iso,
+                )
+            except Exception:
+                logging.warning("Could not persist review request for #%s (msg %s)", number, message_id)
     _ack(config, channel_id, message_id, message)
     for number, record in planned:
         if record:
-            _spawn(lambda number=number: perform_review(config, store, number, source="recheck"))
+            _spawn_review(
+                number,
+                lambda number=number, message_id=message_id: perform_review(
+                    config, store, number, message_id=message_id or None, source="recheck",
+                ),
+            )
             continue
-        _spawn(lambda number=number, message_id=message_id: perform_review(
-            config, store, number, channel_id=channel_id, message_id=message_id, source="new",
-        ))
+        _spawn_review(
+            number,
+            lambda number=number, message_id=message_id: perform_review(
+                config, store, number, channel_id=channel_id, message_id=message_id, source="new",
+            ),
+        )
 
 
 def _answer_if_decided(config: Config, channel_id: str, message: dict) -> None:
@@ -544,6 +689,209 @@ def _routed_complete(config, tier, *, session_id):
     return complete
 
 
+def _message_created_at(message: dict) -> datetime | None:
+    raw_ts = message.get("timestamp")
+    if isinstance(raw_ts, str) and raw_ts.strip():
+        try:
+            return parse_time(raw_ts)
+        except ValueError:
+            pass
+    mid = str(message.get("id") or "")
+    if is_discord_id(mid):
+        ts_ms = (int(mid) >> 22) + _DISCORD_EPOCH_MS
+        return datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
+    return None
+
+
+_NON_REVIEW_BOT_PREFIXES = (
+    "checked recently.",
+    "ran out of budget",
+    "already checking",
+    "couldn't ",
+    "the reviewer hit an error",
+)
+
+
+def _thread_already_has_bot_review(
+    config: Config,
+    thread_id: str,
+    number: int,
+    *,
+    multi_pr: bool,
+    cache: dict[str, list[dict]],
+) -> bool:
+    """Check Discord thread history so boot recovery never duplicates a review after a DB reset."""
+    if not is_discord_id(thread_id):
+        return False
+    messages = cache.get(thread_id)
+    if messages is None:
+        try:
+            messages = fetch_recent_messages(thread_id, config.discord_token, limit=20)
+        except Exception:
+            messages = []
+        cache[thread_id] = messages
+    pr_tag = f"#{number}"
+    pr_path = f"/pull/{number}"
+    for msg in messages:
+        author = msg.get("author") or {}
+        if not author.get("bot"):
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        lowered = content.lower()
+        if any(lowered.startswith(prefix) for prefix in _NON_REVIEW_BOT_PREFIXES):
+            continue
+        if not multi_pr:
+            return True
+        if pr_tag in content or pr_path in lowered:
+            return True
+    return False
+
+
+def recover_pending_reviews(
+    config: Config,
+    store: Store,
+    *,
+    now: datetime | None = None,
+    lookback_hours: int = _RECOVERY_LOOKBACK_HOURS,
+    max_attempts: int = _RECOVERY_MAX_ATTEMPTS,
+    scan_channels: bool = True,
+) -> list[int]:
+    """Retry pending/failed review requests from roughly the last 24h without duplicating completed reviews.
+
+    Also recovers interrupted pre-migration review threads (``last_reviewed_at IS NULL``)
+    and unreviewed PR review requests posted in watched channels within the lookback window.
+    """
+    if not config.pr_review_enabled:
+        return []
+    moment = now or datetime.now(UTC)
+    cutoff = moment - timedelta(hours=max(1, int(lookback_hours)))
+    cutoff_iso = iso(cutoff)
+    now_iso = iso(moment)
+    repo = config.github_repository
+
+    # 1. Any review_threads created in the last 24h that never finished (e.g. mid-review restart).
+    for row in store.incomplete_review_threads(repo, since_iso=cutoff_iso):
+        if is_discord_id(row.get("channel_id")) and is_discord_id(row.get("message_id")):
+            try:
+                store.upsert_review_request(
+                    repository=repo,
+                    number=int(row["number"]),
+                    channel_id=str(row["channel_id"]),
+                    message_id=str(row["message_id"]),
+                    status="pending",
+                    source="recovery",
+                    now_iso=now_iso,
+                )
+            except Exception:
+                logging.warning("Could not enqueue incomplete review thread #%s", row.get("number"))
+
+    # 2. Recent channel messages in the last 24h that were never reviewed (e.g. crashed before DB save).
+    if scan_channels and config.discord_token:
+        thread_msg_cache: dict[str, list[dict]] = {}
+        for channel_id in config.review_channel_ids:
+            try:
+                recent = fetch_recent_messages(channel_id, config.discord_token, limit=50)
+            except (TransientAPIError, RuntimeError) as error:
+                logging.warning(
+                    "Could not scan recent review messages in channel %s on boot: %s",
+                    channel_id, error,
+                )
+                continue
+            recent.sort(key=lambda item: int(item["id"]) if is_discord_id(item.get("id")) else 0)
+            for message in recent:
+                author = message.get("author") or {}
+                if author.get("bot") or message.get("webhook_id"):
+                    continue
+                msg_id = str(message.get("id") or "")
+                if not is_discord_id(msg_id):
+                    continue
+                created_at = _message_created_at(message)
+                if created_at is not None and created_at < cutoff:
+                    continue
+                text = message.get("content") or ""
+                if not explicit_review(text, repo):
+                    continue
+                candidate_numbers = should_review_message(message, repo, require_ask=False)
+                if not candidate_numbers:
+                    continue
+                msg_thread = message.get("thread") or {}
+                msg_thread_id = str(msg_thread.get("id") or "")
+                multi_pr = len(candidate_numbers) > 1
+                unreviewed: list[int] = []
+                for number in candidate_numbers:
+                    existing_thread = store.review_thread(repo, number)
+                    if existing_thread and existing_thread.get("last_reviewed_at"):
+                        continue
+                    existing_req = store.get_review_request(repo, number, msg_id)
+                    if existing_req and existing_req.get("status") == "done":
+                        continue
+                    if (
+                        not existing_thread
+                        and is_discord_id(msg_thread_id)
+                        and _thread_already_has_bot_review(
+                            config, msg_thread_id, number, multi_pr=multi_pr, cache=thread_msg_cache,
+                        )
+                    ):
+                        continue
+                    unreviewed.append(number)
+                if not unreviewed:
+                    continue
+                try:
+                    asked, _ = message_decision(config, message)
+                except Exception:
+                    logging.warning("Boot recovery classification failed for msg %s", msg_id)
+                    asked = False
+                if not asked:
+                    continue
+                for number in unreviewed:
+                    try:
+                        store.upsert_review_request(
+                            repository=repo,
+                            number=number,
+                            channel_id=channel_id,
+                            message_id=msg_id,
+                            status="pending",
+                            source="recovery",
+                            now_iso=now_iso,
+                        )
+                    except Exception:
+                        logging.warning("Could not enqueue recovered review #%s (msg %s)", number, msg_id)
+
+    # 3. Replay all pending/failed requests from the last 24h without duplicating finished reviews.
+    pending = store.pending_review_requests(repo, since_iso=cutoff_iso, max_attempts=max_attempts)
+    queued: list[int] = []
+    seen_numbers: set[int] = set()
+    for req in pending:
+        number = int(req["number"])
+        msg_id = str(req["message_id"])
+        ch_id = str(req["channel_id"])
+        existing_thread = store.review_thread(repo, number)
+        if existing_thread and existing_thread.get("last_reviewed_at"):
+            if req.get("source") in {"new", "recovery"} or existing_thread["last_reviewed_at"] >= req["created_at"]:
+                _record_request_outcome(store, repo, number, msg_id, status="done")
+                continue
+        if number in seen_numbers:
+            continue
+        seen_numbers.add(number)
+        queued.append(number)
+        _spawn_review(
+            number,
+            lambda number=number, ch_id=ch_id, msg_id=msg_id: perform_review(
+                config, store, number, channel_id=ch_id, message_id=msg_id, source="recovery",
+            ),
+        )
+    if queued:
+        logging.info(
+            "Recovered %d pending/failed PR review request(s) from the last %dh: %s",
+            len(queued),
+            lookback_hours,
+            ", ".join(f"#{n}" for n in queued),
+        )
+    return queued
+
+
 def poll_review_channels(config: Config, store: Store) -> None:
     """Read new messages in the review channels. The first poll does not backfill."""
     if not config.pr_review_enabled:
@@ -551,7 +899,14 @@ def poll_review_channels(config: Config, store: Store) -> None:
     for channel_id in config.review_channel_ids:
         cursor = store.review_cursor(channel_id)
         if cursor is None:
-            latest = fetch_latest_message_id(channel_id, config.discord_token)
+            try:
+                latest = fetch_latest_message_id(channel_id, config.discord_token)
+            except TransientAPIError as error:
+                logging.warning(
+                    "Skipping initial PR review cursor check for channel %s due to transient Discord error: %s",
+                    channel_id, error,
+                )
+                continue
             if latest:
                 store.set_review_cursor(channel_id, latest)
             logging.info(
@@ -559,11 +914,18 @@ def poll_review_channels(config: Config, store: Store) -> None:
                 channel_id, latest or "none",
             )
             continue
-        messages = list(fetch_channel_messages(channel_id, config.discord_token, cursor))
+        try:
+            messages = list(fetch_channel_messages(channel_id, config.discord_token, cursor))
+        except TransientAPIError as error:
+            logging.warning(
+                "Skipping PR review poll for channel %s due to transient Discord error: %s",
+                channel_id, error,
+            )
+            continue
         messages.sort(key=lambda item: int(item["id"]))
         for message in messages:
             try:
                 handle_channel_message(config, store, channel_id, message)
             except Exception:
                 logging.exception("PR review failed for message %s", message.get("id"))
-            store.set_review_cursor(channel_id, str(message["id"]))
+            store.advance_review_cursor(channel_id, str(message["id"]))

@@ -78,13 +78,34 @@ CREATE TABLE IF NOT EXISTS review_threads (
     number INTEGER NOT NULL,
     channel_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
-    thread_id TEXT NOT NULL UNIQUE,
+    thread_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_reviewed_at TEXT,
     last_followup_at TEXT,
     head_sha TEXT,
     PRIMARY KEY (repository, number)
 );
+CREATE INDEX IF NOT EXISTS review_threads_thread_id
+    ON review_threads (thread_id);
+CREATE INDEX IF NOT EXISTS review_threads_message
+    ON review_threads (channel_id, message_id);
+
+CREATE TABLE IF NOT EXISTS review_requests (
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'new',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (repository, number, message_id)
+);
+CREATE INDEX IF NOT EXISTS review_requests_lookup
+    ON review_requests (repository, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS review_cursors (
     channel_id TEXT PRIMARY KEY,
@@ -266,6 +287,7 @@ class Store:
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(review_threads)")}
             if columns and "last_followup_at" not in columns:
                 self._conn.execute("ALTER TABLE review_threads ADD COLUMN last_followup_at TEXT")
+            self._migrate_review_threads_drop_unique_thread_id()
             mw_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(merged_weeks)")}
             if mw_columns and "via" not in mw_columns:
                 self._conn.execute("ALTER TABLE merged_weeks ADD COLUMN via TEXT NOT NULL DEFAULT 'scheduler'")
@@ -761,6 +783,95 @@ class Store:
             )
             self._conn.commit()
 
+    def advance_review_cursor(self, channel_id: str, message_id: str) -> None:
+        """Advance a channel's review cursor forward only (never backwards)."""
+        if not is_discord_id(channel_id) or not is_discord_id(message_id):
+            return
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_message_id FROM review_cursors WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+            if row is not None and is_discord_id(row["last_message_id"]):
+                if int(message_id) <= int(row["last_message_id"]):
+                    return
+            self._conn.execute(
+                """
+                INSERT INTO review_cursors (channel_id, last_message_id) VALUES (?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET last_message_id = excluded.last_message_id
+                """,
+                (channel_id, message_id),
+            )
+            self._conn.commit()
+
+    def _migrate_review_threads_drop_unique_thread_id(self) -> None:
+        """Allow multiple PR rows to share one Discord thread (e.g. a message linking 2+ PRs)."""
+        has_unique_thread_id = False
+        for idx in self._conn.execute("PRAGMA index_list(review_threads)").fetchall():
+            if not idx["unique"]:
+                continue
+            cols = [
+                col["name"]
+                for col in self._conn.execute(f'PRAGMA index_info("{idx["name"]}")').fetchall()
+            ]
+            if cols == ["thread_id"]:
+                has_unique_thread_id = True
+                break
+        if not has_unique_thread_id:
+            return
+        logging.info("Migrating review_threads table to allow multiple PRs per Discord thread")
+        existing_cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(review_threads)").fetchall()
+        }
+        target_cols = (
+            "repository",
+            "number",
+            "channel_id",
+            "message_id",
+            "thread_id",
+            "created_at",
+            "last_reviewed_at",
+            "last_followup_at",
+            "head_sha",
+        )
+        select_exprs = ", ".join(
+            col if col in existing_cols else f"NULL AS {col}"
+            for col in target_cols
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE review_threads_new (
+                repository TEXT NOT NULL,
+                number INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_reviewed_at TEXT,
+                last_followup_at TEXT,
+                head_sha TEXT,
+                PRIMARY KEY (repository, number)
+            )
+            """
+        )
+        self._conn.execute(
+            f"""
+            INSERT INTO review_threads_new ({", ".join(target_cols)})
+            SELECT {select_exprs}
+            FROM review_threads
+            """
+        )
+        self._conn.execute("DROP TABLE review_threads")
+        self._conn.execute("ALTER TABLE review_threads_new RENAME TO review_threads")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS review_threads_thread_id ON review_threads (thread_id)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS review_threads_message ON review_threads (channel_id, message_id)"
+        )
+        self._conn.commit()
+
     def review_thread(self, repository: str, number: int) -> dict | None:
         self._review_key(repository, number)
         with self._lock:
@@ -770,15 +881,162 @@ class Store:
             ).fetchone()
         return dict(row) if row else None
 
-    def review_thread_by_discord(self, thread_id: str) -> dict | None:
+    def review_threads_by_discord(self, thread_id: str) -> list[dict]:
         if not is_discord_id(thread_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM review_threads WHERE thread_id = ? ORDER BY created_at ASC, number ASC",
+                (thread_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def review_thread_by_discord(self, thread_id: str) -> dict | None:
+        rows = self.review_threads_by_discord(thread_id)
+        return rows[0] if rows else None
+
+    def review_thread_by_message(self, channel_id: str, message_id: str) -> dict | None:
+        if not is_discord_id(channel_id) or not is_discord_id(message_id):
             return None
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM review_threads WHERE thread_id = ?",
-                (thread_id,),
+                """
+                SELECT * FROM review_threads
+                WHERE channel_id = ? AND message_id = ?
+                ORDER BY created_at ASC, number ASC
+                LIMIT 1
+                """,
+                (channel_id, message_id),
             ).fetchone()
         return dict(row) if row else None
+
+    def incomplete_review_threads(self, repository: str, *, since_iso: str) -> list[dict]:
+        """Return review_threads created since ``since_iso`` that never finished a review."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM review_threads
+                WHERE lower(repository) = lower(?)
+                  AND last_reviewed_at IS NULL
+                  AND created_at >= ?
+                ORDER BY created_at ASC, number ASC
+                """,
+                (repository, since_iso),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_review_request(
+        self,
+        *,
+        repository: str,
+        number: int,
+        channel_id: str,
+        message_id: str,
+        status: str = "pending",
+        source: str = "new",
+        now_iso: str,
+    ) -> None:
+        self._review_key(repository, number)
+        if not is_discord_id(channel_id) or not is_discord_id(message_id):
+            raise ValueError("Invalid Discord id for review request")
+        if status not in {"pending", "done", "failed"}:
+            raise ValueError("Invalid review request status")
+        completed_at = now_iso if status == "done" else None
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO review_requests (
+                    repository, number, channel_id, message_id, status, source,
+                    attempts, last_error, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, '', ?, ?, ?)
+                ON CONFLICT(repository, number, message_id) DO UPDATE SET
+                    status = CASE
+                        WHEN review_requests.status = 'done' THEN 'done'
+                        ELSE excluded.status
+                    END,
+                    source = CASE
+                        WHEN review_requests.status = 'done' THEN review_requests.source
+                        ELSE excluded.source
+                    END,
+                    updated_at = excluded.updated_at,
+                    completed_at = COALESCE(review_requests.completed_at, excluded.completed_at)
+                """,
+                (repository, number, channel_id, message_id, status, source, now_iso, now_iso, completed_at),
+            )
+            self._conn.commit()
+
+    def get_review_request(self, repository: str, number: int, message_id: str) -> dict | None:
+        self._review_key(repository, number)
+        if not is_discord_id(message_id):
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM review_requests
+                WHERE repository = ? AND number = ? AND message_id = ?
+                """,
+                (repository, number, message_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_review_request(
+        self,
+        repository: str,
+        number: int,
+        message_id: str,
+        status: str,
+        *,
+        error: str = "",
+        updated_at: str,
+        increment_attempts: bool = False,
+    ) -> None:
+        self._review_key(repository, number)
+        if not is_discord_id(message_id):
+            return
+        if status not in {"pending", "done", "failed"}:
+            raise ValueError("Invalid review request status")
+        clean_error = str(error or "")[:500]
+        completed_at = updated_at if status == "done" else None
+        inc = 1 if increment_attempts else 0
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE review_requests
+                SET status = ?,
+                    last_error = ?,
+                    updated_at = ?,
+                    attempts = attempts + ?,
+                    completed_at = CASE
+                        WHEN ? = 'done' THEN COALESCE(completed_at, ?)
+                        ELSE completed_at
+                    END
+                WHERE repository = ? AND number = ? AND message_id = ?
+                """,
+                (status, clean_error, updated_at, inc, status, completed_at, repository, number, message_id),
+            )
+            self._conn.commit()
+
+    def pending_review_requests(
+        self,
+        repository: str,
+        *,
+        since_iso: str,
+        max_attempts: int = 3,
+    ) -> list[dict]:
+        """Return pending or failed review requests from ``since_iso`` with attempts below ``max_attempts``."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM review_requests
+                WHERE lower(repository) = lower(?)
+                  AND status IN ('pending', 'failed')
+                  AND updated_at >= ?
+                  AND attempts < ?
+                ORDER BY created_at ASC, number ASC
+                """,
+                (repository, since_iso, max(1, int(max_attempts))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_review_thread(
         self,

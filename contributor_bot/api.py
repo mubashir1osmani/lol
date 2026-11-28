@@ -343,6 +343,37 @@ def _rate_limit_delay(error: HTTPError, details: str, *, now: float | None = Non
     return None
 
 
+def _github_json_error_summary(host: str | None, details: str) -> str:
+    """Extract safe JSON error fields from a GitHub API error body for logs."""
+    if host != "api.github.com" or not details:
+        return ""
+    try:
+        parsed = json.loads(details)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    parts: list[str] = []
+    msg = parsed.get("message")
+    if isinstance(msg, str) and msg.strip():
+        parts.append(msg.strip()[:200])
+    errs = parsed.get("errors")
+    if isinstance(errs, list):
+        for item in errs[:3]:
+            if isinstance(item, dict):
+                e_type = str(item.get("type") or "").strip()
+                e_msg = str(item.get("message") or "").strip()
+                e_path = item.get("path")
+                chunk = ": ".join(p for p in (e_type, e_msg) if p)
+                if e_path:
+                    chunk = f"{chunk} (path={e_path})" if chunk else f"path={e_path}"
+                if chunk:
+                    parts.append(chunk[:160])
+            elif isinstance(item, str) and item.strip():
+                parts.append(item.strip()[:160])
+    return "; ".join(parts)[:300]
+
+
 def _http(
     request: Request,
     attempts: int = 2,
@@ -364,7 +395,7 @@ def _http(
                 _record_github_rate_headers(request.host, error.headers)
                 error.close()
                 return 304, error.headers, b""
-            details = error.read(500).decode("utf-8", errors="replace")
+            details = error.read(1024).decode("utf-8", errors="replace")
             _record_github_rate_headers(request.host, error.headers)
             error.close()
             has_retry_after = bool(error.headers and error.headers.get("Retry-After"))
@@ -373,7 +404,7 @@ def _http(
                 or has_retry_after
             )
             retryable = error.code in _RETRYABLE_STATUS or github_rate_limited
-            delay = 1.0 if error.code in {500, 502, 503, 504} else None
+            delay = min(max_retry_delay, float(1 << attempt)) if error.code in {500, 502, 503, 504} else None
             if error.code == 429 or github_rate_limited:
                 delay = _rate_limit_delay(error, details)
             if (
@@ -383,9 +414,14 @@ def _http(
                 time.sleep(delay)
                 continue
             message = f"{request.host} returned HTTP {error.code}"
+            gh_detail = _github_json_error_summary(request.host, details)
             if retryable:
-                raise TransientAPIError(message, retry_after=delay) from error
-            raise RuntimeError(message) from error
+                exc: Exception = TransientAPIError(message, retry_after=delay)
+            else:
+                exc = RuntimeError(message)
+            if gh_detail:
+                setattr(exc, "github_error_detail", gh_detail)
+            raise exc from error
         except OSError as error:
             if attempt + 1 < attempts:
                 time.sleep(1)
@@ -448,10 +484,13 @@ def fetch_channel_messages(
         params = {"limit": "100"}
         if before:
             params["before"] = before
-        messages = _request_json(Request(
-            f"{DISCORD_API}/channels/{channel_id}/messages?{urlencode(params)}",
-            headers=_discord_headers(token),
-        ))
+        messages = _request_json(
+            Request(
+                f"{DISCORD_API}/channels/{channel_id}/messages?{urlencode(params)}",
+                headers=_discord_headers(token),
+            ),
+            attempts=3,
+        )
         if not isinstance(messages, list):
             raise RuntimeError("Discord returned an unexpected messages response")
         if not messages:
@@ -977,10 +1016,13 @@ def edit_message(
 
 def fetch_latest_message_id(channel_id: str, token: str) -> str | None:
     """The newest message id, or None when the channel is empty. Does not page history."""
-    messages = _request_json(Request(
-        f"{DISCORD_API}/channels/{channel_id}/messages?limit=1",
-        headers=_discord_headers(token),
-    ))
+    messages = _request_json(
+        Request(
+            f"{DISCORD_API}/channels/{channel_id}/messages?limit=1",
+            headers=_discord_headers(token),
+        ),
+        attempts=3,
+    )
     if not isinstance(messages, list):
         raise RuntimeError("Discord returned an unexpected messages response")
     if not messages:
