@@ -26,7 +26,7 @@ from .interactions import (
 )
 from .poller import poll_once, preview_roundup
 from .pr_board import sync_pr_board
-from .review_job import poll_review_channels
+from .review_job import poll_review_channels, recover_pending_reviews
 from .roles_sync import (
     log_roles_daily_boot_status,
     revalidate_all_grants_on_boot,
@@ -342,6 +342,11 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
         return
     if config.pr_review_enabled and not reviews:
         logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
+    if reviews:
+        try:
+            recover_pending_reviews(config, store)
+        except Exception:
+            logging.exception("Boot PR review recovery failed")
     first_tick = True
     next_board_sync = 0.0
     boot_backfill_started = False

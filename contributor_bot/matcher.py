@@ -665,6 +665,58 @@ def _cached_github_profile(
     )
 
 
+def _format_github_error(error: Exception) -> str:
+    detail = getattr(error, "github_error_detail", "")
+    if detail:
+        return f"{error} ({detail})"
+    return str(error)
+
+
+def _inspect_graphql_errors(errors: object) -> tuple[bool, list[str], set[str]]:
+    """Inspect GraphQL ``errors`` array.
+
+    Returns ``(is_rate_limited, notable_error_summaries, not_found_user_aliases)``.
+    Routine ``NOT_FOUND`` errors on ``[uN, "profileRepo"]`` (users without a
+    ``<login>/<login>`` profile README repository) are ignored.
+    """
+    if not isinstance(errors, list):
+        return False, [], set()
+    rate_limited = False
+    notable: list[str] = []
+    not_found_aliases: set[str] = set()
+    for err in errors:
+        if not isinstance(err, dict):
+            text = str(err).strip()
+            if text:
+                notable.append(text[:200])
+            continue
+        err_type = str(err.get("type") or "").strip()
+        err_msg = str(err.get("message") or "").strip()
+        err_path = err.get("path")
+        if err_type == "RATE_LIMITED" or "rate limit" in err_msg.lower():
+            rate_limited = True
+        if (
+            err_type == "NOT_FOUND"
+            and isinstance(err_path, list)
+            and len(err_path) == 2
+            and err_path[1] == "profileRepo"
+        ):
+            continue
+        if (
+            err_type == "NOT_FOUND"
+            and isinstance(err_path, list)
+            and len(err_path) == 1
+            and isinstance(err_path[0], str)
+        ):
+            not_found_aliases.add(err_path[0])
+        piece = ": ".join(p for p in (err_type, err_msg) if p)
+        if err_path:
+            piece = f"{piece} (path={err_path})" if piece else f"path={err_path}"
+        if piece:
+            notable.append(piece[:200])
+    return rate_limited, notable, not_found_aliases
+
+
 def fetch_github_profiles_graphql(
     logins: list[str],
     token: str | None,
@@ -678,9 +730,10 @@ def fetch_github_profiles_graphql(
 ) -> tuple[dict[str, GitHubAuthorProfile], bool]:
     """Batch-fetch up to 50 GitHub user profiles + 4KB profile READMEs per GraphQL query.
 
-    Handles rate limits via exponential backoff + retry instead of skipping/deferring,
-    and invokes ``on_batch(batch_profiles)`` after each chunk so callers can persist
-    enrichment progress incrementally.
+    Handles rate limits (HTTP and GraphQL-level) via exponential backoff + retry,
+    logs actual GitHub error details, parses valid user nodes even alongside partial
+    GraphQL errors, and bisects failed multi-login batches so one bad user never
+    fails the rest of the batch.
     """
     caller = graphql_caller or github_graphql
     clean_logins: list[str] = []
@@ -699,11 +752,23 @@ def fetch_github_profiles_graphql(
     profiles: dict[str, GitHubAuthorProfile] = {}
     rate_limited = False
 
-    for offset in range(0, len(clean_logins), step):
-        if deadline is not None and (deadline - time.monotonic()) <= 1.5:
-            rate_limited = True
-            break
-        batch = clean_logins[offset: offset + step]
+    pending_batches: list[list[str]] = [
+        clean_logins[offset: offset + step]
+        for offset in range(0, len(clean_logins), step)
+    ]
+
+    while pending_batches:
+        batch = pending_batches.pop(0)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.5:
+                logging.warning(
+                    "GraphQL profile batch aborted before request (%d logins): deadline exhausted (%.1fs remaining)",
+                    len(batch),
+                    remaining,
+                )
+                rate_limited = True
+                break
         var_defs = ", ".join(f"$l{idx}: String!" for idx in range(len(batch)))
         selections = " ".join(
             f"u{idx}: user(login: $l{idx}) {{ ...U profileRepo: repository(name: $l{idx}) {{ ...R }} }}"
@@ -728,8 +793,8 @@ def fetch_github_profiles_graphql(
                     payload = caller(token, query, variables)
                 else:
                     payload = caller(token, query, variables, timeout=req_timeout, attempts=1, max_retry_delay=0.0)
-                break
             except Exception as error:
+                err_text = _format_github_error(error)
                 if _is_rate_limit_error(error):
                     delay = _rate_limit_backoff_delay(error, attempt, deadline=deadline)
                     if delay is not None:
@@ -739,22 +804,60 @@ def fetch_github_profiles_graphql(
                             attempt + 1,
                             ENRICH_RATE_LIMIT_MAX_RETRIES,
                             delay,
-                            error,
+                            err_text,
                         )
                         sleep_fn(delay)
                         continue
                     rate_limited = True
-                logging.warning("GraphQL profile batch fetch failed (%d logins): %s", len(batch), error)
+                logging.warning("GraphQL profile batch fetch failed (%d logins): %s", len(batch), err_text)
                 payload = None
                 break
+
+            gql_errors = payload.get("errors") if isinstance(payload, dict) else None
+            gql_rl, notable_errors, _not_found = _inspect_graphql_errors(gql_errors)
+            if gql_rl:
+                rl_err = TransientAPIError("; ".join(notable_errors) or "GraphQL RATE_LIMITED")
+                delay = _rate_limit_backoff_delay(rl_err, attempt, deadline=deadline)
+                if delay is not None:
+                    logging.warning(
+                        "GraphQL profile batch hit GraphQL RATE_LIMITED (%d logins, attempt %d/%d); waiting %.1fs: %s",
+                        len(batch),
+                        attempt + 1,
+                        ENRICH_RATE_LIMIT_MAX_RETRIES,
+                        delay,
+                        "; ".join(notable_errors[:3]),
+                    )
+                    sleep_fn(delay)
+                    payload = None
+                    continue
+                rate_limited = True
+                logging.warning(
+                    "GraphQL profile batch hit GraphQL RATE_LIMITED (%d logins): %s",
+                    len(batch),
+                    "; ".join(notable_errors[:3]),
+                )
+                break
+            if notable_errors:
+                logging.warning(
+                    "GraphQL profile batch returned errors (%d logins): %s",
+                    len(batch),
+                    "; ".join(notable_errors[:5]),
+                )
+            break
 
         if payload is None:
             if rate_limited:
                 break
+            if len(batch) > 1:
+                mid = len(batch) // 2
+                pending_batches = [batch[:mid], batch[mid:]] + pending_batches
             continue
 
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
+            if not rate_limited and len(batch) > 1:
+                mid = len(batch) // 2
+                pending_batches = [batch[:mid], batch[mid:]] + pending_batches
             continue
         batch_profiles: dict[str, GitHubAuthorProfile] = {}
         for idx, requested_login in enumerate(batch):
@@ -806,8 +909,11 @@ def fetch_github_profiles_graphql(
                 readme=readme,
                 email_locals=tuple(email_locals),
             )
-            profiles[requested_login.casefold()] = prof_obj
-            batch_profiles[requested_login.casefold()] = prof_obj
+            req_key = requested_login.casefold()
+            profiles[req_key] = prof_obj
+            batch_profiles[req_key] = prof_obj
+            if login_val and login_val.casefold() != req_key:
+                profiles[login_val.casefold()] = prof_obj
         if on_batch is not None and batch_profiles:
             on_batch(batch_profiles)
     return profiles, rate_limited
@@ -870,6 +976,7 @@ def _fetch_commit_signals_graphql(
                     payload = caller(token, query, variables, timeout=req_timeout, attempts=1, max_retry_delay=0.0)
                 break
             except Exception as error:
+                err_text = _format_github_error(error)
                 if _is_rate_limit_error(error):
                     delay = _rate_limit_backoff_delay(error, attempt, deadline=deadline)
                     if delay is not None:
@@ -879,12 +986,12 @@ def _fetch_commit_signals_graphql(
                             attempt + 1,
                             ENRICH_RATE_LIMIT_MAX_RETRIES,
                             delay,
-                            error,
+                            err_text,
                         )
                         sleep_fn(delay)
                         continue
                     rate_limited = True
-                logging.warning("GraphQL commit batch fetch failed (%d PRs): %s", len(batch), error)
+                logging.warning("GraphQL commit batch fetch failed (%d PRs): %s", len(batch), err_text)
                 payload = None
                 break
 
@@ -1244,6 +1351,7 @@ def fetch_github_author_profile(
                             enrichment_failed = True
                         break
                     except Exception as error:
+                        err_text = _format_github_error(error)
                         if _is_rate_limit_error(error):
                             delay = _rate_limit_backoff_delay(error, attempt, deadline=deadline)
                             if delay is not None:
@@ -1253,12 +1361,12 @@ def fetch_github_author_profile(
                                     attempt + 1,
                                     ENRICH_RATE_LIMIT_MAX_RETRIES,
                                     delay,
-                                    error,
+                                    err_text,
                                 )
                                 sleep_fn(delay)
                                 continue
                         enrichment_failed = True
-                        logging.warning("Could not fetch GitHub profile for %s: %s", login, error)
+                        logging.warning("Could not fetch GitHub profile for %s: %s", login, err_text)
                         break
 
     should_fetch_commits = (
@@ -3507,7 +3615,15 @@ def _match_community_contributors_with_diagnostics_impl(
         repository = getattr(config, "github_repository", "") or ""
         org = repository.split("/", 1)[0] if "/" in repository else ""
         pending_by_login = {g["login"].strip().casefold(): g for g in pending}
-        enrich_deadline = (deadline - 20.0) if deadline is not None else None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining > 5.0:
+                llm_reserve = min(20.0, remaining * 0.35)
+                enrich_deadline = time.monotonic() + max(5.0, remaining - llm_reserve)
+            else:
+                enrich_deadline = time.monotonic() + max(5.0, remaining)
+        else:
+            enrich_deadline = None
         excluded_staff_ids = _excluded_staff_discord_ids(
             config, store, guild_members, org_members=org_members, org=org,
         )
@@ -4007,12 +4123,16 @@ def _match_community_contributors_with_diagnostics_impl(
 
             if recent_candidates:
                 ambiguous_candidates.extend(recent_candidates)
+                llm_deadline = (
+                    (deadline - min(5.0, max(0.0, (deadline - time.monotonic()) * 0.2)))
+                    if deadline is not None else None
+                )
                 recent_winners, recent_llm_source, _recent_skips, _recent_meta, recent_ev = _disambiguate_with_reasons(
                     config,
                     recent_candidates,
                     llm_complete=complete_fn,
                     jev_transport=jev_transport,
-                    deadline=(deadline - 10.0) if deadline is not None else None,
+                    deadline=llm_deadline,
                 )
                 if recent_llm_source != "none":
                     llm_source = recent_llm_source
@@ -4043,12 +4163,16 @@ def _match_community_contributors_with_diagnostics_impl(
 
         if full_candidates:
             ambiguous_candidates.extend(full_candidates)
+            llm_deadline = (
+                (deadline - min(5.0, max(0.0, (deadline - time.monotonic()) * 0.2)))
+                if deadline is not None else None
+            )
             llm_winners, full_llm_source, llm_skip_reasons, llm_skip_meta, full_ev = _disambiguate_with_reasons(
                 config,
                 full_candidates,
                 llm_complete=complete_fn,
                 jev_transport=jev_transport,
-                deadline=(deadline - 10.0) if deadline is not None else None,
+                deadline=llm_deadline,
             )
             if full_llm_source != "none":
                 llm_source = full_llm_source
