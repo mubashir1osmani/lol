@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -88,6 +91,57 @@ _roles_daily_last_skip_log: dict[tuple[str, str], str] = {}
 _roles_backfill_lock = threading.Lock()
 _pr_link_revalidation_lock = threading.Lock()
 _GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9-]+$")
+ROLES_JOB_LEASE_TTL_SECONDS = 600.0
+
+
+def _lease_owner(job: str) -> str:
+    return f"{job}:{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def _lease_name(job: str, repository: str) -> str:
+    return f"{job}:{(repository or '').strip().lower()}"
+
+
+def _try_acquire_lease(
+    store: Store | None,
+    lock_name: str,
+    owner_id: str,
+    ttl_seconds: float,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if store is None or not hasattr(store, "acquire_lease"):
+        return True
+    try:
+        return store.acquire_lease(lock_name, owner_id, ttl_seconds, now=now)
+    except Exception as error:
+        logging.warning("Could not acquire DB lease %s: %s", lock_name, error)
+        return False
+
+
+def _try_renew_lease(
+    store: Store | None,
+    lock_name: str,
+    owner_id: str,
+    ttl_seconds: float,
+    *,
+    now: datetime | None = None,
+) -> None:
+    if store is None or not hasattr(store, "renew_lease"):
+        return
+    try:
+        store.renew_lease(lock_name, owner_id, ttl_seconds, now=now)
+    except Exception as error:
+        logging.warning("Could not renew DB lease %s: %s", lock_name, error)
+
+
+def _try_release_lease(store: Store | None, lock_name: str, owner_id: str) -> None:
+    if store is None or not hasattr(store, "release_lease"):
+        return
+    try:
+        store.release_lease(lock_name, owner_id)
+    except Exception as error:
+        logging.warning("Could not release DB lease %s: %s", lock_name, error)
 
 
 @dataclass(frozen=True)
@@ -691,15 +745,22 @@ def poll_merged_prs_for_roles(
     """Check PRs merged in the rolling past 7 days and auto-assign newly earned roles."""
     if not config.contributor_roles_enabled or store is None:
         return None
+    moment = now or datetime.now(UTC)
+    repo = config.github_repository
+    lease_key = _lease_name("roles_poll", repo)
+    lease_owner = _lease_owner("roles_poll")
+    lease_ttl = max(ROLES_JOB_LEASE_TTL_SECONDS, float(deadline_seconds or POLL_DEADLINE_SECONDS) + 120.0)
     if not _roles_poll_lock.acquire(blocking=False):
         logging.info("Contributor roles poll skipped: another poll is already in progress")
+        return None
+    if not _try_acquire_lease(store, lease_key, lease_owner, lease_ttl, now=moment):
+        _roles_poll_lock.release()
+        logging.info("Contributor roles poll skipped: another instance holds DB lease %s", lease_key)
         return None
 
     t_start = time.monotonic()
     deadline = (t_start + deadline_seconds) if deadline_seconds is not None else None
-    moment = now or datetime.now(UTC)
     moment_iso = iso(moment)
-    repo = config.github_repository
     org = repo.split("/", 1)[0] if "/" in repo else ""
     token = config.effective_github_token
     search_fn = search_merged_fn or _search_merged_numbers_per_day
@@ -737,6 +798,11 @@ def poll_merged_prs_for_roles(
                     )
                 except TransientAPIError:
                     pass
+                if not config.roles_announce_enabled:
+                    logging.info(
+                        "Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted %d roles silently",
+                        stored_roles_granted,
+                    )
             logging.warning(
                 "Contributor roles poll deferred due to GitHub rate limit (%s); checkpoint unchanged",
                 error,
@@ -883,6 +949,11 @@ def poll_merged_prs_for_roles(
         except TransientAPIError as error:
             logging.warning("Batched role announcement deferred due to Discord rate limit: %s", error)
             rate_limited = True
+        if not config.roles_announce_enabled and roles_granted > 0:
+            logging.info(
+                "Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted %d roles silently",
+                roles_granted,
+            )
 
         logging.info(
             "Contributor roles poll for %s complete: discovered=%d stored=%d existing=%d "
@@ -911,6 +982,7 @@ def poll_merged_prs_for_roles(
             timed_out=timed_out,
         )
     finally:
+        _try_release_lease(store, lease_key, lease_owner)
         _roles_poll_lock.release()
 
 
@@ -968,7 +1040,7 @@ def roles_daily_schedule_status(config: Config, store: Store | None, now: dateti
     return (
         f"daily {config.roles_daily_time} {config.merged_timezone}, "
         f"now={local.strftime('%Y-%m-%d %H:%M %Z')}, date={run_date}, "
-        f"status={state}, oauth={config.github_oauth_enabled}, "
+        f"status={state}, announce={config.roles_announce_enabled}, oauth={config.github_oauth_enabled}, "
         f"webhook={bool(config.github_webhook_secret)}, backfill_on_boot={config.roles_backfill_on_boot}"
     )
 
@@ -1018,14 +1090,21 @@ def run_daily_roles_if_due(
     """
     if store is None or not config.contributor_roles_enabled:
         return None
+    moment = now or datetime.now(UTC)
+    repo = config.github_repository
+    lease_key = _lease_name("roles_daily", repo)
+    lease_owner = _lease_owner("roles_daily")
+    lease_ttl = max(ROLES_JOB_LEASE_TTL_SECONDS, float(POLL_DEADLINE_SECONDS) + 120.0)
     if not _roles_daily_lock.acquire(blocking=False):
         logging.info("Contributor roles daily check skipped: another daily roles run is already in progress")
         return None
+    if not _try_acquire_lease(store, lease_key, lease_owner, lease_ttl, now=moment):
+        _roles_daily_lock.release()
+        logging.info("Contributor roles daily check skipped: another instance holds DB lease %s", lease_key)
+        return None
     try:
-        moment = now or datetime.now(UTC)
         local = moment.astimezone(ZoneInfo(config.merged_timezone))
         run_date = local.date().isoformat()
-        repo = config.github_repository
 
         if not force:
             done_info = store.roles_day_info(repo, run_date)
@@ -1122,6 +1201,7 @@ def run_daily_roles_if_due(
         )
         return result
     finally:
+        _try_release_lease(store, lease_key, lease_owner)
         _roles_daily_lock.release()
 
 
@@ -1162,8 +1242,17 @@ def run_roles_backfill(
     """
     if not config.contributor_roles_enabled or store is None:
         return None
+    moment = now or datetime.now(UTC)
+    repo = config.github_repository
+    lease_key = _lease_name("roles_backfill", repo)
+    lease_owner = _lease_owner("roles_backfill")
+    lease_ttl = max(ROLES_JOB_LEASE_TTL_SECONDS, float(deadline_seconds or BACKFILL_DEADLINE_SECONDS) + 120.0)
     if not _roles_backfill_lock.acquire(blocking=False):
         logging.info("Contributor roles backfill skipped: already running")
+        return None
+    if not _try_acquire_lease(store, lease_key, lease_owner, lease_ttl, now=moment):
+        _roles_backfill_lock.release()
+        logging.info("Contributor roles backfill skipped: another instance holds DB lease %s", lease_key)
         return None
 
     t_start = time.monotonic()
@@ -1173,9 +1262,7 @@ def run_roles_backfill(
         if deadline is not None
         else None
     )
-    moment = now or datetime.now(UTC)
     moment_iso = iso(moment)
-    repo = config.github_repository
     org = repo.split("/", 1)[0] if "/" in repo else ""
     token = config.effective_github_token
     search_fn = search_merged_fn or fetch_merged_numbers
@@ -1234,6 +1321,7 @@ def run_roles_backfill(
             if ingest_deadline is not None and time.monotonic() >= ingest_deadline:
                 timed_out = True
                 break
+            _try_renew_lease(store, lease_key, lease_owner, lease_ttl, now=now or datetime.now(UTC))
             start_iso, end_iso = iso(start), iso(end)
             try:
                 numbers = search_fn(repo, start, end, token)
@@ -1384,7 +1472,13 @@ def run_roles_backfill(
         )
 
         summary_announced = False
-        if announce_summary and contributors_granted > 0 and config.role_announcements_channel_id:
+        if not config.roles_announce_enabled:
+            if roles_granted > 0:
+                logging.info(
+                    "Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted %d roles silently",
+                    roles_granted,
+                )
+        elif announce_summary and contributors_granted > 0 and config.role_announcements_channel_id:
             try:
                 post_message(
                     config.role_announcements_channel_id,
@@ -1443,6 +1537,7 @@ def run_roles_backfill(
             enrichment_deferred=enrichment_deferred,
         )
     finally:
+        _try_release_lease(store, lease_key, lease_owner)
         _roles_backfill_lock.release()
 
 
@@ -1512,10 +1607,16 @@ def revalidate_pr_link_poster_matches_on_boot(
     marker_key = _pr_link_revalidation_key(repo)
     if store.get_roles_meta(marker_key):
         return None
+    moment = now or datetime.now(UTC)
+    lease_key = _lease_name("roles_pr_link_revalidation", repo)
+    lease_owner = _lease_owner("roles_pr_link_revalidation")
     if not _pr_link_revalidation_lock.acquire(blocking=False):
         return None
+    if not _try_acquire_lease(store, lease_key, lease_owner, ROLES_JOB_LEASE_TTL_SECONDS, now=moment):
+        _pr_link_revalidation_lock.release()
+        logging.info("Boot pr_link_poster re-validation skipped: another instance holds DB lease %s", lease_key)
+        return None
 
-    moment = now or datetime.now(UTC)
     moment_iso = iso(moment)
     try:
         if store.get_roles_meta(marker_key):
@@ -1694,6 +1795,7 @@ def revalidate_pr_link_poster_matches_on_boot(
             rate_limited=rate_limited,
         )
     finally:
+        _try_release_lease(store, lease_key, lease_owner)
         _pr_link_revalidation_lock.release()
 
 

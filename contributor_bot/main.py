@@ -278,8 +278,11 @@ def start_contributor_roles(config):
             "PR review agent is on for %s using %s. It only posts in Discord.",
             ", ".join(config.review_channel_ids), config.review_model,
         )
-    if config.contributor_roles_enabled and not config.role_announcements_channel_id:
-        logging.warning("ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; new roles will be granted without a #shipped post")
+    if config.contributor_roles_enabled:
+        if not config.roles_announce_enabled:
+            logging.info("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); roles will be granted silently")
+        elif not config.role_announcements_channel_id:
+            logging.warning("ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; new roles will be granted without a #shipped post")
     return server
 
 

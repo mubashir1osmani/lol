@@ -44,6 +44,7 @@ def minimal_roles_env(directory: str, **extra: str) -> dict[str, str]:
         "ROLE_AGENT_BUILDER_ID": "1003",
         "ROLE_PROVIDER_WIZARD_ID": "1004",
         "ROLE_ANNOUNCEMENTS_CHANNEL_ID": "789",
+        "ROLES_ANNOUNCE_ENABLED": "true",
         "MAINTAINER_GITHUB_LOGINS": "maint-alice",
         "GITHUB_TOKEN": "github-secret",
         "ROLES_DB_PATH": str(Path(directory) / "roles.db"),

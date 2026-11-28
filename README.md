@@ -207,14 +207,19 @@ the same automatic matcher as the weekly summary:
   (skipping unchanged profiles/candidates unless new `pr_link_posters` evidence
   or a signature change appears).
 
-It then grants newly earned roles, and **batches all new role
-announcements into a single message** (chunked only if needed, posting nothing
-when there are zero new grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each
-completed local date is recorded in `roles_daily_runs` so restarts and
-redeploys never run or announce twice on the same day, while catching up
-automatically if the bot was offline at `10:00`. Roles are sticky: the bot adds
-them and never removes them. Docs Hero is no longer granted; anyone who already
-has that Discord role keeps it.
+It then grants newly earned roles. By default, **`ROLES_ANNOUNCE_ENABLED=false`**
+so roles are granted silently and marked `announced_at` immediately (turning it
+on later never posts a backlog), logging `Role announcements disabled
+(ROLES_ANNOUNCE_ENABLED=false); granted N roles silently`. When
+`ROLES_ANNOUNCE_ENABLED=true`, newly earned roles are **batched into a single
+message** (chunked only if needed, posting nothing when there are zero new
+grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each completed local date is
+recorded in `roles_daily_runs` and concurrent runs across instances are guarded
+by a DB-backed lease lock (`job_locks`), so restarts and redeploys never overlap
+or run twice on the same day, while catching up automatically if the bot was
+offline at `10:00`. Roles are sticky: the bot adds them and never removes them
+automatically (mods can use `/roles-revoke`). Docs Hero is no longer granted;
+anyone who already has that Discord role keeps it.
 
 ### Minimal setup (no GitHub OAuth or webhook required)
 

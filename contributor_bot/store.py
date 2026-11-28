@@ -15,9 +15,11 @@ import os
 import re
 import sqlite3
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import is_discord_id
+from .schedule import UTC, iso
 
 _LOGIN = re.compile(r"[A-Za-z0-9-]+(?:\[bot\])?")
 _INVITE_PENDING = "pending"
@@ -210,6 +212,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY,
     applied_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS job_locks (
+    lock_name TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
 """
 
 
@@ -231,6 +240,12 @@ class Store:
         self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=30000")
+        if path != ":memory:":
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.Error:
+                pass
         with self._lock:
             self._conn.executescript(_SCHEMA)
             columns = {row[1] for row in self._conn.execute("PRAGMA table_info(review_threads)")}
@@ -1650,6 +1665,101 @@ class Store:
         with self._lock:
             self._conn.execute("DELETE FROM match_attempts WHERE login = ?", (key,))
             self._conn.commit()
+
+    def acquire_lease(
+        self,
+        lock_name: str,
+        owner_id: str,
+        ttl_seconds: float,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically acquire or re-acquire a DB-backed lease lock across processes."""
+        name = (lock_name or "").strip()
+        owner = (owner_id or "").strip()
+        if not name or not owner:
+            raise ValueError("Invalid lease lock_name or owner_id")
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        acquired_iso = iso(moment)
+        expires_iso = iso(moment + timedelta(seconds=max(1.0, float(ttl_seconds))))
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO job_locks (lock_name, owner_id, acquired_at, expires_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(lock_name) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        acquired_at = excluded.acquired_at,
+                        expires_at = excluded.expires_at
+                    WHERE job_locks.owner_id = excluded.owner_id
+                       OR job_locks.expires_at <= excluded.acquired_at
+                    """,
+                    (name, owner, acquired_iso, expires_iso),
+                )
+                row = self._conn.execute(
+                    "SELECT owner_id FROM job_locks WHERE lock_name = ?",
+                    (name,),
+                ).fetchone()
+                return bool(row is not None and row["owner_id"] == owner)
+
+    def renew_lease(
+        self,
+        lock_name: str,
+        owner_id: str,
+        ttl_seconds: float,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Extend the lease expiration if still held by ``owner_id``."""
+        name = (lock_name or "").strip()
+        owner = (owner_id or "").strip()
+        if not name or not owner:
+            return False
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        expires_iso = iso(moment + timedelta(seconds=max(1.0, float(ttl_seconds))))
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(
+                    "UPDATE job_locks SET expires_at = ? WHERE lock_name = ? AND owner_id = ?",
+                    (expires_iso, name, owner),
+                )
+                return cur.rowcount > 0
+
+    def release_lease(self, lock_name: str, owner_id: str) -> None:
+        """Release a DB-backed lease lock only if held by ``owner_id``."""
+        name = (lock_name or "").strip()
+        owner = (owner_id or "").strip()
+        if not name or not owner:
+            return
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM job_locks WHERE lock_name = ? AND owner_id = ?",
+                    (name, owner),
+                )
+
+    def get_lease(self, lock_name: str) -> dict | None:
+        name = (lock_name or "").strip()
+        if not name:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT lock_name, owner_id, acquired_at, expires_at FROM job_locks WHERE lock_name = ?",
+                (name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "lock_name": row["lock_name"],
+            "owner_id": row["owner_id"],
+            "acquired_at": row["acquired_at"],
+            "expires_at": row["expires_at"],
+        }
 
     @staticmethod
     def _review_key(repository: str, number: int) -> None:

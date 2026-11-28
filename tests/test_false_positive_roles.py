@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from contributor_bot.config import Config
+from contributor_bot.config import Config, get_config
 from contributor_bot.interactions import handle_interaction, role_slash_commands
 from contributor_bot.matcher import (
     DiscordMemberInfo,
@@ -14,11 +15,14 @@ from contributor_bot.matcher import (
     multi_author_poster_ids,
     score_author_against_members,
 )
-from contributor_bot.rewards import apply_roles
+from contributor_bot.rewards import announce_pending_role_grants, apply_roles
 from contributor_bot.roles_sync import (
     _grant_roles_for_stored_matches,
     execute_roles_revoke,
+    poll_merged_prs_for_roles,
     revalidate_pr_link_poster_matches_on_boot,
+    run_daily_roles_if_due,
+    run_roles_backfill,
     should_run_pr_link_poster_revalidation,
 )
 from contributor_bot.store import Store
@@ -637,6 +641,323 @@ class TestBootRevalidationAndGrantLogging(unittest.TestCase):
             ),
             f"Expected structured role grant log, got: {logs.output}",
         )
+
+
+class TestRolesAnnounceDisabledByDefault(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
+        self.addCleanup(self.store.close)
+        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+
+    def test_config_defaults_roles_announce_enabled_to_false(self):
+        cfg = get_config({
+            "DISCORD_BOT_TOKEN": "tok",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+            "ANNOUNCEMENTS_CHANNEL_ID": "456",
+            "CONTRIBUTOR_ROLES_ENABLED": "true",
+            "DISCORD_GUILD_ID": "333333333333333333",
+            "ROLE_CONTRIBUTOR_ID": "900000000000000001",
+            "ROLE_OSS_CHAMPION_ID": "900000000000000002",
+            "ROLE_AGENT_BUILDER_ID": "900000000000000003",
+            "ROLE_PROVIDER_WIZARD_ID": "900000000000000004",
+            "ROLE_ANNOUNCEMENTS_CHANNEL_ID": "800000000000000001",
+            "ROLES_DB_PATH": str(Path(self.tmp.name) / "cfg.db"),
+        })
+        self.assertFalse(cfg.roles_announce_enabled)
+
+    def test_apply_roles_silent_no_shoutout_and_no_backlog_when_enabled_later(self):
+        cfg_off = _make_config(roles_announce_enabled=False)
+        uid = "760000000000000001"
+        _seed_pull(
+            self.store, cfg_off.github_repository, 701, 601, "silent-dev", "2026-11-27T10:00:00+00:00",
+            labels=["agents"],
+        )
+        with patch("contributor_bot.rewards.add_member_role"), patch(
+            "contributor_bot.rewards.post_message"
+        ) as mock_post, self.assertLogs(level="INFO") as logs:
+            granted = apply_roles(
+                cfg_off,
+                self.store,
+                uid,
+                601,
+                pr_number=701,
+                shoutout=True,
+                announce=True,
+                github_login="silent-dev",
+                match_method="exact_login",
+                match_confidence=0.98,
+            )
+        self.assertEqual(set(granted), {"contributor", "agent_builder"})
+        mock_post.assert_not_called()
+        # Marked announced_at + shoutout_at silently so turning it on later never backlogs!
+        self.assertEqual(self.store.all_unannounced_grants(), [])
+        self.assertIsNotNone(self.store.get_pull(cfg_off.github_repository, 701)["shoutout_at"])
+        self.assertTrue(
+            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 2 roles silently" in m for m in logs.output),
+            f"Expected silent grant log, got: {logs.output}",
+        )
+
+        # Turning ROLES_ANNOUNCE_ENABLED=true later must post ZERO backlog!
+        cfg_on = _make_config(roles_announce_enabled=True)
+        with patch("contributor_bot.rewards.post_message") as mock_post_later:
+            posted_chunks = announce_pending_role_grants(cfg_on, self.store, now=self.now)
+        self.assertEqual(posted_chunks, 0)
+        mock_post_later.assert_not_called()
+
+    def test_daily_poll_and_backfill_post_nothing_and_log_silent_when_disabled(self):
+        cfg_off = _make_config(roles_announce_enabled=False, backfill_since="2026-11-01T00:00:00+00:00")
+        uid = "760000000000000002"
+        members = [DiscordMemberInfo(uid, username="quiet-dev", global_name="Quiet Dev")]
+
+        def fake_pull(_repo, num, _tok):
+            return {
+                "number": num,
+                "merged": True,
+                "merged_at": "2026-11-26T10:00:00Z",
+                "title": "feat: quiet",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "quiet-dev", "id": 602, "type": "User"},
+                "labels": [],
+            }
+
+        with patch("contributor_bot.rewards.add_member_role"), patch(
+            "contributor_bot.rewards.post_message"
+        ) as mock_rewards_post, patch(
+            "contributor_bot.roles_sync.post_message"
+        ) as mock_sync_post, self.assertLogs(level="INFO") as logs:
+            poll_res = poll_merged_prs_for_roles(
+                cfg_off,
+                self.store,
+                now=self.now,
+                members=members,
+                search_merged_fn=lambda _r, _s, _e, _t: {801},
+                pull_fetcher=fake_pull,
+                files_fetcher=lambda _r, _n, _t: ["litellm/router.py"],
+                count_fetcher=lambda _r, _l, _t: 1,
+                org_members_fetcher=lambda _o, _t: [],
+            )
+        self.assertIsNotNone(poll_res)
+        self.assertEqual(poll_res.roles_granted, 1)
+        mock_rewards_post.assert_not_called()
+        mock_sync_post.assert_not_called()
+        self.assertEqual(self.store.all_unannounced_grants(), [])
+        self.assertTrue(
+            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in m for m in logs.output),
+            f"Expected silent grant log in poll, got: {logs.output}",
+        )
+
+        # Backfill summary is also silenced when ROLES_ANNOUNCE_ENABLED=false.
+        uid2 = "760000000000000003"
+        members2 = members + [DiscordMemberInfo(uid2, username="backfill-quiet", global_name="Backfill Quiet")]
+
+        def fake_pull_bf(_repo, num, _tok):
+            return {
+                "number": num,
+                "merged": True,
+                "merged_at": "2026-11-10T10:00:00Z",
+                "title": "feat: bf",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "backfill-quiet", "id": 603, "type": "User"},
+                "labels": [],
+            }
+
+        with patch("contributor_bot.rewards.add_member_role"), patch(
+            "contributor_bot.rewards.post_message"
+        ) as mock_rewards_post2, patch(
+            "contributor_bot.roles_sync.post_message"
+        ) as mock_sync_post2, self.assertLogs(level="INFO") as logs_bf:
+            bf_res = run_roles_backfill(
+                cfg_off,
+                self.store,
+                now=self.now,
+                members=members2,
+                search_merged_fn=lambda _r, _s, _e, _t: [802],
+                pull_fetcher=fake_pull_bf,
+                files_fetcher=lambda _r, _n, _t: ["litellm/router.py"],
+                count_fetcher=lambda _r, _l, _t: 1,
+                org_members_fetcher=lambda _o, _t: [],
+                announce_summary=True,
+            )
+        self.assertIsNotNone(bf_res)
+        self.assertEqual(bf_res.roles_granted, 1)
+        self.assertFalse(bf_res.summary_announced)
+        mock_rewards_post2.assert_not_called()
+        mock_sync_post2.assert_not_called()
+        self.assertEqual(self.store.all_unannounced_grants(), [])
+        self.assertTrue(
+            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in m for m in logs_bf.output),
+            f"Expected silent grant log in backfill, got: {logs_bf.output}",
+        )
+
+
+class TestLLMEnrichmentDeferredGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
+        self.addCleanup(self.store.close)
+        self.cfg = _make_config(github_token="gh-tok")
+        self.now = datetime(2026, 11, 28, 4, 13, tzinfo=timezone.utc)
+
+    def test_llm_never_accepts_when_enrichment_deferred_and_retries_next_run(self):
+        """Repro 04:13 UTC prod bug: enrichment_deferred > 0 must block LLM and treat as llm_unavailable."""
+        edvn_id = "1466417354824224830"
+        members = [DiscordMemberInfo(edvn_id, username="edvn", global_name="edvn")]
+        groups = [
+            {
+                "login": "edvn-unrelated-dev",
+                "user_id": 777,
+                "first_time": False,
+                "pulls": [{"number": 4201, "title": "feat", "url": "https://github.com/BerriAI/litellm/pull/4201"}],
+            }
+        ]
+        llm_calls = []
+
+        def aggressive_llm(model, messages):
+            llm_calls.append(messages)
+            return json.dumps({
+                "discord_id": edvn_id,
+                "confidence": 0.96,
+                "reason": "similar handle prefix",
+                "evidence": ["handle prefix", "handle"],
+            })
+
+        # Simulate GraphQL rate-limit deferral (enrichment_deferred=1, zero profile data).
+        def rate_limited_gql(_query, _vars, _tok, **_kw):
+            raise RuntimeError("api.github.com returned HTTP 403 rate limit exceeded")
+
+        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
+            groups,
+            self.cfg,
+            self.store,
+            members=members,
+            now=self.now,
+            graphql_caller=rate_limited_gql,
+            llm_complete=aggressive_llm,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
+        self.assertEqual(diag.enrichment_deferred, 1)
+        self.assertEqual(dict(diag.skip_reasons), {"llm_unavailable": 1})
+        self.assertEqual(llm_calls, [])
+        self.assertIsNone(self.store.get_confirmed_match("edvn-unrelated-dev"))
+        # Must NOT write 7-day negative cache so next run retries!
+        self.assertIsNone(self.store.get_match_attempt("edvn-unrelated-dev"))
+
+    def test_llm_never_accepts_when_enrichment_returns_empty_profile(self):
+        """Even without rate limit, an author with zero profile/commit fields must not be LLM-accepted."""
+        edvn_id = "1466417354824224830"
+        members = [DiscordMemberInfo(edvn_id, username="edvn", global_name="edvn")]
+        groups = [
+            {
+                "login": "edvn-empty-gh",
+                "user_id": 778,
+                "first_time": False,
+                "pulls": [],
+            }
+        ]
+        llm_calls = []
+
+        def aggressive_llm(model, messages):
+            llm_calls.append(messages)
+            return json.dumps({
+                "discord_id": edvn_id,
+                "confidence": 0.95,
+                "reason": "handle overlap",
+                "evidence": ["handle prefix", "handle"],
+            })
+
+        # GraphQL returns a user object with ALL enrichment fields empty.
+        def empty_profile_gql(_query, _vars, _tok, **_kw):
+            return {
+                "data": {
+                    "u0": {
+                        "login": "edvn-empty-gh",
+                        "name": None,
+                        "bio": None,
+                        "company": None,
+                        "email": None,
+                        "twitterUsername": None,
+                        "websiteUrl": None,
+                        "socialAccounts": {"nodes": []},
+                        "readme": None,
+                    }
+                }
+            }
+
+        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
+            groups,
+            self.cfg,
+            self.store,
+            members=members,
+            now=self.now,
+            graphql_caller=empty_profile_gql,
+            llm_complete=aggressive_llm,
+        )
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
+        self.assertEqual(dict(diag.skip_reasons), {"llm_unavailable": 1})
+        self.assertEqual(llm_calls, [])
+        self.assertIsNone(self.store.get_match_attempt("edvn-empty-gh"))
+
+
+class TestDBBackedRunLeaseLock(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = str(Path(self.tmp.name) / "shared.db")
+        self.store_a = Store(self.db_path)
+        self.store_b = Store(self.db_path)
+        self.addCleanup(self.store_a.close)
+        self.addCleanup(self.store_b.close)
+        self.now = datetime(2026, 11, 28, 16, 0, tzinfo=timezone.utc)
+
+    def test_two_instances_cannot_hold_lease_simultaneously_and_expired_lease_recovers(self):
+        # Instance A acquires lease.
+        self.assertTrue(self.store_a.acquire_lease("roles_daily:berriai/litellm", "inst-a", 300, now=self.now))
+        # Instance B (separate connection to the same SQLite DB) is blocked while lease is active.
+        self.assertFalse(self.store_b.acquire_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=60)))
+        # Non-owner cannot renew or release Instance A's lease.
+        self.assertFalse(self.store_b.renew_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=60)))
+        self.store_b.release_lease("roles_daily:berriai/litellm", "inst-b")
+        self.assertEqual(self.store_a.get_lease("roles_daily:berriai/litellm")["owner_id"], "inst-a")
+
+        # Owner can renew lease.
+        self.assertTrue(self.store_a.renew_lease("roles_daily:berriai/litellm", "inst-a", 300, now=self.now + timedelta(seconds=100)))
+        self.assertFalse(self.store_b.acquire_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=350)))
+
+        # Once lease expires (e.g. Instance A crashed during deploy), Instance B takes over cleanly.
+        self.assertTrue(self.store_b.acquire_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=401)))
+        self.assertEqual(self.store_b.get_lease("roles_daily:berriai/litellm")["owner_id"], "inst-b")
+
+        # Release lets Instance A acquire immediately.
+        self.store_b.release_lease("roles_daily:berriai/litellm", "inst-b")
+        self.assertIsNone(self.store_a.get_lease("roles_daily:berriai/litellm"))
+        self.assertTrue(self.store_a.acquire_lease("roles_daily:berriai/litellm", "inst-a", 300, now=self.now + timedelta(seconds=402)))
+
+    def test_daily_roles_skips_when_other_instance_holds_db_lease(self):
+        cfg = _make_config(roles_daily_time="10:00", merged_timezone="America/Toronto")
+        # Simulate another Render instance holding the DB lease for roles_daily.
+        self.assertTrue(self.store_a.acquire_lease("roles_daily:berriai/litellm", "other-instance", 600, now=self.now))
+
+        poll_called = []
+
+        def fake_poll(*_args, **_kwargs):
+            poll_called.append(True)
+            return None
+
+        res = run_daily_roles_if_due(
+            cfg,
+            self.store_b,
+            now=self.now,
+            force=True,
+            poll_fn=fake_poll,
+        )
+        self.assertIsNone(res)
+        self.assertEqual(poll_called, [])
+
 
 
 if __name__ == "__main__":

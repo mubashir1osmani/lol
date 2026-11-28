@@ -770,6 +770,24 @@ def _fetch_commit_signals_graphql(
     return out, rate_limited
 
 
+def _profile_has_enrichment_data(profile: GitHubAuthorProfile | None) -> bool:
+    """True when GitHub enrichment populated at least one profile or commit field."""
+    if profile is None:
+        return False
+    return bool(
+        (profile.name or "").strip()
+        or (profile.blog or "").strip()
+        or (profile.twitter_username or "").strip()
+        or (profile.bio or "").strip()
+        or (profile.company or "").strip()
+        or (profile.email or "").strip()
+        or profile.social_accounts
+        or (profile.readme or "").strip()
+        or profile.commit_names
+        or profile.email_locals
+    )
+
+
 def _enrich_profiles_batch(
     groups: list[dict],
     repository: str,
@@ -781,10 +799,13 @@ def _enrich_profiles_batch(
     graphql_caller=None,
     deadline: float | None = None,
     skip_github_enrichment: bool = False,
-) -> tuple[dict[str, GitHubAuthorProfile], int]:
-    """Batch-enrich profiles via GraphQL (50/query) or ThreadPoolExecutor(8) REST fallback."""
+) -> tuple[dict[str, GitHubAuthorProfile], set[str]]:
+    """Batch-enrich profiles via GraphQL (50/query) or ThreadPoolExecutor(8) REST fallback.
+
+    Returns ``(profiles_by_login, deferred_logins)``.
+    """
     profiles: dict[str, GitHubAuthorProfile] = {}
-    deferred = 0
+    deferred_logins: set[str] = set()
     uncached_groups: list[dict] = []
 
     for group in groups:
@@ -801,7 +822,7 @@ def _enrich_profiles_batch(
             uncached_groups.append(group)
 
     if not uncached_groups:
-        return profiles, 0
+        return profiles, deferred_logins
 
     use_graphql = graphql_caller is not None or (
         (github_getter is None or github_getter is github_get_json) and bool(token)
@@ -839,8 +860,7 @@ def _enrich_profiles_batch(
                 login_key = login.strip().casefold()
                 base_prof = gql_profiles.get(login_key)
                 if base_prof is None:
-                    if hit_limit:
-                        deferred += 1
+                    deferred_logins.add(login_key)
                     profiles[login_key] = GitHubAuthorProfile(login=login, user_id=g.get("user_id"))
                     continue
                 c_names, c_emails = commit_signals.get(login_key, ((), ()))
@@ -864,7 +884,7 @@ def _enrich_profiles_batch(
                 )
                 profiles[login_key] = full_prof
                 _save_cached_github_profile(store, full_prof, moment)
-            return profiles, deferred
+            return profiles, deferred_logins
 
     # Concurrent REST fallback (ThreadPoolExecutor(8)) when GraphQL is unavailable or github_getter is injected.
     rate_limited = threading.Event()
@@ -900,7 +920,7 @@ def _enrich_profiles_batch(
             login_key, prof, was_deferred = _worker(group)
             profiles[login_key] = prof
             if was_deferred:
-                deferred += 1
+                deferred_logins.add(login_key)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_worker, group) for group in uncached_groups]
@@ -908,8 +928,8 @@ def _enrich_profiles_batch(
                 login_key, prof, was_deferred = fut.result()
                 profiles[login_key] = prof
                 if was_deferred:
-                    deferred += 1
-    return profiles, deferred
+                    deferred_logins.add(login_key)
+    return profiles, deferred_logins
 
 
 def fetch_github_author_profile(
@@ -2573,6 +2593,7 @@ def match_community_contributors_with_diagnostics(
             members_source = "guild_cache+rest_search" if members_source == "guild_cache" else "rest_search"
 
     enrichment_deferred = 0
+    enrichment_blocked_for_llm: set[str] = set()
     if pending and not guild_members:
         for group in pending:
             login_key = group["login"].strip().casefold()
@@ -2675,7 +2696,7 @@ def match_community_contributors_with_diagnostics(
             need_enrichment.append(group)
 
         # Batch-enrich remaining authors via GraphQL (50/query) or ThreadPoolExecutor(8) REST fallback.
-        profiles_by_login, enrichment_deferred = _enrich_profiles_batch(
+        profiles_by_login, deferred_logins = _enrich_profiles_batch(
             need_enrichment,
             repository,
             token,
@@ -2686,6 +2707,17 @@ def match_community_contributors_with_diagnostics(
             deadline=enrich_deadline,
             skip_github_enrichment=skip_github_enrichment,
         )
+        enrichment_deferred = len(deferred_logins)
+
+        # Never allow the LLM to accept a match when GitHub profile enrichment was
+        # deferred or returned zero profile/commit fields (treat as llm_unavailable
+        # and retry next run rather than guessing from handle fragments alone).
+        enrichment_blocked_for_llm: set[str] = set(deferred_logins)
+        if not skip_github_enrichment:
+            for group in need_enrichment:
+                lk = group["login"].strip().casefold()
+                if not _profile_has_enrichment_data(profiles_by_login.get(lk)):
+                    enrichment_blocked_for_llm.add(lk)
 
         # Precompute full-pool scoring + negative-cache check for every still-pending author so
         # identical no_match attempts skip BOTH Pass 1 and Pass 2 LLM calls for 7 days.
@@ -2708,7 +2740,12 @@ def match_community_contributors_with_diagnostics(
             full_scores_cache[login_key] = (full_strong, full_cands)
             sig = _compute_attempt_signature(profile, full_cands, pr_link_rows_by_login.get(login_key, []))
             attempt_signatures[login_key] = sig
-            if full_strong is None and store is not None and hasattr(store, "get_match_attempt"):
+            if (
+                full_strong is None
+                and login_key not in enrichment_blocked_for_llm
+                and store is not None
+                and hasattr(store, "get_match_attempt")
+            ):
                 prev = store.get_match_attempt(login)
                 if (
                     prev
@@ -2756,7 +2793,7 @@ def match_community_contributors_with_diagnostics(
                     member, method, confidence = strong
                     resolved[login_key] = (group, member.discord_id, method, confidence)
                     evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
-                elif candidates:
+                elif candidates and login_key not in enrichment_blocked_for_llm:
                     recent_candidates.extend(candidates)
 
             if recent_candidates:
@@ -2789,6 +2826,15 @@ def match_community_contributors_with_diagnostics(
                 member, method, confidence = strong
                 resolved[login_key] = (group, member.discord_id, method, confidence)
                 evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
+            elif login_key in enrichment_blocked_for_llm:
+                top_h = candidates[0].heuristic_score if candidates else 0.0
+                skip_reason_by_login[login_key] = "llm_unavailable"
+                skip_meta_by_login[login_key] = (top_h, "github profile enrichment deferred or empty; will retry next run")
+                logging.info(
+                    "Skipping LLM match for %s: GitHub profile enrichment was deferred or empty "
+                    "(treating as llm_unavailable; will retry next run)",
+                    group["login"],
+                )
             elif candidates:
                 full_candidates.extend(candidates)
             else:
@@ -2966,6 +3012,7 @@ def match_community_contributors_with_diagnostics(
             # Persist definitive no_match attempts for 7-day negative caching.
             if (
                 reason in _DEFINITIVE_NEGATIVE_REASONS
+                and login_key not in enrichment_blocked_for_llm
                 and login_key in attempt_signatures
                 and store is not None
                 and hasattr(store, "save_match_attempt")

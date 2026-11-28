@@ -235,6 +235,21 @@ def apply_roles(
         name = config.role_names.get(key) or DEFAULT_ROLE_NAMES[key]
         if store.record_grant(discord_id, key, name, now):
             newly_granted.append(key)
+    if not config.roles_announce_enabled:
+        pending_keys = [grant["role_key"] for grant in store.unannounced_grants(discord_id)]
+        to_mark = list(dict.fromkeys([*newly_granted, *pending_keys]))
+        if to_mark:
+            store.mark_grants_announced(discord_id, to_mark, now)
+        if shoutout and pr_number:
+            recorded = store.get_pull(config.github_repository, pr_number)
+            if recorded and not recorded["shoutout_at"]:
+                store.mark_shoutout(config.github_repository, pr_number, now)
+        if announce and newly_granted:
+            logging.info(
+                "Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted %d roles silently",
+                len(newly_granted),
+            )
+        return newly_granted
     if not announce:
         if newly_granted and mark_announced:
             store.mark_grants_announced(discord_id, newly_granted, now)
@@ -302,6 +317,19 @@ def announce_pending_role_grants(
     Returns the number of chunks posted.
     """
     rows = store.all_unannounced_grants()
+    if not config.roles_announce_enabled:
+        if rows:
+            announced_at = iso(now or datetime.now(UTC))
+            by_user: dict[str, list[str]] = {}
+            for row in rows:
+                by_user.setdefault(str(row["discord_id"]), []).append(str(row["role_key"]))
+            for uid, keys in by_user.items():
+                store.mark_grants_announced(uid, keys, announced_at)
+            logging.info(
+                "Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted %d roles silently",
+                len(rows),
+            )
+        return 0
     if not rows:
         return 0
     channel_id = config.role_announcements_channel_id
