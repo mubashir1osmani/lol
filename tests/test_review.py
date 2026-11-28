@@ -175,9 +175,9 @@ class BotFilterAndVerdictTests(unittest.TestCase):
         self.assertTrue(gate.ready)
         self.assertEqual(gate.reasons, ())
         text = render_status(gate, number=12, title="add a timeout", url="https://github.com/BerriAI/litellm/pull/12", head_sha=HEAD)
-        self.assertTrue(text.startswith("ready for maintainer ✅"))
-        self.assertIn("ci: green", text)
-        self.assertIn("cursor[bot]: re-reviewed, no outstanding issues", text)
+        self.assertEqual(text, "looks good")
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertNotIn("✅", text)
 
     def test_needs_work_lists_unresolved_bots_ci_draft_and_conflicts(self):
         stale = _review("cursor[bot]", body="<!-- BUGBOT_REVIEW --> <!-- BUGBOT_REVIEW_STALE --> stale")
@@ -204,8 +204,9 @@ class BotFilterAndVerdictTests(unittest.TestCase):
         self.assertIn("veria-ai[bot] has not reviewed this pr", text)
         self.assertNotIn("codecov", text)
         rendered = render_status(gate, number=12, title="fix @everyone\nnow", url="https://github.com/BerriAI/litellm/pull/12", head_sha=HEAD)
-        self.assertTrue(rendered.startswith("needs work"))
-        self.assertIn("fix these before a maintainer looks:", rendered)
+        self.assertTrue(rendered.startswith("needs work\n- "))
+        self.assertLessEqual(len(rendered.splitlines()) - 1, 5)
+        self.assertNotIn("fix these before a maintainer looks:", rendered)
         self.assertNotIn("@everyone", rendered)
 
     def test_resolution_fallback_counts_only_latest_head_comments(self):
@@ -437,11 +438,8 @@ class DiscordPostTests(unittest.TestCase):
     def test_review_posts_in_discord_and_does_not_write_to_github(self):
         self.store.link_account("111", "octocat", 5, "2026-11-01T00:00:00+00:00")
         verdict = {
-            "summary": "adds a timeout around the proxy call",
-            "risks": ["the timeout might cut a stream short"],
-            "missing_tests": ["no test for a slow upstream"],
-            "checklist": ["run the proxy tests"],
-            "blocking": [],
+            "verdict": "looks good",
+            "findings": [],
         }
         sdk, calls = _fake_sdk(lambda context: tool_submit_verdict(context, verdict))
 
@@ -462,9 +460,8 @@ class DiscordPostTests(unittest.TestCase):
         thread.assert_called_once()
         comment.assert_not_called()
         contents = [call.args[2]["content"] for call in post.call_args_list]
-        joined = "\n".join(contents)
-        self.assertIn("ready for maintainer ✅", joined)
-        self.assertIn("adds a timeout around the proxy call", joined)
+        self.assertEqual(contents[0], "looks good")
+        self.assertNotIn("✅", "\n".join(contents))
         self.assertIn("<@111>", contents[-1])
         self.assertIn("<@&555>", contents[-1])
         self.assertEqual(post.call_args_list[-1].kwargs["mention_roles"], ["555"])

@@ -286,9 +286,9 @@ class DiscordAckFlowTests(unittest.TestCase):
             order.append(("agent", tuple(discord.reactions)))
             from contributor_bot.review_agent import ReviewContext
             ctx = ReviewContext(config=config, store=store, number=number, thread_id=thread_id)
-            tool_submit_verdict(ctx, {"summary": "the gate is clean", "blocking": []})
+            tool_submit_verdict(ctx, {"verdict": "looks good", "findings": []})
             from contributor_bot.review_agent import AgentResult
-            return AgentResult("posted", verdict_posted=True, ready=True, head_sha="ab" * 20)
+            return AgentResult("posted", verdict_posted=True, ready=True, verdict="looks good", head_sha="ab" * 20)
 
         message = {
             "id": "654",
@@ -322,7 +322,7 @@ class DiscordAckFlowTests(unittest.TestCase):
         self.assertEqual(discord.threads, [("321", "654", "pr 12 review")])
         self.assertTrue(order)
         self.assertEqual(order[0][1], tuple(discord.reactions))
-        self.assertTrue(any("needs work" in content or "ready for maintainer" in content for _channel, content, _roles in discord.posts))
+        self.assertTrue(any("needs work" in content or "looks good" in content for _channel, content, _roles in discord.posts))
         self.assertNotIn("run_agent_loop", inspect.getsource(review_job))
 
     def test_recheck_without_a_message_does_not_react_and_check_again_does(self):
