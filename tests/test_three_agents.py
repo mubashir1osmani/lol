@@ -1333,6 +1333,160 @@ class LensObservabilityParityTests(unittest.TestCase):
         self.assertEqual(a3["support.skip_reason"], "low_confidence")
         self.assertIn("support_skipped", dict(_span_events(agent_spans[2])))
 
+    def test_root_agent_spans_set_lens_source_attributes(self) -> None:
+        from contributor_bot import review_job
+        from contributor_bot.tracing import (
+            AGENT_SOURCE_TITLE_ATTR,
+            AGENT_SOURCE_TYPE_ATTR,
+            AGENT_SOURCE_URL_ATTR,
+        )
+
+        guild_id = "123456789012345678"
+        config = _base_config(
+            self.db_path,
+            discord_guild_id=guild_id,
+            pr_review_enabled=True,
+            review_channel_ids=("333333333333333333",),
+            support_agent_enabled=True,
+            support_agent_channel_ids=("444444444444444444",),
+        )
+        long_review_msg = (
+            "Please review https://github.com/BerriAI/litellm/pull/8811 — "
+            "this fixes streaming timeouts across OpenAI-compatible custom endpoints in proxy mode"
+        )
+        # 1. pr_review_agent from a channel message (>80 chars truncated cleanly).
+        with (
+            mock.patch.object(review_job, "acknowledge_message"),
+            mock.patch.object(review_job, "_spawn_review"),
+        ):
+            pr_review_agent.handle_routed_message(
+                config,
+                self.store,
+                "333333333333333333",
+                {
+                    "id": "600000000000000101",
+                    "guild_id": guild_id,
+                    "content": long_review_msg,
+                    "author": {"id": "111", "bot": False},
+                },
+                route_info={"target": AGENT_PR_REVIEW, "reason": "pr_review_request", "pr_numbers": [8811]},
+            )
+
+        # 2. pr_review_agent from a thread follow-up message.
+        self.store.save_review_thread(
+            repository="BerriAI/litellm",
+            number=8811,
+            channel_id="333333333333333333",
+            message_id="600000000000000101",
+            thread_id="700000000000000202",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        with (
+            mock.patch.object(review_job, "acknowledge_message"),
+            mock.patch.object(review_job, "perform_review", return_value={"status": "posted"}),
+        ):
+            pr_review_agent.handle_thread_followup(
+                config,
+                self.store,
+                {
+                    "id": "600000000000000203",
+                    "channel_id": "700000000000000202",
+                    "guild_id": guild_id,
+                    "content": "@Aria review again",
+                    "author": {"id": "111", "bot": False},
+                },
+            )
+
+        # 3. support_agent from an allowlisted Discord channel message.
+        kb = _make_mock_kb(store=self.store)
+        kb.refresh()
+        support_agent.handle_routed_message(
+            config,
+            self.store,
+            "444444444444444444",
+            {
+                "id": "600000000000000304",
+                "guild_id": guild_id,
+                "content": "How do I configure router fallbacks and num_retries in LiteLLM proxy?",
+                "author": {"id": "111", "bot": False},
+            },
+            kb=kb,
+            complete=lambda _s, _u: json.dumps({
+                "action": "reply",
+                "confidence": 0.91,
+                "reply": "set `fallbacks` and `num_retries` under `router_settings`.",
+                "citations": ["https://docs.litellm.ai/docs/proxy/reliability"],
+            }),
+            poster=lambda _c, _t: {"id": "600000000000000305"},
+            route_info={"target": AGENT_SUPPORT, "reason": "support_question"},
+        )
+
+        # 4. engagement_agent scheduled role match (source.url MUST be omitted!).
+        engagement_agent.run_role_matching(
+            [],
+            config,
+            self.store,
+            members=[],
+            now=datetime(2026, 11, 28, 12, 0, tzinfo=UTC),
+            skip_github_enrichment=True,
+        )
+
+        spans = self.exporter.get_finished_spans()
+        agent_spans = [
+            s for s in spans
+            if _span_attrs(s).get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT
+        ]
+        self.assertEqual(len(agent_spans), 4)
+
+        # 1. pr_review_agent channel message
+        a_rev = _span_attrs(agent_spans[0])
+        self.assertEqual(a_rev[AGENT_SOURCE_TYPE_ATTR], "discord")
+        self.assertEqual(
+            a_rev[AGENT_SOURCE_URL_ATTR],
+            f"https://discord.com/channels/{guild_id}/333333333333333333/600000000000000101",
+        )
+        self.assertLessEqual(len(a_rev[AGENT_SOURCE_TITLE_ATTR]), 80)
+        self.assertTrue(a_rev[AGENT_SOURCE_TITLE_ATTR].startswith("Please review https://github.com/BerriAI/litellm/pull/8811"))
+        self.assertTrue(a_rev[AGENT_SOURCE_TITLE_ATTR].endswith("..."))
+
+        # 2. pr_review_agent thread follow-up
+        a_thr = _span_attrs(agent_spans[1])
+        self.assertEqual(a_thr[AGENT_SOURCE_TYPE_ATTR], "discord")
+        self.assertEqual(
+            a_thr[AGENT_SOURCE_URL_ATTR],
+            f"https://discord.com/channels/{guild_id}/700000000000000202/600000000000000203",
+        )
+        self.assertEqual(a_thr[AGENT_SOURCE_TITLE_ATTR], "@Aria review again")
+
+        # 3. support_agent question
+        a_sup = _span_attrs(agent_spans[2])
+        self.assertEqual(a_sup[AGENT_SOURCE_TYPE_ATTR], "discord")
+        self.assertEqual(
+            a_sup[AGENT_SOURCE_URL_ATTR],
+            f"https://discord.com/channels/{guild_id}/444444444444444444/600000000000000304",
+        )
+        self.assertEqual(
+            a_sup[AGENT_SOURCE_TITLE_ATTR],
+            "How do I configure router fallbacks and num_retries in LiteLLM proxy?",
+        )
+
+        # 4. engagement_agent scheduled role match (no source.url)
+        a_eng = _span_attrs(agent_spans[3])
+        self.assertEqual(a_eng[AGENT_SOURCE_TYPE_ATTR], "discord")
+        self.assertNotIn(AGENT_SOURCE_URL_ATTR, a_eng)
+        self.assertEqual(a_eng[AGENT_SOURCE_TITLE_ATTR], "Daily contributor role match")
+
+        # Child spans must not carry agent.source.* attributes.
+        child_spans = [
+            s for s in spans
+            if _span_attrs(s).get(OPENINFERENCE_SPAN_KIND_ATTR) != OPENINFERENCE_SPAN_KIND_AGENT
+        ]
+        for child in child_spans:
+            cattrs = _span_attrs(child)
+            self.assertNotIn(AGENT_SOURCE_TYPE_ATTR, cattrs)
+            self.assertNotIn(AGENT_SOURCE_URL_ATTR, cattrs)
+            self.assertNotIn(AGENT_SOURCE_TITLE_ATTR, cattrs)
+
 
 class PRReviewThreadRehydrationAndRecheckTests(unittest.TestCase):
     """Tests for post-deploy SQLite wipe resilience: review_threads rehydration

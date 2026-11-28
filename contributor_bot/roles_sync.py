@@ -871,6 +871,8 @@ def poll_merged_prs_for_roles(
                         "engagement.repository": repo,
                         "engagement.announce_enabled": bool(config.roles_announce_enabled),
                     },
+                    source_type="discord",
+                    source_title="Daily contributor role match",
                 )
             )
         window_start = moment - timedelta(days=DAILY_LOOKBACK_DAYS)
@@ -1381,6 +1383,8 @@ def run_daily_roles_if_due(
                     "engagement.repository": repo,
                     "roles.announce_enabled": bool(config.roles_announce_enabled),
                 },
+                source_type="discord",
+                source_title="Daily contributor role match",
             )
             if current_agent_name() is None
             else nullcontext()
@@ -2159,6 +2163,8 @@ def revalidate_all_grants_on_boot(
                                     session_id=f"{AGENT_ENGAGEMENT}:revalidate_grants:{repo}:{moment.date().isoformat()}",
                                     input_value={"task": "revalidate_grants", "repository": repo, "github_login": login},
                                     attributes={"engagement.task": "revalidate_grants", "engagement.repository": repo},
+                                    source_type="discord",
+                                    source_title="Contributor grants revalidation",
                                 )
                                 if current_agent_name() is None
                                 else nullcontext()

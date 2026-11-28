@@ -70,6 +70,8 @@ def run_role_matching(
         session_id=f"{AGENT_NAME}:role_matcher:{repo}:{moment.date().isoformat()}",
         input_value={"task": "role_matching", "repository": repo, "contributor_count": len(groups)},
         attributes={"engagement.task": "role_matching", "engagement.repository": repo},
+        source_type="discord",
+        source_title="Daily contributor role match",
     ) as span:
         result = match_community_contributors_with_diagnostics(groups, config, store, **kwargs)
         diagnostics = result[3]
@@ -97,6 +99,8 @@ def summarize_weekly_prs(config: Config, groups: list[dict], **kwargs) -> dict[i
         session_id=f"{AGENT_NAME}:weekly_summary:{pr_count}prs",
         input_value={"task": "weekly_summary", "pr_count": pr_count},
         attributes={"engagement.task": "weekly_summary", "weekly.pr_count": pr_count},
+        source_type="discord",
+        source_title="Weekly contributor summary",
     ) as span:
         summaries = summarize_pr_titles(config, groups, **kwargs)
         span.set_output({"summarized_count": len(summaries)})
@@ -135,6 +139,8 @@ def run_roles_backfill(config: Config, store: Store, **kwargs):
         session_id=f"{AGENT_NAME}:roles_backfill:{repo}:{moment.date().isoformat()}",
         input_value={"task": "roles_backfill", "repository": repo},
         attributes={"engagement.task": "roles_backfill", "engagement.repository": repo},
+        source_type="discord",
+        source_title="Contributor roles backfill",
     ) as span:
         result = _run_roles_backfill(config, store, **kwargs)
         span.set_output({"ran": result is not None})

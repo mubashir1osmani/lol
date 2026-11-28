@@ -38,6 +38,8 @@ from .tracing import (
     OPENINFERENCE_SPAN_KIND_CHAIN,
     agent_span,
     child_span,
+    discord_source_url,
+    truncate_source_title,
 )
 
 AGENT_NAME = AGENT_PR_REVIEW
@@ -62,6 +64,7 @@ def handle_routed_message(
 
     text = str(message.get("content") or "")
     message_id = str(message.get("id") or "")
+    guild_id = str(message.get("guild_id") or getattr(config, "discord_guild_id", None) or "")
     session_id = f"{AGENT_NAME}:{channel_id}:{message_id or 'msg'}"
     with agent_span(
         AGENT_NAME,
@@ -72,6 +75,9 @@ def handle_routed_message(
             "discord.message_id": message_id,
             "pr.repository": config.github_repository,
         },
+        source_type="discord",
+        source_url=discord_source_url(guild_id, channel_id, message_id),
+        source_title=truncate_source_title(text, fallback=f"PR review request in #{channel_id}"),
     ) as span:
         if route_info is not None:
             with child_span(
@@ -117,6 +123,8 @@ def handle_thread_followup(config: Config, store: Store, message: dict) -> None:
     numbers = [int(rec["number"]) for rec in records]
     primary = numbers[0]
     text = str(message.get("content") or "")
+    guild_id = str(message.get("guild_id") or getattr(config, "discord_guild_id", None) or "")
+    message_id = str(message.get("id") or "")
     with agent_span(
         AGENT_NAME,
         session_id=f"{AGENT_NAME}:{config.github_repository}#{primary}",
@@ -132,6 +140,9 @@ def handle_thread_followup(config: Config, store: Store, message: dict) -> None:
             "discord.thread_id": channel_id,
             "review.mode": "followup",
         },
+        source_type="discord",
+        source_url=discord_source_url(guild_id, channel_id, message_id),
+        source_title=truncate_source_title(text, fallback=f"PR #{primary} review thread"),
     ) as span:
         handle_thread_message(config, store, message)
         span.set_output({"thread_id": channel_id, "pr_numbers": numbers})

@@ -433,6 +433,8 @@ def summarize_pr_titles(
             session_id=session_id,
             input_value=items_payload,
             attributes={"weekly.pr_count": len(pulls_by_num)},
+            source_type="discord",
+            source_title="Weekly contributor summary",
         )
         if current_agent_name() is None
         else nullcontext()
@@ -1481,6 +1483,8 @@ def post_weekly_if_due(
                 session_id=f"{AGENT_ENGAGEMENT}:weekly:{repo}:{key}",
                 input_value={"task": "weekly_summary", "repository": repo, "week_key": key, "force": force},
                 attributes={"engagement.task": "weekly_summary", "engagement.repository": repo},
+                source_type="discord",
+                source_title="Weekly contributor summary",
             )
             if current_agent_name() is None
             else nullcontext()

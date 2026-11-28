@@ -195,9 +195,19 @@ def perform_review(
 ) -> dict:
     """Run one pre-review. Returns a small status dict for the caller."""
     from contextlib import nullcontext
-    from .tracing import AGENT_PR_REVIEW, agent_span, current_agent_name, current_span, log_decision
+    from .tracing import (
+        AGENT_PR_REVIEW,
+        agent_span,
+        current_agent_name,
+        current_span,
+        discord_source_url,
+        log_decision,
+    )
 
     repository = config.github_repository
+    existing_rec = store.review_thread(repository, number) if current_agent_name() is None else None
+    src_channel = channel_id or (existing_rec.get("thread_id") if existing_rec else None) or (existing_rec.get("channel_id") if existing_rec else None)
+    src_message = message_id if channel_id else (None if (existing_rec and existing_rec.get("thread_id")) else (existing_rec.get("message_id") if existing_rec else None))
     outer_cm = (
         agent_span(
             AGENT_PR_REVIEW,
@@ -214,6 +224,9 @@ def perform_review(
                 "pr.number": int(number),
                 "review.source": source,
             },
+            source_type="discord",
+            source_url=discord_source_url(getattr(config, "discord_guild_id", None), src_channel, src_message),
+            source_title=f"PR #{number} review ({source})",
         )
         if current_agent_name() is None
         else nullcontext()
@@ -684,10 +697,14 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
         agent_span,
         child_span,
         current_agent_name,
+        discord_source_url,
+        truncate_source_title,
     )
 
     text = message.get("content") or ""
     channel_id = message.get("channel_id") or message.get("id") or ""
+    guild_id = str(message.get("guild_id") or getattr(config, "discord_guild_id", None) or "")
+    msg_id = str(message.get("id") or "")
     session_id = f"{AGENT_PR_REVIEW}:classifier:{channel_id}" if channel_id else None
     outer_cm = (
         agent_span(
@@ -695,6 +712,9 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
             session_id=session_id,
             input_value=text[:800],
             attributes={"discord.channel_id": str(channel_id)},
+            source_type="discord",
+            source_url=discord_source_url(guild_id, message.get("channel_id"), msg_id),
+            source_title=truncate_source_title(text, fallback="PR review request"),
         )
         if current_agent_name() is None
         else nullcontext()

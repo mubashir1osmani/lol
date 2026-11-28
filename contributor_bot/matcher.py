@@ -3525,6 +3525,8 @@ def match_community_contributors_with_diagnostics(
             session_id=f"{AGENT_ENGAGEMENT}:role_matcher:{repo}:{moment.date().isoformat()}",
             input_value=input_payload,
             attributes=span_attrs,
+            source_type="discord",
+            source_title="Daily contributor role match",
         )
         if current_agent_name() is None
         else nullcontext()

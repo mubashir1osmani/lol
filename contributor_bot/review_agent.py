@@ -1337,12 +1337,16 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
         "discord.thread_id": str(thread_id),
         "review.mode": mode,
     }
+    from .tracing import discord_source_url
     outer_cm = (
         agent_span(
             AGENT_PR_REVIEW,
             session_id=f"{AGENT_PR_REVIEW}:{config.github_repository}#{number}",
             input_value=input_payload,
             attributes=span_attrs,
+            source_type="discord",
+            source_url=discord_source_url(getattr(config, "discord_guild_id", None), thread_id),
+            source_title=f"PR #{number} {mode}",
         )
         if current_agent_name() is None
         else nullcontext()

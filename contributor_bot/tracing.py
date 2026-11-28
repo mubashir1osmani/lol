@@ -46,6 +46,9 @@ OPENINFERENCE_INPUT_VALUE_ATTR = "input.value"
 OPENINFERENCE_INPUT_MIME_ATTR = "input.mime_type"
 OPENINFERENCE_OUTPUT_VALUE_ATTR = "output.value"
 OPENINFERENCE_OUTPUT_MIME_ATTR = "output.mime_type"
+AGENT_SOURCE_TYPE_ATTR = "agent.source.type"
+AGENT_SOURCE_URL_ATTR = "agent.source.url"
+AGENT_SOURCE_TITLE_ATTR = "agent.source.title"
 
 AGENT_PR_REVIEW = "pr_review_agent"
 AGENT_SUPPORT = "support_agent"
@@ -53,6 +56,49 @@ AGENT_ENGAGEMENT = "engagement_agent"
 TOP_LEVEL_AGENTS = frozenset({AGENT_PR_REVIEW, AGENT_SUPPORT, AGENT_ENGAGEMENT})
 
 _MAX_SPAN_VALUE_CHARS = 4000
+_MAX_SOURCE_TITLE_CHARS = 80
+
+
+def _is_snowflake(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return stripped.isdigit() and 1 <= len(stripped) <= 20 and not stripped.startswith("0")
+
+
+def discord_source_url(
+    guild_id: object,
+    channel_id: object,
+    message_id: object = None,
+) -> str:
+    """Build a Discord permalink (``https://discord.com/channels/<guild>/<channel>[/<message>]``)."""
+    gid = str(guild_id or "").strip()
+    cid = str(channel_id or "").strip()
+    if not (_is_snowflake(gid) and _is_snowflake(cid)):
+        return ""
+    mid = str(message_id or "").strip()
+    if _is_snowflake(mid):
+        return f"https://discord.com/channels/{gid}/{cid}/{mid}"
+    return f"https://discord.com/channels/{gid}/{cid}"
+
+
+def truncate_source_title(
+    text: object,
+    *,
+    fallback: str = "",
+    limit: int = _MAX_SOURCE_TITLE_CHARS,
+) -> str:
+    """Normalize and truncate triggering text to ~80 chars for ``agent.source.title``."""
+    raw = str(text or "")
+    cleaned = " ".join(raw.split()).strip()
+    if not cleaned:
+        cleaned = " ".join(str(fallback or "").split()).strip()
+    if not cleaned:
+        return ""
+    max_len = max(10, int(limit))
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3].rstrip() + "..."
 _DEFAULT_SERVICE_NAME = "aria-litellm-discord"
 _OTLP_EXPORT_TIMEOUT_SECONDS = 30
 _OTLP_BATCH_MAX_SIZE = 16
@@ -606,6 +652,9 @@ def agent_span(
     session_id: str | None = None,
     input_value: object = None,
     attributes: Mapping[str, object] | None = None,
+    source_type: str | None = "discord",
+    source_url: str | None = None,
+    source_title: str | None = None,
 ) -> Iterator[_SpanHandle]:
     """Wrap one logical bot agent run in a top-level OpenInference ``AGENT`` span.
 
@@ -641,6 +690,14 @@ def agent_span(
             span.set_attribute(OPENINFERENCE_SPAN_KIND_ATTR, OPENINFERENCE_SPAN_KIND_AGENT)
             span.set_attribute(OPENINFERENCE_AGENT_NAME_ATTR, agent_name)
             span.set_attribute(OPENINFERENCE_SESSION_ID_ATTR, sid)
+            if source_type:
+                _set_safe_attribute(span, AGENT_SOURCE_TYPE_ATTR, str(source_type).strip())
+            if source_url and str(source_url).strip().startswith("https://"):
+                _set_safe_attribute(span, AGENT_SOURCE_URL_ATTR, str(source_url).strip())
+            if source_title:
+                clean_title = truncate_source_title(source_title)
+                if clean_title:
+                    _set_safe_attribute(span, AGENT_SOURCE_TITLE_ATTR, clean_title)
             if input_value is not None:
                 handle.set_input(input_value)
             if attributes:

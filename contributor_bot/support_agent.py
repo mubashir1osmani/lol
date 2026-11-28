@@ -49,8 +49,10 @@ from .tracing import (
     agent_span,
     build_trace_metadata,
     child_span,
+    discord_source_url,
     log_decision,
     tool_span,
+    truncate_source_title,
 )
 
 AGENT_NAME = AGENT_SUPPORT
@@ -713,6 +715,8 @@ def answer_support_question(
     bypass_cooldown: bool = False,
     fetch_pages: bool = True,
     route_info: dict | None = None,
+    guild_id: str | None = None,
+    message_id: str | None = None,
 ) -> SupportOutcome:
     """Answer one LiteLLM support question inside the ``support_agent`` AGENT span."""
     safe_question = discord_safe(text or "")[:1500].strip()
@@ -720,6 +724,9 @@ def answer_support_question(
         return SupportOutcome(action="silent", reason="empty_question")
 
     session_id = f"{AGENT_NAME}:{channel_id}"
+    effective_guild_id = str(guild_id or getattr(config, "discord_guild_id", None) or "")
+    source_url = discord_source_url(effective_guild_id, channel_id, message_id)
+    source_title = truncate_source_title(safe_question, fallback="Support question")
     question_detected = bool(
         (route_info or {}).get("reason") == "support_question"
         or is_support_question(safe_question, getattr(config, "github_repository", "BerriAI/litellm"))
@@ -738,6 +745,9 @@ def answer_support_question(
                     "support.outcome": "skipped",
                     "support.skip_reason": "channel_cooldown",
                 },
+                source_type="discord",
+                source_url=source_url,
+                source_title=source_title,
             ) as span:
                 if route_info is not None:
                     with child_span(
@@ -779,6 +789,9 @@ def answer_support_question(
             "discord.channel_id": str(channel_id),
             "support.question_detected": question_detected,
         },
+        source_type="discord",
+        source_url=source_url,
+        source_title=source_title,
     ) as span:
         if route_info is not None:
             with child_span(
@@ -1095,6 +1108,8 @@ def handle_routed_message(
         complete=complete,
         poster=poster,
         route_info=route_info,
+        guild_id=str(message.get("guild_id") or getattr(config, "discord_guild_id", None) or "") or None,
+        message_id=str(message.get("id") or "") or None,
     )
 
 
