@@ -123,11 +123,8 @@ def _install_fake_litellm():
             name, arguments, content = "review_bundle", {}, None
         elif "submit_verdict" not in done:
             name, arguments, content = "submit_verdict", {
-                "summary": "smoke: gate comes from review_bundle, not from reading every file",
-                "risks": "",
-                "missing_tests": "",
-                "checklist": "",
-                "blocking_json": "[]",
+                "verdict": "looks good",
+                "findings_json": "[]",
             }, None
         else:
             name, arguments, content = None, None, "smoke review finished"

@@ -419,24 +419,31 @@ same thing from the slash-command menu inside the thread.
 ```
 contributor: can someone review https://github.com/BerriAI/litellm/pull/54722
 bot: needs work
+     - litellm/proxy/server.py:120 - stream branch returns before timeout wrapper
+     - tests/unit/proxy/test_server.py - missing unit test mocking a slow upstream
      - cursor[bot]: unresolved on litellm/proxy/server.py - timeout returns early
-     - litellm/proxy/server.py:120 - the stream path never applies the timeout
-     checklist:
-     - cover a hung upstream
 contributor: why is this a bug?
 bot: the stream branch returns before the wrapper, so a stuck upstream never gets cancelled.
 contributor: i fixed it, check again
-bot: ready for maintainer ✅
+bot: looks good
      <@contributor> <@&maintainers>
 ```
 
-The verdict is **ready for maintainer ✅** only when every configured bot has
-re-reviewed the latest commit, none of them have an unresolved current thread,
-CI is green, the pull request is mergeable and not a draft, and the agent did
-not report a blocking bug. Otherwise it is **needs work** with file and line
-items when the agent has them. Messages are split at Discord's 2000-character
-limit. The maintainer role is pinged only on a ready verdict. Make that role
-mentionable.
+Reviews are checked against `review_standards/LITELLM_STANDARDS.md` and use one
+of three verdicts:
+
+- **looks good**: posted in one line only when the diff meets the standards,
+  every configured bot has re-reviewed the latest commit with no unresolved
+  current threads, CI is green, and the PR is mergeable and not a draft.
+- **needs work**: up to 5 short `file:line` bullets for fixable issues, missing
+  tests, failing CI, draft/conflicts, or unresolved bot comments.
+- **doesn't meet our standards**: up to 5 short `file:line` bullets when the
+  code breaks core architecture or quality standards (for example wrong layer,
+  `__init__.py`/`main.py` sprawl, private third-party imports, broad silent
+  `except`, or wide unrelated churn).
+
+Messages are split at Discord's 2000-character limit. The maintainer role is
+pinged only on a **looks good** verdict. Make that role mentionable.
 
 Default bot logins, seen on recent `BerriAI/litellm` reviews such as #54722:
 
@@ -482,8 +489,8 @@ Set the provider key the model expects (`OPENAI_API_KEY`, and so on).
    Code search needs a token. Anonymous access still works for the other reads
    until the rate limit.
 5. Restart. The bot should show online. Paste a pull request URL or run
-   `/review-pr`. The thread should show `ready for maintainer ✅` or
-   `needs work`.
+   `/review-pr`. The thread should show `looks good`, `needs work`, or
+   `doesn't meet our standards`.
 6. For webhook re-checks, set `REVIEW_WEBHOOK_RECHECK=true` and
    `GITHUB_WEBHOOK_SECRET` (already required when contributor roles are on).
    On the GitHub webhook, send **Pull requests**, **Pull request reviews**,
