@@ -69,6 +69,16 @@ ROLES_BACKFILL_SLASH_COMMANDS = [
     },
 ]
 
+LINKS_BACKFILL_SLASH_COMMANDS = [
+    {
+        "name": "links-backfill",
+        "description": "Backfill PR-link posters from review threads and Discord message search",
+        "type": 1,
+        "dm_permission": False,
+        "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
+    },
+]
+
 
 def role_slash_commands(config: Config) -> list[dict]:
     """Slash commands to register when contributor roles are enabled.
@@ -194,6 +204,15 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
             app_id,
             guild=payload.get("_guild"),
             loop=payload.get("_loop"),
+        )
+    if name == "links-backfill":
+        if not is_server_moderator(payload):
+            return _ephemeral("only mods can run this")
+        return _links_backfill(
+            config,
+            store,
+            payload.get("token"),
+            app_id,
         )
     if name == "merged-this-week":
         if not is_server_moderator(payload):
@@ -361,6 +380,47 @@ def _finish_roles_backfill(
         })
     except Exception:
         logging.exception("Could not send the /roles-backfill follow-up")
+
+
+def _links_backfill(
+    config: Config,
+    store: Store,
+    interaction_token: object,
+    application_id: str,
+) -> dict:
+    if not isinstance(interaction_token, str) or not interaction_token:
+        return _ephemeral("couldn't open that reply. try /links-backfill again.")
+    threading.Thread(
+        target=_finish_links_backfill,
+        args=(config, store, interaction_token, application_id),
+        name="links-backfill",
+        daemon=True,
+    ).start()
+    return {"type": 5, "data": {"flags": _EPHEMERAL}}
+
+
+def _finish_links_backfill(
+    config: Config,
+    store: Store,
+    interaction_token: str,
+    application_id: str,
+) -> None:
+    from .links_backfill import format_links_backfill_result, run_links_backfill
+
+    try:
+        result = run_links_backfill(config, store)
+        content = format_links_backfill_result(result)
+    except Exception:
+        logging.exception("/links-backfill failed")
+        content = "pr links backfill hit an unexpected error. check logs and try again."
+    try:
+        edit_original_interaction(application_id, interaction_token, {
+            "content": content,
+            "flags": _EPHEMERAL,
+            "allowed_mentions": {"parse": []},
+        })
+    except Exception:
+        logging.exception("Could not send the /links-backfill follow-up")
 
 
 def _resolved_identity_for_discord(config: Config, store: Store, discord_id: str) -> dict | None:

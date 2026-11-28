@@ -1211,22 +1211,29 @@ class DailyRolesSchedulerTests(unittest.TestCase):
             login = url.rsplit("/", 1)[-1]
             return profiles.get(login, {})
 
-        jev_calls = []
+        llm_calls = []
 
-        def fake_jev(body_bytes):
+        def fake_llm(model, messages):
             import json as _json
-            payload = _json.loads(body_bytes.decode("utf-8"))
-            state = _json.loads(payload["state"])
-            pairs = state["candidate_pairs"]
-            jev_calls.append([(p["github"]["login"], p["discord"]["id"]) for p in pairs])
-            answers = {}
-            for p in pairs:
-                score = 0.93 if (p["github"]["login"] == "miracode" and p["discord"]["id"] == "9003") else 0.1
-                answers[p["pair"]] = {"type": "noul", "noul": score}
-            return {"model": "jev-1.14.0", "answers": answers}
+            payload = _json.loads(messages[1]["content"])
+            login = payload["github_author"]["login"]
+            cand_ids = [c["discord_id"] for c in payload["candidates"]]
+            llm_calls.append((login, cand_ids))
+            if login == "miracode" and "9003" in cand_ids:
+                return _json.dumps({
+                    "discord_id": "9003",
+                    "confidence": 0.93,
+                    "reason": "username and display name match",
+                    "evidence": ["login prefix matches username", "name matches display_name"],
+                })
+            return _json.dumps({
+                "discord_id": None,
+                "confidence": 0.1,
+                "reason": "none of these",
+                "evidence": [],
+            })
 
-        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": "jev-test-key"}, clear=False), \
-             self.assertLogs(level="INFO") as logs:
+        with self.assertLogs(level="INFO") as logs:
             matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
                 groups,
                 cfg,
@@ -1234,20 +1241,20 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 now=now,
                 members=members,
                 github_getter=fake_github_get,
-                jev_transport=fake_jev,
+                llm_complete=fake_llm,
             )
 
         self.assertEqual(skipped, 0)
         by_login = {g["login"]: g["discord_id"] for g in matched}
         self.assertEqual(by_login, {
             "gh-jsmith": "9001",    # matched recent_john uniquely in 7-day priority pool!
-            "miracode": "9003",     # matched 5-day joiner via priority-pool Jev!
+            "miracode": "9003",     # matched 5-day joiner via priority-pool list-wise LLM!
             "veteran-dev": "9005",  # fell back to full member list!
         })
         # Exact pool-size log emitted (2 joined within 7d; 15d-old & 22d-old excluded from recent pool)!
         self.assertTrue(any("match pool: recent=2 full=5" in line for line in logs.output))
-        # Jev was called ONLY ONCE (on the 7d recent pool for miracode -> 9003), NEVER on the full pool (9002 or 9004)!
-        self.assertEqual(jev_calls, [[("miracode", "9003")]])
+        # LLM was called ONLY ONCE (on the 7d recent pool for miracode -> 9003), NEVER on the full pool (9002 or 9004)!
+        self.assertEqual(llm_calls, [("miracode", ["9003"])])
 
 
 if __name__ == "__main__":

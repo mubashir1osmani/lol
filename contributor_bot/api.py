@@ -210,6 +210,7 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/channels", path)
         or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/members", path)
         or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/members/search", path)
+        or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/messages/search", path)
     ):
         return True
     # Add an existing role to a member. Creating roles, editing members, and
@@ -841,6 +842,14 @@ def fetch_merged_numbers(repository: str, start, end, token: str | None, author:
             raise TransientAPIError("GitHub search is incomplete; roundup deferred")
         if total is None:
             total = payload["total_count"]
+        if payload["total_count"] >= 1000:
+            logging.warning(
+                "GitHub merged PR search window %s..%s for %s hit %d results (>=1000 cap); splitting",
+                iso(start),
+                iso(end),
+                repository,
+                payload["total_count"],
+            )
         if payload["total_count"] > 1000:
             if (end - start).total_seconds() < 4:
                 raise RuntimeError("Too many merged PRs in a one-second search window")
@@ -1109,6 +1118,59 @@ def search_guild_members(
     if not isinstance(payload, list):
         return []
     return [item for item in payload if isinstance(item, dict)]
+
+
+def search_guild_messages(
+    guild_id: str,
+    content: str,
+    token: str,
+    *,
+    offset: int = 0,
+    max_202_retries: int = 6,
+    timeout: float = 15.0,
+    sleep_fn=time.sleep,
+) -> dict[str, Any]:
+    """Search guild messages via GET /guilds/{id}/messages/search.
+
+    Handles HTTP 202 (Discord search index still building) with retry_after
+    and bounds offset to Discord's 9975 ceiling.
+    """
+    if not is_discord_id(guild_id):
+        raise ValueError("Unexpected Discord guild ID")
+    cleaned = (content or "").strip()
+    if not cleaned:
+        raise ValueError("Search content must not be empty")
+    if not isinstance(offset, int) or offset < 0 or offset > 9975:
+        raise ValueError("Search offset must be between 0 and 9975")
+    params = urlencode({"content": cleaned, "offset": offset})
+    url = f"{DISCORD_API}/guilds/{guild_id}/messages/search?{params}"
+    for attempt in range(max(1, max_202_retries) + 1):
+        status, headers, body = _http(
+            Request(url, headers=_discord_headers(token)),
+            attempts=2,
+            timeout=timeout,
+            max_retry_delay=15.0,
+        )
+        payload = json.loads(body) if body else {}
+        if status == 202:
+            if attempt >= max_202_retries:
+                raise TransientAPIError("Discord guild search index is still building (HTTP 202)")
+            retry_after = 2.0
+            if isinstance(payload, dict) and isinstance(payload.get("retry_after"), (int, float)):
+                retry_after = max(0.0, min(float(payload["retry_after"]), 15.0))
+            elif headers is not None and headers.get("Retry-After") is not None:
+                try:
+                    retry_after = max(0.0, min(float(headers.get("Retry-After")), 15.0))
+                except (TypeError, ValueError):
+                    retry_after = 2.0
+            sleep_fn(retry_after)
+            continue
+        if status != 200:
+            raise RuntimeError(f"discord.com returned HTTP {status}")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Discord returned an unexpected guild message search response")
+        return payload
+    raise TransientAPIError("Discord guild search index did not become ready")
 
 
 def add_reaction(channel_id: str, message_id: str, emoji: str, token: str) -> None:

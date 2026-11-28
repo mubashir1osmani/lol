@@ -40,8 +40,10 @@ from .schedule import UTC, iso, parse_time
 from .store import Store
 from .weekly import (
     EXCLUDED_AUTHOR_ASSOCIATIONS,
+    WeeklyFetchError,
     _bot_login,
     _org_staff_login,
+    _search_merged_pages,
     fetch_org_public_members,
 )
 
@@ -333,6 +335,7 @@ def _match_authors(
     rest_fetcher=None,
     rest_searcher=None,
     deadline: float | None = None,
+    org_members: frozenset[str] = frozenset(),
 ) -> tuple[dict[int, str], int, int]:
     """Resolve ``[{"user_id": int, "login": str, "pulls": [...]}]`` to ``(resolved, matched_count, enrichment_deferred)``.
 
@@ -377,6 +380,7 @@ def _match_authors(
         rest_fetcher=rest_fetcher,
         rest_searcher=rest_searcher,
         deadline=deadline,
+        org_members=org_members,
     )
     for group in matched_groups:
         uid = group.get("user_id")
@@ -473,6 +477,31 @@ def _grant_roles_for_stored_matches(
     return roles_granted, rate_limited
 
 
+def _search_merged_numbers_per_day(
+    repository: str,
+    start: datetime,
+    end: datetime,
+    token: str | None,
+) -> set[int]:
+    """Discover merged PR numbers across per-day ``merged:D..D`` windows (cap 10 pages/day)."""
+    try:
+        rows, rate_limited = _search_merged_pages(
+            repository,
+            start,
+            token,
+            until=end,
+            pace=True,
+            max_pages=10,
+        )
+    except WeeklyFetchError as error:
+        if error.rate_limited:
+            raise TransientAPIError(str(error), retry_after=error.retry_after) from error
+        raise RuntimeError(str(error)) from error
+    if rate_limited:
+        raise TransientAPIError("GitHub search rate limit hit during per-day merged PR fetch")
+    return {int(row["number"]) for row in rows if isinstance(row.get("number"), int)}
+
+
 def poll_merged_prs_for_roles(
     config: Config,
     store: Store,
@@ -509,7 +538,7 @@ def poll_merged_prs_for_roles(
     repo = config.github_repository
     org = repo.split("/", 1)[0] if "/" in repo else ""
     token = config.effective_github_token
-    search_fn = search_merged_fn or fetch_merged_numbers
+    search_fn = search_merged_fn or _search_merged_numbers_per_day
     try:
         window_start = moment - timedelta(days=DAILY_LOOKBACK_DAYS)
         window_start_iso = iso(window_start)
@@ -648,6 +677,7 @@ def poll_merged_prs_for_roles(
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
             deadline=deadline,
+            org_members=org_members,
         )
 
         roles_granted = stored_roles_granted
@@ -1142,6 +1172,7 @@ def run_roles_backfill(
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
             deadline=deadline,
+            org_members=org_members,
         )
         if enrichment_deferred > 0:
             timed_out = True

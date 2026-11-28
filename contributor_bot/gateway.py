@@ -16,6 +16,7 @@ import threading
 
 from .config import Config
 from .interactions import (
+    LINKS_BACKFILL_SLASH_COMMANDS,
     MERGED_SLASH_COMMANDS,
     PR_BOARD_SLASH_COMMANDS,
     REVIEW_SLASH_COMMANDS,
@@ -23,6 +24,7 @@ from .interactions import (
     handle_interaction,
     role_slash_commands,
 )
+from .links_backfill import record_pr_links_from_message
 from .matcher import record_recent_poster
 from .review_job import handle_channel_message, handle_thread_message
 from .store import Store
@@ -203,6 +205,22 @@ class Gateway:
             record_recent_poster(str(message.guild.id), str(message.author.id))
             if store is None:
                 return
+            try:
+                raw_embeds = [
+                    {"url": getattr(embed, "url", "") or ""}
+                    for embed in (getattr(message, "embeds", None) or ())
+                ]
+                record_pr_links_from_message(
+                    store,
+                    config.github_repository,
+                    discord_id=str(message.author.id),
+                    message_id=str(message.id),
+                    content=getattr(message, "content", "") or "",
+                    ts=getattr(message, "created_at", None),
+                    embeds=raw_embeds,
+                )
+            except Exception:
+                logging.exception("Could not record PR link poster from message")
             try:
                 payload = _message_payload(message, loop=self.loop)
             except Exception:
@@ -474,6 +492,8 @@ def commands_for_guild(config: Config) -> list[dict]:
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
         commands.extend(MERGED_SLASH_COMMANDS)
+    if (config.contributor_roles_enabled or config.merged_weekly_enabled) and config.discord_guild_id:
+        commands.extend(LINKS_BACKFILL_SLASH_COMMANDS)
     if config.pr_board_enabled and config.discord_guild_id:
         commands.extend(PR_BOARD_SLASH_COMMANDS)
     return commands
@@ -648,6 +668,7 @@ _DEFERRED_COMMAND_EPHEMERAL = {
     "merged-this-week": True,
     "my-prs": True,
     "roles-backfill": True,
+    "links-backfill": True,
 }
 
 
@@ -753,6 +774,14 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
 
         restricted = app.default_permissions(manage_messages=True)(merged_this_week)
         add(spec, restricted)
+    if (config.contributor_roles_enabled or config.merged_weekly_enabled) and config.discord_guild_id:
+        spec = LINKS_BACKFILL_SLASH_COMMANDS[0]
+
+        async def links_backfill(interaction):
+            await _dispatch_command(discord, interaction, config, store, client=client)
+
+        restricted_links = app.default_permissions(manage_messages=True)(links_backfill)
+        add(spec, restricted_links)
     if config.pr_board_enabled and config.discord_guild_id:
         spec = PR_BOARD_SLASH_COMMANDS[0]
 
