@@ -898,14 +898,27 @@ def fetch_author_merged_count(
     return int(payload["total_count"])
 
 
-def fetch_recent_messages(channel_id: str, token: str, limit: int = 20) -> list[dict[str, Any]]:
+def fetch_recent_messages(
+    channel_id: str,
+    token: str,
+    limit: int = 20,
+    *,
+    timeout: float = 15.0,
+    attempts: int = 2,
+    max_retry_delay: float = 10.0,
+) -> list[dict[str, Any]]:
     """Newest messages in a channel or thread. One page, no history backfill."""
-    if not is_discord_id(channel_id) or not 1 <= limit <= 50:
+    if not is_discord_id(channel_id) or not 1 <= limit <= 100:
         raise ValueError("Unexpected Discord channel id")
-    messages = _request_json(Request(
-        f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}",
-        headers=_discord_headers(token),
-    ))
+    messages = _request_json(
+        Request(
+            f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}",
+            headers=_discord_headers(token),
+        ),
+        attempts=attempts,
+        timeout=timeout,
+        max_retry_delay=max_retry_delay,
+    )
     if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
         raise RuntimeError("Discord returned an unexpected messages response")
     return messages

@@ -305,7 +305,7 @@ def _start_weekly_task(discord, client, config, store):
     if store is None or not config.merged_weekly_enabled:
         return None
     from discord.ext import tasks
-    from .weekly import post_weekly_if_due, weekly_schedule_status
+    from .weekly import log_weekly_boot_status, post_weekly_if_due
 
     @tasks.loop(seconds=60)
     async def merged_weekly_post():
@@ -324,10 +324,13 @@ def _start_weekly_task(discord, client, config, store):
     @merged_weekly_post.before_loop
     async def wait_until_ready():
         await client.wait_until_ready()
-        logging.info(
-            "Weekly contributor summary scheduler active: %s",
-            weekly_schedule_status(config, store),
-        )
+        guild = None
+        if config.discord_guild_id and hasattr(client, "get_guild"):
+            try:
+                guild = client.get_guild(int(config.discord_guild_id))
+            except (TypeError, ValueError):
+                guild = None
+        await asyncio.to_thread(log_weekly_boot_status, config, store, guild=guild)
 
     @merged_weekly_post.error
     async def on_weekly_error(error):

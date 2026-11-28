@@ -1,5 +1,6 @@
 """Friday summary of community pull requests merged since the previous Friday post."""
 
+import base64
 import json
 import logging
 import os
@@ -12,7 +13,15 @@ from pathlib import Path
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from .api import GITHUB_API, TransientAPIError, fetch_guild_channels, github_get_json, post_message
+from .api import (
+    GITHUB_API,
+    TransientAPIError,
+    fetch_guild_channels,
+    fetch_recent_messages,
+    github_get_json,
+    post_message,
+)
+from .api import fetch_recent_messages as _real_fetch_recent_messages
 from .api import github_get_json as _real_github_get_json
 from .config import is_discord_id
 from .matcher import MatchDetail, MatchDiagnostics, match_community_contributors_with_diagnostics
@@ -28,6 +37,7 @@ _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "satur
 WEEKLY_CHUNK_LIMIT = 1900
 SUPPRESS_EMBEDS_FLAG = 1 << 2  # Discord message flag: SUPPRESS_EMBEDS (4)
 WEEKLY_HEADER = "thank you to this week's contributors 🙏"
+_WEEKLY_HEADER_PREFIX = "thank you to this week's contributors"
 DEFAULT_WEEKLY_CHANNEL_NAME = "announcements"
 _POSTABLE_CHANNEL_TYPES = frozenset({0, 5})  # GUILD_TEXT, GUILD_ANNOUNCEMENT
 WEEKLY_LOOKBACK_MAX_DAYS = 14
@@ -968,8 +978,181 @@ def _merged_week_info(store, repository: str, key: str) -> dict | None:
     if hasattr(store, "merged_week_info"):
         return store.merged_week_info(repository, key)
     if store.merged_week_posted(repository, key):
-        return {"week_key": key, "posted_at": None}
+        return {"week_key": key, "posted_at": None, "via": "scheduler"}
     return None
+
+
+def _bot_user_id_from_token(token: str | None) -> str | None:
+    """Decode the bot's own Discord user ID from a standard 3-segment Discord bot token."""
+    raw = (token or "").strip()
+    parts = raw.split(".")
+    if len(parts) != 3 or not parts[0]:
+        return None
+    segment = parts[0]
+    padded = segment + "=" * (-len(segment) % 4)
+    try:
+        decoded = base64.b64decode(padded, validate=False).decode("ascii", errors="strict").strip()
+    except Exception:
+        return None
+    return decoded if is_discord_id(decoded) else None
+
+
+def _resolve_bot_user_id(config, guild=None) -> str | None:
+    me = getattr(guild, "me", None) if guild is not None else None
+    me_id = getattr(me, "id", None) if me is not None else None
+    if me_id is not None and is_discord_id(str(me_id)):
+        return str(me_id)
+    app_id = getattr(config, "discord_application_id", None)
+    if app_id and is_discord_id(str(app_id)):
+        return str(app_id)
+    return _bot_user_id_from_token(getattr(config, "discord_token", None))
+
+
+def _is_weekly_summary_message(
+    message: object,
+    target_week_key: str,
+    timezone_name: str,
+    *,
+    bot_user_id: str | None = None,
+) -> str | None:
+    """Return UTC ISO timestamp if ``message`` is our bot's weekly summary for ``target_week_key``."""
+    if not isinstance(message, dict) or message.get("webhook_id"):
+        return None
+    author = message.get("author")
+    if not isinstance(author, dict) or author.get("bot") is not True:
+        return None
+    if bot_user_id and str(author.get("id") or "") != bot_user_id:
+        return None
+    content = str(message.get("content") or "")
+    first_line = ""
+    for line in content.splitlines():
+        cleaned = line.strip().lstrip("*#> ").strip()
+        if cleaned:
+            first_line = cleaned.lower()
+            break
+    if not first_line.startswith(_WEEKLY_HEADER_PREFIX):
+        return None
+    raw_ts = message.get("timestamp")
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return None
+    try:
+        parsed = parse_time(raw_ts)
+        local = parsed.astimezone(ZoneInfo(timezone_name))
+    except Exception:
+        return None
+    if week_key(local) != target_week_key:
+        return None
+    return iso(parsed)
+
+
+def reconcile_weekly_from_channel(
+    config,
+    store,
+    now: datetime | None = None,
+    *,
+    guild=None,
+    channels_fetcher=None,
+    messages_fetcher=None,
+    limit: int = 50,
+) -> dict | None:
+    """Self-heal ``merged_weeks`` by scanning recent #announcements history for this week's bot post.
+
+    Returns the existing or newly healed ``{"week_key", "posted_at", "via"}`` row if the
+    current ISO week has already been posted publicly, else ``None``.
+    """
+    if store is None or not config.merged_weekly_enabled:
+        return None
+    moment = now or datetime.now(UTC)
+    local = moment.astimezone(ZoneInfo(config.merged_timezone))
+    key = week_key(local)
+    repo = config.github_repository
+
+    existing = _merged_week_info(store, repo, key)
+    if existing is not None:
+        return existing
+
+    channel = resolve_weekly_channel_id(config, guild=guild, channels_fetcher=channels_fetcher)
+    if not channel or not getattr(config, "discord_token", None):
+        return None
+
+    try:
+        if messages_fetcher is not None:
+            messages = messages_fetcher(channel, config.discord_token, limit=limit)
+        elif fetch_recent_messages is _real_fetch_recent_messages:
+            messages = fetch_recent_messages(
+                channel,
+                config.discord_token,
+                limit=limit,
+                timeout=10.0,
+                attempts=1,
+                max_retry_delay=2.0,
+            )
+        else:
+            messages = fetch_recent_messages(channel, config.discord_token, limit=limit)
+    except Exception as error:
+        logging.warning(
+            "Could not scan channel %s history for existing %s weekly summary: %s",
+            channel,
+            key,
+            error,
+        )
+        return None
+
+    bot_user_id = _resolve_bot_user_id(config, guild=guild)
+    for message in messages or ():
+        found_ts = _is_weekly_summary_message(
+            message,
+            key,
+            config.merged_timezone,
+            bot_user_id=bot_user_id,
+        )
+        if found_ts is None:
+            continue
+        store.mark_merged_week(repo, key, found_ts, via="channel_self_heal")
+        msg_id = str(message.get("id") or "unknown")
+        logging.info(
+            "Self-healed merged_weeks for %s %s from existing bot message %s in channel %s (posted_at=%s)",
+            repo,
+            key,
+            msg_id,
+            channel,
+            found_ts,
+        )
+        return _merged_week_info(store, repo, key) or {
+            "week_key": key,
+            "posted_at": found_ts,
+            "via": "channel_self_heal",
+        }
+    return None
+
+
+def log_weekly_boot_status(
+    config,
+    store,
+    now: datetime | None = None,
+    *,
+    guild=None,
+    channels_fetcher=None,
+    messages_fetcher=None,
+) -> dict | None:
+    """Reconcile #announcements history on boot and log clear weekly scheduler status."""
+    info = reconcile_weekly_from_channel(
+        config,
+        store,
+        now,
+        guild=guild,
+        channels_fetcher=channels_fetcher,
+        messages_fetcher=messages_fetcher,
+    )
+    if info is not None:
+        logging.info(
+            "Weekly merge summary %s already posted at %s via %s; skipping",
+            info["week_key"],
+            info.get("posted_at") or "unknown time",
+            info.get("via") or "scheduler",
+        )
+    logging.info("Weekly contributor summary: %s", weekly_schedule_status(config, store, now))
+    return info
 
 
 def _store_db_label(store) -> str:
@@ -1011,7 +1194,8 @@ def weekly_schedule_status(config, store, now: datetime | None = None) -> str:
         state = "disabled"
     elif info is not None:
         posted_at = info.get("posted_at") or "unknown time"
-        state = f"already posted at {posted_at}"
+        via = info.get("via") or "scheduler"
+        state = f"already posted at {posted_at} via {via}"
     elif weekly_is_due(moment, config.merged_weekday, config.merged_time, config.merged_timezone, None):
         state = "due now (will catch up)"
     else:
@@ -1032,7 +1216,9 @@ def post_weekly_if_due(
     guild=None,
     loop=None,
     channels_fetcher=None,
+    messages_fetcher=None,
     force: bool = False,
+    via: str | None = None,
     clock=time.monotonic,
 ) -> str | None:
     """Post this week's summary once on the configured weekday at or after the configured time.
@@ -1040,8 +1226,9 @@ def post_weekly_if_due(
     Safe across restarts and concurrent scheduler ticks:
     - Protected by a process-wide lock so gateway and fallback watchdogs cannot double-post.
     - Before the scheduled time (or on other weekdays): logs a clear INFO skip reason once and returns None.
-    - At or after the scheduled time on the target weekday: catches up automatically if not yet posted
-      for that ISO week, posts once, and persists ``week_key`` in SQLite.
+    - At or after the scheduled time on the target weekday: checks both SQLite ``merged_weeks`` and
+      recent #announcements channel history (self-healing SQLite if a bot post already exists), and
+      catches up only when neither has a record for that ISO week.
     - Never marks ``merged_weeks`` when 0 contributors matched or when an error occurs, so transient
       blips cannot silently poison the rest of the week.
     """
@@ -1062,13 +1249,15 @@ def post_weekly_if_due(
             posted_info = _merged_week_info(store, repo, key)
             if posted_info is not None:
                 posted_at = posted_info.get("posted_at") or "unknown time"
+                posted_via = posted_info.get("via") or "scheduler"
                 _log_weekly_skip(
                     repo,
                     key,
                     "already_posted",
-                    "Weekly merge summary skipped for %s: already posted at %s",
+                    "Weekly merge summary %s already posted at %s via %s; skipping",
                     key,
                     posted_at,
+                    posted_via,
                 )
                 return None
             if local.weekday() != config.merged_weekday:
@@ -1103,6 +1292,33 @@ def post_weekly_if_due(
                 moment, config.merged_weekday, config.merged_time, config.merged_timezone, None,
             ):
                 return None
+            # Before catching up, check #announcements channel history for an existing
+            # bot post from this ISO week (self-heals SQLite across ephemeral deploys).
+            should_scan_channel = (
+                messages_fetcher is not None
+                or post is None
+                or fetch_recent_messages is not _real_fetch_recent_messages
+            )
+            if should_scan_channel:
+                healed = reconcile_weekly_from_channel(
+                    config,
+                    store,
+                    moment,
+                    guild=guild,
+                    channels_fetcher=channels_fetcher,
+                    messages_fetcher=messages_fetcher,
+                )
+                if healed is not None:
+                    _log_weekly_skip(
+                        repo,
+                        key,
+                        "already_posted",
+                        "Weekly merge summary %s already posted at %s via %s; skipping",
+                        key,
+                        healed.get("posted_at") or "unknown time",
+                        healed.get("via") or "channel_self_heal",
+                    )
+                    return None
             retry_key = (repo.lower(), key)
             with _weekly_state_lock:
                 retry_deadline = _weekly_retry_after.get(retry_key, 0.0)
@@ -1184,6 +1400,7 @@ def post_weekly_if_due(
             _weekly_retry_after.pop((repo.lower(), key), None)
 
         sender = post or post_message
+        mark_via = via or ("cli" if force else "scheduler")
         recorded = False
         try:
             for chunk in report.chunks:
@@ -1195,15 +1412,16 @@ def post_weekly_if_due(
                 })
                 if not recorded:
                     recorded = True
-                    if not store.mark_merged_week(repo, key, iso(moment)):
+                    if not store.mark_merged_week(repo, key, iso(moment), via=mark_via):
                         logging.info("Weekly merge summary for %s was already recorded in SQLite", key)
         except Exception:
             logging.exception("Weekly merge summary failed while posting to channel %s for %s", channel, key)
             raise
         logging.info(
-            "Posted weekly merge summary for %s to channel %s (%d contributors, %d chunks)",
+            "Posted weekly merge summary for %s to channel %s via %s (%d contributors, %d chunks)",
             key,
             channel,
+            mark_via,
             report.matched_count,
             len(report.chunks),
         )

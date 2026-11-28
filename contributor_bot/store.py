@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS author_merged_counts (
     fetched_at TEXT NOT NULL,
     PRIMARY KEY (repository, github_login)
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
 """
 
 
@@ -191,24 +196,38 @@ class Store:
             mw_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(merged_weeks)")}
             if mw_columns and "via" not in mw_columns:
                 self._conn.execute("ALTER TABLE merged_weeks ADD COLUMN via TEXT NOT NULL DEFAULT 'scheduler'")
-            # One-time recovery for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
-            bad_rows = self._conn.execute(
-                "SELECT repository, week_key, posted_at FROM merged_weeks "
-                "WHERE week_key = '2026-W48' AND (posted_at LIKE '2026-11-27T20:34:06%' OR via = 'manual_preview')",
-            ).fetchall()
-            if bad_rows:
-                self._conn.execute(
-                    "DELETE FROM merged_weeks "
-                    "WHERE week_key = '2026-W48' AND (posted_at LIKE '2026-11-27T20:34:06%' OR via = 'manual_preview')",
-                )
-                for row in bad_rows:
-                    logging.info(
-                        "Cleared bogus ephemeral-preview merged_weeks entry for %s %s (posted_at=%s) "
-                        "so scheduled post can run",
-                        row["repository"],
-                        row["week_key"],
-                        row["posted_at"],
+            # One-time migration for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
+            # Guarded by schema_migrations so it runs at most once and never touches legitimate public posts.
+            migration_name = "clear_bogus_2026_w48_preview_v1"
+            already_migrated = self._conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (migration_name,),
+            ).fetchone()
+            if already_migrated is None:
+                bad_rows = self._conn.execute(
+                    "SELECT repository, week_key, posted_at, via FROM merged_weeks "
+                    "WHERE week_key = '2026-W48' "
+                    "AND (posted_at LIKE '2026-11-27T20:34:06%' OR via IN ('preview', 'manual_preview'))",
+                ).fetchall()
+                if bad_rows:
+                    self._conn.execute(
+                        "DELETE FROM merged_weeks "
+                        "WHERE week_key = '2026-W48' "
+                        "AND (posted_at LIKE '2026-11-27T20:34:06%' OR via IN ('preview', 'manual_preview'))",
                     )
+                    for row in bad_rows:
+                        logging.info(
+                            "Cleared bogus ephemeral-preview merged_weeks entry for %s %s "
+                            "(posted_at=%s, via=%s) so scheduled post can run",
+                            row["repository"],
+                            row["week_key"],
+                            row["posted_at"],
+                            row["via"],
+                        )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, datetime('now'))",
+                    (migration_name,),
+                )
             self._conn.commit()
         if path != ":memory:":
             os.chmod(path, 0o600)
@@ -696,7 +715,13 @@ class Store:
         """Return ``{"week_key", "posted_at", "via"}`` if this week was already recorded."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT week_key, posted_at, via FROM merged_weeks WHERE repository = ? AND week_key = ?",
+                """
+                SELECT week_key, posted_at, via
+                FROM merged_weeks
+                WHERE lower(repository) = lower(?) AND week_key = ?
+                ORDER BY posted_at DESC
+                LIMIT 1
+                """,
                 (repository, week_key),
             ).fetchone()
         return dict(row) if row else None
@@ -705,7 +730,7 @@ class Store:
         """Delete a recorded week entry so a forced manual catch-up can repost cleanly."""
         with self._lock:
             cursor = self._conn.execute(
-                "DELETE FROM merged_weeks WHERE repository = ? AND week_key = ?",
+                "DELETE FROM merged_weeks WHERE lower(repository) = lower(?) AND week_key = ?",
                 (repository, week_key),
             )
             self._conn.commit()
@@ -718,7 +743,7 @@ class Store:
                 """
                 SELECT week_key, posted_at, via
                 FROM merged_weeks
-                WHERE repository = ?
+                WHERE lower(repository) = lower(?)
                 ORDER BY posted_at DESC
                 LIMIT 1
                 """,
@@ -736,6 +761,12 @@ class Store:
     ) -> bool:
         """Return False when this week was already recorded."""
         with self._lock:
+            existing = self._conn.execute(
+                "SELECT 1 FROM merged_weeks WHERE lower(repository) = lower(?) AND week_key = ?",
+                (repository, week_key),
+            ).fetchone()
+            if existing is not None:
+                return False
             cursor = self._conn.execute(
                 """
                 INSERT INTO merged_weeks (repository, week_key, posted_at, via)
