@@ -1,38 +1,59 @@
-previews:
-  generation: 'off'
-
-services:
-  - type: web
-    # One process. Do not add a second bot during a sync.
-    name: litellm-discord
-    runtime: python
-    branch: main
-    autoDeployTrigger: 'off'
-    healthCheckPath: /health
-    # discord.py (gateway presence) and litellm (review agent, off until enabled).
-    buildCommand: pip install -r requirements.txt
-    startCommand: python3 bot.py
-    # Keeps contributor IDs, PR history, and pending announcements on redeploy.
-    disk:
-      name: bot-state
-      mountPath: /opt/render/project/src/.data
-      sizeGB: 1
-    envVars:
-      - key: DISCORD_BOT_TOKEN
-        sync: false
-      - key: OSS_CONTRIBUTIONS_CHANNEL_ID
-        sync: false
-      - key: ANNOUNCEMENTS_CHANNEL_ID
-        sync: false
-      # No GitHub or Render credentials: public PRs can be read anonymously.
-      - key: POLL_INTERVAL_MINUTES
-        value: "5"
-      # Weekly Friday 10:00 AM America/Toronto summary posts to ANNOUNCEMENTS_CHANNEL_ID.
-      - key: MERGED_WEEKLY_ENABLED
-        value: "true"
-      - key: MERGED_POST_WEEKDAY
-        value: friday
-      - key: MERGED_POST_TIME
-        value: "10:00"
-      - key: MERGED_POST_TIMEZONE
-        value: America/Toronto
+projects:
+  - name: aria-litellm-discord
+    environments:
+      - name: production
+        services:
+          - type: pserv
+            name: lens-clickhouse
+            runtime: docker
+            repo: https://github.com/BerriAI/lens
+            dockerfilePath: ./deploy/render/clickhouse.Dockerfile
+            dockerContext: .
+            plan: standard
+            disk:
+              name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+              sizeGB: 10
+            envVars:
+              - key: CLICKHOUSE_USER
+                value: lens
+              - key: CLICKHOUSE_DB
+                value: lens
+              - key: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+                value: "1"
+              - key: CLICKHOUSE_PASSWORD
+                generateValue: true
+          - type: web
+            name: lens
+            runtime: image
+            image:
+              url: ghcr.io/berriai/lens:0.6.0
+            plan: standard
+            healthCheckPath: /health/ready
+            envVars:
+              - key: PORT
+                value: "4318"
+              - key: LENS_MODE
+                value: standalone
+              - key: LENS_PUBLIC_URL
+                sync: false
+              - key: LENS_SIGN_IN_LINK
+                value: "false"
+              - key: LENS_ADMIN_TOKEN
+                generateValue: true
+              - key: CLICKHOUSE_HOST
+                fromService:
+                  type: pserv
+                  name: lens-clickhouse
+                  property: host
+              - key: CLICKHOUSE_USER
+                value: lens
+              - key: CLICKHOUSE_DATABASE
+                value: lens
+              - key: CLICKHOUSE_PASSWORD
+                fromService:
+                  type: pserv
+                  name: lens-clickhouse
+                  envVarKey: CLICKHOUSE_PASSWORD
+              - key: AGENT_TRACING_RETENTION_DAYS
+                value: "14"

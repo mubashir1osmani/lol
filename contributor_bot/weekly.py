@@ -421,7 +421,12 @@ def summarize_pr_titles(
             raw = summarizer(model, messages)
         else:
             from .review_llm import complete_litellm
-            raw = complete_litellm(model, messages, timeout=llm_timeout)
+            from .tracing import build_trace_metadata
+            metadata = build_trace_metadata(
+                "weekly_summary",
+                session_id=f"weekly_summary:{len(pulls_by_num)}prs",
+            )
+            raw = complete_litellm(model, messages, timeout=llm_timeout, metadata=metadata)
         start = raw.find("{")
         end = raw.rfind("}")
         parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}

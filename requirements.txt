@@ -1,8 +1,12 @@
 # discord.py keeps the bot online (gateway) and receives messages and slash commands.
 # The review agent uses the OpenAI Agents SDK with LiteLLM underneath, so
 # REVIEW_MODEL can be anthropic/claude-sonnet-4-5 with that provider's key.
-# litellm is also imported for message classification. CI allows these lines
-# and still rejects anything else.
+# litellm is also imported for message classification, contributor matching, and
+# optional OpenTelemetry tracing (via opentelemetry-*) to LiteLLM Lens.
+# CI allows these lines and still rejects anything else.
 discord.py==2.7.1
 litellm==1.111.0
 openai-agents[litellm]==0.26.0
+opentelemetry-api==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp==1.45.2

@@ -220,10 +220,15 @@ def _haiku_decision(config, text: str, complete=None) -> Decision:
     if complete is None:
         try:
             from .review_llm import complete_litellm
-            raw = complete_litellm(model, [
-                {"role": "system", "content": "Reply with JSON only: {\"reply\": true|false, \"route\": \"simple_qa|pr_review|bug_report|maintainer_only\", \"reason\": \"short\"}"},
-                {"role": "user", "content": (text or "")[:800]},
-            ])
+            from .tracing import build_trace_metadata
+            raw = complete_litellm(
+                model,
+                [
+                    {"role": "system", "content": "Reply with JSON only: {\"reply\": true|false, \"route\": \"simple_qa|pr_review|bug_report|maintainer_only\", \"reason\": \"short\"}"},
+                    {"role": "user", "content": (text or "")[:800]},
+                ],
+                metadata=build_trace_metadata("message_router"),
+            )
         except Exception as error:
             logging.warning("Haiku decision fallback failed: %s", error)
             return Decision(False, "maintainer_only", "COMPLEX", "classifier unavailable", "", "haiku")
@@ -261,6 +266,8 @@ def routing_config(plugin=None) -> dict:
 def build_router(config):
     """The documented Autorouter. ``fast`` is Haiku. ``capable`` is REVIEW_MODEL."""
     import litellm
+    from .tracing import configure_litellm_tracing
+    configure_litellm_tracing()
     capable = config.review_model or "anthropic/claude-sonnet-4-5"
     fast = getattr(config, "fast_model", None) or FAST_MODEL
     return litellm.Router(
@@ -282,11 +289,13 @@ def capable_model(config) -> str:
     return config.review_model or "anthropic/claude-sonnet-4-5"
 
 
-def complete_auto(config, messages: list, *, session_id: str, tier: str) -> str:
+def complete_auto(config, messages: list, *, session_id: str, tier: str, agent: str = "auto_router") -> str:
     """One Autorouter completion. The classifier reads ``tier`` and does not call Jev."""
     import asyncio
+    from .tracing import build_trace_metadata
     router = build_router(config)
-    metadata = {"session_id": str(session_id), "decision_tier": tier}
+    metadata = build_trace_metadata(agent, session_id=str(session_id), extra={"decision_tier": tier})
+    metadata["decision_tier"] = tier
 
     async def call():
         return await router.acompletion(model="auto", messages=messages, metadata=metadata)

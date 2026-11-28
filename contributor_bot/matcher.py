@@ -2541,7 +2541,13 @@ def _select_with_llm(
         raw = llm_complete(model, messages)
     else:
         from .review_llm import complete_litellm
-        raw = complete_litellm(model, messages, timeout=timeout)
+        from .tracing import build_trace_metadata
+        metadata = build_trace_metadata(
+            "role_matcher",
+            session_id=f"role_matcher:{profile.login}",
+            extra={"github_login": profile.login},
+        )
+        raw = complete_litellm(model, messages, timeout=timeout, metadata=metadata)
 
     parsed: dict = {}
     if isinstance(raw, dict):

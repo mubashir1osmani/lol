@@ -72,7 +72,7 @@ Use the existing **litellm-discord Background Worker**, one instance:
 
 - **Build Command:** `python3 -I -m compileall -q bot.py contributor_bot`
 - **Start Command:** `python3 bot.py`
-- **Persistent disk:** `/opt/render/project/src/.data` (1 GB in `render.yaml`).
+- **Persistent disk:** `/opt/render/project/src/.data` (1 GB; configured directly on the worker — `render.yaml` only manages LiteLLM Lens).
 - Keep **Auto-Deploy**, **PR Previews**, and Blueprint **Auto Sync** off.
 
 | Environment variable | Value / purpose |
@@ -543,6 +543,41 @@ last-set status in SQLite (`ROLES_DB_PATH`) so repeat runs make zero mutations
 for unchanged PRs, and updates `Status` when a PR changes state. Moderators can
 run `/pr-board` in Discord for an ephemeral reply with the board link and PR
 counts per status.
+
+## LiteLLM Lens tracing (OpenTelemetry)
+
+The repo root includes a Render Blueprint (`render.yaml`) that deploys
+[LiteLLM Lens](https://github.com/BerriAI/lens) in `standalone` mode (`lens`
+web service on port `4318` + `lens-clickhouse` private service) inside the
+`aria-litellm-discord` project (`production` environment). `render.yaml`
+**only** declares Lens resources and does **not** define the existing `lol`
+background worker, so syncing the Blueprint never modifies the bot service.
+
+On the bot worker, tracing via LiteLLM's built-in OpenTelemetry callback stays
+**off** (no-op) until `OTEL_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) is
+set. When set, the bot registers `"otel"` in `litellm.callbacks` at startup
+before any completion call, and tags each call with feature/agent metadata
+(`role_matcher`, `pr_review`, `pr_review_classifier`, `message_router`,
+`weekly_summary`, `discord_qa`) and a `session_id` so Lens can group traces.
+
+### Bot environment variables (`litellm==1.111.0`)
+
+`litellm`'s `OpenTelemetryConfig.from_env()` reads the following variables
+(`OTEL_EXPORTER_OTLP_*` aliases take precedence if both are set):
+
+| Environment variable | Value / notes |
+| --- | --- |
+| `OTEL_EXPORTER` | `otlp_http` (alias: `OTEL_EXPORTER_OTLP_PROTOCOL`). LiteLLM also auto-selects `otlp_http` when an endpoint is set and exporter defaults to `console`. |
+| `OTEL_ENDPOINT` | `https://<lens-host>/v1/traces` (alias: `OTEL_EXPORTER_OTLP_ENDPOINT`). Leaving both unset keeps tracing completely off. |
+| `OTEL_HEADERS` | `Authorization=Bearer <tracing-key>` (alias: `OTEL_EXPORTER_OTLP_HEADERS`). |
+| `OTEL_SERVICE_NAME` | `litellm-contributor-bot` (optional; defaults to `litellm`). |
+
+**Important header formatting note (`litellm==1.111.0`):** `OpenTelemetry._get_headers_dictionary()`
+splits `OTEL_HEADERS` on `,` and then on the first `=` **without** URL-decoding
+or stripping whitespace. Set the value literally as
+`Authorization=Bearer <tracing-key>` (using `=` and a literal space; do **not**
+use `Authorization: Bearer ...` and do **not** percent-encode the space as
+`%20`).
 
 ## Checks
 
