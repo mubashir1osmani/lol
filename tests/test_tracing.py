@@ -22,12 +22,17 @@ from contributor_bot.review_llm import complete_litellm
 from contributor_bot.routing import decide, reset_decision_cache
 from contributor_bot.schedule import UTC
 from contributor_bot.tracing import (
+    AGENT_ENGAGEMENT,
+    AGENT_PR_REVIEW,
+    AGENT_SUPPORT,
     OPENINFERENCE_AGENT_NAME_ATTR,
     OPENINFERENCE_INPUT_VALUE_ATTR,
     OPENINFERENCE_OUTPUT_VALUE_ATTR,
     OPENINFERENCE_SESSION_ID_ATTR,
     OPENINFERENCE_SPAN_KIND_AGENT,
     OPENINFERENCE_SPAN_KIND_ATTR,
+    OPENINFERENCE_SPAN_KIND_CHAIN,
+    TOP_LEVEL_AGENTS,
     _reset_tracing_state,
     agent_span,
     build_sdk_trace_metadata,
@@ -50,12 +55,16 @@ class _FakeSpan:
         self.name = name
         self.parent = parent
         self.attributes: dict[str, object] = {}
+        self.events: list[tuple[str, dict[str, object]]] = []
         self.exceptions: list[Exception] = []
         self.status = None
         self.oi_session_at_start = _ACTIVE_OI_SESSION.get()
 
     def set_attribute(self, key: str, value: object) -> None:
         self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict | None = None) -> None:
+        self.events.append((name, dict(attributes or {})))
 
     def record_exception(self, exc: Exception) -> None:
         self.exceptions.append(exc)
@@ -126,22 +135,32 @@ def _fake_otel_and_openinference_modules():
         def get_tracer(self, name):
             return _FakeTracer(state["spans"])
 
-        def force_flush(self):
+        def force_flush(self, timeout_millis=None):
             self.flush_called += 1
+            return True
 
         def shutdown(self):
             self.shutdown_called += 1
 
     class BatchSpanProcessor:
-        def __init__(self, exporter):
+        def __init__(self, exporter, **kwargs):
             self.exporter = exporter
+            self.kwargs = dict(kwargs)
             state["processors"].append(self)
 
+    class Compression:
+        Gzip = "gzip"
+
     class OTLPSpanExporter:
-        def __init__(self, endpoint=None, headers=None):
+        def __init__(self, endpoint=None, headers=None, **kwargs):
             self.endpoint = endpoint
             self.headers = headers
+            self.kwargs = dict(kwargs)
             state["exporters"].append(self)
+
+    class TraceConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
 
     class LiteLLMInstrumentor:
         def instrument(self, **kwargs):
@@ -175,6 +194,7 @@ def _fake_otel_and_openinference_modules():
     otel_exporter_otlp = types.ModuleType("opentelemetry.exporter.otlp")
     otel_exporter_otlp_proto = types.ModuleType("opentelemetry.exporter.otlp.proto")
     otel_exporter_otlp_proto_http = types.ModuleType("opentelemetry.exporter.otlp.proto.http")
+    otel_exporter_otlp_proto_http.Compression = Compression
     otel_exporter_otlp_proto_http_trace = types.ModuleType(
         "opentelemetry.exporter.otlp.proto.http.trace_exporter"
     )
@@ -183,6 +203,7 @@ def _fake_otel_and_openinference_modules():
     oi_pkg = types.ModuleType("openinference")
     oi_inst = types.ModuleType("openinference.instrumentation")
     oi_inst.using_session = using_session
+    oi_inst.TraceConfig = TraceConfig
     oi_litellm = types.ModuleType("openinference.instrumentation.litellm")
     oi_litellm.LiteLLMInstrumentor = LiteLLMInstrumentor
 
@@ -322,16 +343,31 @@ class TracingConfigTests(unittest.TestCase):
             state["exporters"][0].headers,
             {"Authorization": "Bearer secret==key", "X-Tenant": "berri"},
         )
+        self.assertEqual(state["exporters"][0].kwargs.get("compression"), "gzip")
+        self.assertEqual(state["exporters"][0].kwargs.get("timeout"), 30)
         self.assertEqual(len(state["providers"]), 1)
         self.assertEqual(len(state["processors"]), 1)
+        self.assertEqual(state["processors"][0].kwargs.get("max_export_batch_size"), 16)
+        self.assertEqual(state["processors"][0].kwargs.get("export_timeout_millis"), 30000)
         self.assertIs(state["set_provider_calls"][0], state["providers"][0])
         self.assertEqual(len(state["instrument_calls"]), 1)
         self.assertIs(state["instrument_calls"][0]["tracer_provider"], state["providers"][0])
+        trace_cfg = state["instrument_calls"][0].get("config")
+        self.assertIsNotNone(trace_cfg)
+        self.assertTrue(trace_cfg.kwargs.get("hide_llm_invocation_parameters"))
 
         shutdown_tracing()
         shutdown_tracing()
         self.assertEqual(state["providers"][0].flush_called, 1)
         self.assertEqual(state["providers"][0].shutdown_called, 1)
+
+    def test_default_service_name_is_aria_litellm_discord(self):
+        fake_litellm = _fake_litellm_module()
+        fake_mods, state = _fake_otel_and_openinference_modules()
+        fake_mods["litellm"] = fake_litellm
+        with mock.patch.dict(sys.modules, fake_mods):
+            self.assertTrue(configure_litellm_tracing(env={"OTEL_ENDPOINT": "https://lens.example.com"}))
+        self.assertEqual(state["resources"][0].attributes, {"service.name": "aria-litellm-discord"})
 
     def test_turns_on_with_otel_exporter_otlp_endpoint(self):
         fake_litellm = _fake_litellm_module()
@@ -476,19 +512,36 @@ class AgentSpanWrappingTests(unittest.TestCase):
                 )
 
         agent_spans = [s for s in state["spans"] if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT]
+        chain_spans = [s for s in state["spans"] if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_CHAIN]
         llm_spans = [s for s in state["spans"] if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == "LLM"]
         self.assertEqual(len(agent_spans), 1)
         root = agent_spans[0]
-        self.assertEqual(root.name, "role_matcher")
-        self.assertEqual(root.attributes[OPENINFERENCE_AGENT_NAME_ATTR], "role_matcher")
-        self.assertEqual(root.attributes[OPENINFERENCE_SESSION_ID_ATTR], "role_matcher:BerriAI/litellm:2026-11-28")
+        self.assertEqual(root.name, AGENT_ENGAGEMENT)
+        self.assertEqual(root.attributes[OPENINFERENCE_AGENT_NAME_ATTR], AGENT_ENGAGEMENT)
+        self.assertEqual(root.attributes[OPENINFERENCE_SESSION_ID_ATTR], "engagement_agent:role_matcher:BerriAI/litellm:2026-11-28")
         self.assertIn("alex-builds", str(root.attributes.get(OPENINFERENCE_INPUT_VALUE_ATTR)))
         self.assertIn("matched", str(root.attributes.get(OPENINFERENCE_OUTPUT_VALUE_ATTR)))
-        # Every parallel LLM span created in ThreadPoolExecutor nested under the role_matcher AGENT span!
+        # role_matcher is a CHAIN child span of engagement_agent (NOT a separate top-level AGENT),
+        # and each contributor gets a match_contributor CHAIN child span under role_matcher.
+        rm_spans = [s for s in chain_spans if s.name == "role_matcher"]
+        contrib_spans = [s for s in chain_spans if s.name == "match_contributor"]
+        self.assertEqual(len(rm_spans), 1)
+        rm_span = rm_spans[0]
+        self.assertIs(rm_span.parent, root)
+        self.assertNotIn(OPENINFERENCE_AGENT_NAME_ATTR, rm_span.attributes)
+        self.assertEqual(len(contrib_spans), 2)
+        for cspan in contrib_spans:
+            self.assertIs(cspan.parent, rm_span)
+            self.assertNotIn(OPENINFERENCE_AGENT_NAME_ATTR, cspan.attributes)
+        # Every parallel LLM span created in ThreadPoolExecutor nested under its contributor's
+        # match_contributor -> role_matcher -> engagement_agent!
         self.assertGreaterEqual(len(llm_spans), 2)
         for child in llm_spans:
-            self.assertIs(child.parent, root)
-            self.assertEqual(child.attributes["session.id"], "role_matcher:BerriAI/litellm:2026-11-28")
+            self.assertIn(child.parent, contrib_spans)
+            self.assertIs(child.parent.parent, rm_span)
+            self.assertEqual(child.attributes["session.id"], "engagement_agent:role_matcher:BerriAI/litellm:2026-11-28")
+        # Root AGENT span exit flushed the TracerProvider.
+        self.assertGreaterEqual(state["providers"][0].flush_called, 1)
 
     def test_pr_review_session_wraps_in_agent_span_and_nests_sdk_run(self):
         fake_mods, state = _fake_otel_and_openinference_modules()
@@ -540,22 +593,29 @@ class AgentSpanWrappingTests(unittest.TestCase):
                     with mock.patch("contributor_bot.review_agent._post_text"):
                         run_review_session(config, None, 4242, "999", mode="review")
 
-        self.assertEqual(len(state["spans"]), 1)
-        span = state["spans"][0]
-        self.assertEqual(span.name, "pr_review")
-        self.assertEqual(span.attributes[OPENINFERENCE_SPAN_KIND_ATTR], OPENINFERENCE_SPAN_KIND_AGENT)
-        self.assertEqual(span.attributes[OPENINFERENCE_AGENT_NAME_ATTR], "pr_review")
-        self.assertEqual(span.attributes[OPENINFERENCE_SESSION_ID_ATTR], "pr_review:BerriAI/litellm#4242")
-        self.assertIn("4242", str(span.attributes.get(OPENINFERENCE_INPUT_VALUE_ATTR)))
-        self.assertIn("looks good", str(span.attributes.get(OPENINFERENCE_OUTPUT_VALUE_ATTR)))
-        # Async Runner.run inherited the parent AGENT span!
-        self.assertIs(captured["active_span_in_async"], span)
-        # SDK metadata still populated cleanly.
+        agent_spans = [s for s in state["spans"] if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT]
+        chain_spans = [s for s in state["spans"] if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_CHAIN]
+        self.assertEqual(len(agent_spans), 1)
+        self.assertEqual(len(chain_spans), 1)
+        root = agent_spans[0]
+        session_span = chain_spans[0]
+        self.assertEqual(root.name, AGENT_PR_REVIEW)
+        self.assertEqual(root.attributes[OPENINFERENCE_AGENT_NAME_ATTR], AGENT_PR_REVIEW)
+        self.assertEqual(root.attributes[OPENINFERENCE_SESSION_ID_ATTR], "pr_review_agent:BerriAI/litellm#4242")
+        self.assertIn("4242", str(root.attributes.get(OPENINFERENCE_INPUT_VALUE_ATTR)))
+        self.assertIn("looks good", str(root.attributes.get(OPENINFERENCE_OUTPUT_VALUE_ATTR)))
+        self.assertEqual(session_span.name, "pr_review_session")
+        self.assertIs(session_span.parent, root)
+        # Async Runner.run inherited the nested pr_review_session -> pr_review_agent span!
+        self.assertIs(captured["active_span_in_async"], session_span)
+        # SDK metadata tags pr_review_agent cleanly.
         meta = captured["settings"]["metadata"]
-        self.assertEqual(meta["agent_name"], "pr_review")
+        self.assertEqual(meta["agent_name"], AGENT_PR_REVIEW)
         self.assertEqual(meta["pr_number"], "4242")
+        # Root AGENT span exit flushed the TracerProvider so PR reviews aren't lost.
+        self.assertGreaterEqual(state["providers"][0].flush_called, 1)
 
-    def test_discord_qa_weekly_summary_and_routing_wrap_in_agent_spans(self):
+    def test_only_three_top_level_agent_spans_exist_across_all_bot_tasks(self):
         fake_mods, state = _fake_otel_and_openinference_modules()
         fake_litellm = _fake_litellm_module(recorded_spans=state["spans"])
         fake_mods["litellm"] = fake_litellm
@@ -564,6 +624,10 @@ class AgentSpanWrappingTests(unittest.TestCase):
             github_repository="BerriAI/litellm",
             review_classifier_model="anthropic/claude-haiku-4-5",
             review_model="anthropic/claude-sonnet-4-5",
+            fast_model="anthropic/claude-haiku-4-5",
+            support_agent_model="anthropic/claude-haiku-4-5",
+            support_kb_refresh_hours=12,
+            effective_github_token=None,
             review_classify=True,
             review_require_ask=False,
             discord_token="tok",
@@ -574,14 +638,22 @@ class AgentSpanWrappingTests(unittest.TestCase):
                 {"OTEL_ENDPOINT": "https://lens.example.com/v1/traces", "ANTHROPIC_API_KEY": "test-key"},
                 clear=True,
             ):
-                # 1. Weekly summary
+                # 1. Engagement agent -> weekly_summary child span
                 summarize_pr_titles(config, [{"pulls": [{"number": 10, "title": "feat: add lens"}]}])
-                # 2. Discord Q&A
+                # 2. Support agent (via backward-compatible questions.answer_question facade)
                 with mock.patch("contributor_bot.questions.post_message"):
-                    answer_question(config, "555666777", "how do i run tests?")
-                # 3. Routing (decide -> Haiku fallback)
-                decide(config, "how do I configure proxy timeout in litellm?", channel="general")
-                # 4. PR review classifier routing
+                    answer_question(
+                        config,
+                        "555666777",
+                        "how do i run tests?",
+                        complete=lambda _s, _b: (
+                            fake_litellm.completion(
+                                model="anthropic/claude-haiku-4-5",
+                                messages=[{"role": "user", "content": "how do i run tests?"}],
+                            )["choices"][0]["message"]["content"]
+                        ),
+                    )
+                # 3. PR review agent -> pr_review_classifier child span
                 message_decision(
                     config,
                     {
@@ -591,24 +663,27 @@ class AgentSpanWrappingTests(unittest.TestCase):
                         "content": "can someone review https://github.com/BerriAI/litellm/pull/54805?",
                     },
                 )
+                # 4. Standalone decide() does NOT register a 4th top-level agent in Lens.
+                decide(config, "how do I configure proxy timeout in litellm?", channel="general")
 
-        agent_spans = {
-            s.name: s
-            for s in state["spans"]
+        agent_spans = [
+            s for s in state["spans"]
             if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT
-        }
-        llm_spans = [s for s in state["spans"] if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == "LLM"]
+        ]
+        agent_names = {s.attributes.get(OPENINFERENCE_AGENT_NAME_ATTR) for s in agent_spans}
+        self.assertEqual(agent_names, TOP_LEVEL_AGENTS)
+        self.assertEqual(agent_names, {AGENT_PR_REVIEW, AGENT_SUPPORT, AGENT_ENGAGEMENT})
 
-        for expected_name in ("weekly_summary", "discord_qa", "message_router", "pr_review_classifier"):
-            self.assertIn(expected_name, agent_spans)
-            span = agent_spans[expected_name]
-            self.assertEqual(span.attributes[OPENINFERENCE_AGENT_NAME_ATTR], expected_name)
-            self.assertTrue(span.attributes.get(OPENINFERENCE_SESSION_ID_ATTR))
-            self.assertTrue(span.attributes.get(OPENINFERENCE_INPUT_VALUE_ATTR))
-            self.assertTrue(span.attributes.get(OPENINFERENCE_OUTPUT_VALUE_ATTR))
-            # Each task has its nested LLM span under the AGENT span!
-            nested = [c for c in llm_spans if c.parent is span]
-            self.assertEqual(len(nested), 1, f"Expected 1 nested LLM span under {expected_name}")
+        chain_names = {
+            s.name for s in state["spans"]
+            if s.attributes.get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_CHAIN
+        }
+        self.assertIn("weekly_summary", chain_names)
+        self.assertIn("pr_review_classifier", chain_names)
+        self.assertNotIn("discord_qa", agent_names)
+        self.assertNotIn("message_router", agent_names)
+        self.assertNotIn("role_matcher", agent_names)
+        self.assertNotIn("weekly_summary", agent_names)
 
         # Verify no "otel" callback was ever added to litellm.
         self.assertEqual(fake_litellm.callbacks, [])
@@ -624,9 +699,9 @@ class AgentSpanWrappingTests(unittest.TestCase):
                 _select_with_llm(config, profile, [candidate])
         self.assertEqual(len(fake.calls), 1)
         _, kwargs, _ = fake.calls[0]
-        self.assertEqual(kwargs["metadata"]["agent_name"], "role_matcher")
-        self.assertEqual(kwargs["metadata"]["generation_name"], "role_matcher")
-        self.assertEqual(kwargs["metadata"]["session_id"], "role_matcher:octocat")
+        self.assertEqual(kwargs["metadata"]["agent_name"], AGENT_ENGAGEMENT)
+        self.assertEqual(kwargs["metadata"]["generation_name"], AGENT_ENGAGEMENT)
+        self.assertEqual(kwargs["metadata"]["session_id"], "engagement_agent:role_matcher:octocat")
 
     def test_sdk_metadata_values_are_all_strings(self):
         meta = build_sdk_trace_metadata("pr_review", session_id="s1", extra={"pr_number": 99, "empty": ""})

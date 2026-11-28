@@ -25,8 +25,10 @@ from .interactions import (
 )
 from .links_backfill import record_pr_links_from_message
 from .matcher import record_recent_poster
-from .review_job import handle_channel_message, handle_thread_message
+from .message_router import is_review_channel_allowed, route_and_dispatch_message
+from .pr_review_agent import handle_thread_followup
 from .store import Store
+from .support_agent import is_support_channel_allowed
 
 
 DEFAULT_BOT_STATUS_TEXT = "skedaddling 🏃‍♂️"
@@ -225,7 +227,8 @@ class Gateway:
             except Exception:
                 logging.exception("Could not record PR link poster from message")
             try:
-                payload = _message_payload(message, loop=self.loop)
+                bot_uid = str(client.user.id) if getattr(client, "user", None) and getattr(client.user, "id", None) else None
+                payload = _message_payload(message, loop=self.loop, bot_user_id=bot_uid)
             except Exception:
                 logging.exception("Could not read a Discord message")
                 return
@@ -238,14 +241,15 @@ class Gateway:
                 if not is_thread:
                     is_thread = await asyncio.to_thread(message_is_thread, message, store)
                 if is_thread:
-                    _start_worker(handle_thread_message, (config, store, payload), "review-followup")
+                    _start_worker(handle_thread_followup, (config, store, payload), "review-followup")
                     return
             if channel_type not in {0, 5}:
                 return
-            in_review_channel = config.review_watch_all_channels or channel_id in config.review_channel_ids
-            if not (config.pr_review_enabled and in_review_channel) and not config.answers_enabled:
+            in_review_channel = is_review_channel_allowed(config, channel_id)
+            in_support_channel = is_support_channel_allowed(config, channel_id)
+            if not in_review_channel and not in_support_channel:
                 return
-            _start_worker(handle_channel_message, (config, store, channel_id, payload), "review-message")
+            _start_worker(route_and_dispatch_message, (config, store, channel_id, payload), "message-router")
 
         @client.event
         async def on_interaction(interaction):
@@ -329,8 +333,9 @@ def _start_weekly_task(discord, client, config, store):
     if store is None or (not config.merged_weekly_enabled and not roles_daily):
         return None
     from discord.ext import tasks
-    from .roles_sync import log_roles_daily_boot_status, run_daily_roles_if_due
-    from .weekly import log_weekly_boot_status, post_weekly_if_due
+    from .engagement_agent import run_daily_roles, run_weekly_summary
+    from .roles_sync import log_roles_daily_boot_status
+    from .weekly import log_weekly_boot_status
 
     @tasks.loop(seconds=60)
     async def merged_weekly_post():
@@ -343,12 +348,12 @@ def _start_weekly_task(discord, client, config, store):
         loop = asyncio.get_running_loop()
         if config.merged_weekly_enabled:
             try:
-                await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
+                await asyncio.to_thread(run_weekly_summary, config, store, guild=guild, loop=loop)
             except Exception:
                 logging.exception("Weekly merge summary check failed; will retry on next tick")
         if roles_daily:
             try:
-                await asyncio.to_thread(run_daily_roles_if_due, config, store, guild=guild, loop=loop)
+                await asyncio.to_thread(run_daily_roles, config, store, guild=guild, loop=loop)
             except Exception:
                 logging.exception("Daily contributor roles check failed; will retry on next tick")
 
@@ -591,7 +596,7 @@ def message_is_thread(message, store: Store | None) -> bool:
     return store.review_thread_by_discord(channel_id) is not None
 
 
-def _message_payload(message, *, loop=None) -> dict:
+def _message_payload(message, *, loop=None, bot_user_id: str | None = None) -> dict:
     author = message.author
     payload = {
         "id": str(message.id),
@@ -601,6 +606,25 @@ def _message_payload(message, *, loop=None) -> dict:
         "author": {"id": str(author.id), "bot": bool(author.bot)},
         "channel_id": message_channel_id(message),
     }
+    channel = getattr(message, "channel", None)
+    parent_id = getattr(channel, "parent_id", None) if channel is not None else None
+    if parent_id:
+        payload["parent_id"] = str(parent_id)
+    mentions = []
+    for mentioned in getattr(message, "mentions", None) or ():
+        uid = getattr(mentioned, "id", None)
+        if uid is None:
+            continue
+        mentions.append({
+            "id": str(uid),
+            "bot": bool(getattr(mentioned, "bot", False)),
+            "username": str(getattr(mentioned, "name", "") or ""),
+            "global_name": str(getattr(mentioned, "global_name", "") or ""),
+        })
+    if mentions:
+        payload["mentions"] = mentions
+    if bot_user_id:
+        payload["bot_user_id"] = str(bot_user_id)
     guild = getattr(message, "guild", None)
     if guild is not None:
         guild_id = getattr(guild, "id", None)

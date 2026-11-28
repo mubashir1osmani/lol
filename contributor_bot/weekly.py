@@ -416,43 +416,73 @@ def summarize_pr_titles(
         },
         {"role": "user", "content": json.dumps(items_payload)},
     ]
-    from .tracing import agent_span, build_trace_metadata
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_ENGAGEMENT,
+        OPENINFERENCE_SPAN_KIND_CHAIN,
+        agent_span,
+        build_trace_metadata,
+        child_span,
+        current_agent_name,
+    )
 
-    session_id = f"weekly_summary:{len(pulls_by_num)}prs"
-    with agent_span(
-        "weekly_summary",
-        session_id=session_id,
-        input_value=items_payload,
-        attributes={"weekly.pr_count": len(pulls_by_num)},
-    ) as span:
-        try:
-            if summarizer is not None:
-                raw = summarizer(model, messages)
-            else:
-                from .review_llm import complete_litellm
-                metadata = build_trace_metadata(
-                    "weekly_summary",
-                    session_id=session_id,
-                )
-                raw = complete_litellm(model, messages, timeout=llm_timeout, metadata=metadata)
-            start = raw.find("{")
-            end = raw.rfind("}")
-            parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}
-        except Exception as error:
-            logging.warning("PR title summarization fallback to deterministic cleanup: %s", error)
-            span.set_output({"fallback": True, "pr_count": len(fallbacks)})
-            return fallbacks
+    session_id = f"{AGENT_ENGAGEMENT}:weekly_summary:{len(pulls_by_num)}prs"
+    outer_cm = (
+        agent_span(
+            AGENT_ENGAGEMENT,
+            session_id=session_id,
+            input_value=items_payload,
+            attributes={"weekly.pr_count": len(pulls_by_num)},
+            source_type="discord",
+            source_title="Weekly contributor summary",
+        )
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        with child_span(
+            "weekly_summary",
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=items_payload,
+            attributes={"weekly.pr_count": len(pulls_by_num)},
+        ) as span:
+            try:
+                if summarizer is not None:
+                    raw = summarizer(model, messages)
+                else:
+                    from .review_llm import complete_litellm
+                    metadata = build_trace_metadata(
+                        AGENT_ENGAGEMENT,
+                        session_id=session_id,
+                    )
+                    raw = complete_litellm(model, messages, timeout=llm_timeout, metadata=metadata)
+                start = raw.find("{")
+                end = raw.rfind("}")
+                parsed = json.loads(raw[start: end + 1]) if isinstance(raw, str) and start >= 0 and end >= start else {}
+            except Exception as error:
+                logging.warning("PR title summarization fallback to deterministic cleanup: %s", error)
+                fallback_out = {"fallback": True, "pr_count": len(fallbacks)}
+                span.set_output(fallback_out)
+                if outer_span is not None:
+                    outer_span.set_output(fallback_out)
+                return fallbacks
 
-        if not isinstance(parsed, dict):
-            span.set_output({"fallback": True, "pr_count": len(fallbacks)})
-            return fallbacks
-        summaries = dict(fallbacks)
-        for num, fallback in fallbacks.items():
-            candidate = parsed.get(str(num))
-            if isinstance(candidate, str) and candidate.strip():
-                summaries[num] = _sanitize_summary(candidate, fallback)
-        span.set_output({str(k): v for k, v in summaries.items()})
-        return summaries
+            if not isinstance(parsed, dict):
+                fallback_out = {"fallback": True, "pr_count": len(fallbacks)}
+                span.set_output(fallback_out)
+                if outer_span is not None:
+                    outer_span.set_output(fallback_out)
+                return fallbacks
+            summaries = dict(fallbacks)
+            for num, fallback in fallbacks.items():
+                candidate = parsed.get(str(num))
+                if isinstance(candidate, str) and candidate.strip():
+                    summaries[num] = _sanitize_summary(candidate, fallback)
+            out_map = {str(k): v for k, v in summaries.items()}
+            span.set_output(out_map)
+            if outer_span is not None:
+                outer_span.set_output(out_map)
+            return summaries
 
 
 def community_groups(
@@ -1444,16 +1474,34 @@ def post_weekly_if_due(
             local.strftime("%Y-%m-%d %H:%M %Z"),
             channel,
         )
-        try:
-            report = build_weekly_report(
-                config,
-                store,
-                moment,
-                guild=guild,
-                loop=loop,
-                pace=False,
-                deadline_seconds=WEEKLY_BUILD_DEADLINE_SECONDS,
+        from contextlib import nullcontext
+        from .tracing import AGENT_ENGAGEMENT, agent_span, current_agent_name
+
+        eng_cm = (
+            agent_span(
+                AGENT_ENGAGEMENT,
+                session_id=f"{AGENT_ENGAGEMENT}:weekly:{repo}:{key}",
+                input_value={"task": "weekly_summary", "repository": repo, "week_key": key, "force": force},
+                attributes={"engagement.task": "weekly_summary", "engagement.repository": repo},
+                source_type="discord",
+                source_title="Weekly contributor summary",
             )
+            if current_agent_name() is None
+            else nullcontext()
+        )
+        try:
+            with eng_cm as eng_span:
+                report = build_weekly_report(
+                    config,
+                    store,
+                    moment,
+                    guild=guild,
+                    loop=loop,
+                    pace=False,
+                    deadline_seconds=WEEKLY_BUILD_DEADLINE_SECONDS,
+                )
+                if eng_span is not None:
+                    eng_span.set_output({"matched_count": report.matched_count, "skipped": report.skipped_count})
         except WeeklyFetchError as error:
             if error.rate_limited:
                 wait_note = (

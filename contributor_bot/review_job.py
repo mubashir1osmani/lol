@@ -12,13 +12,15 @@ import time
 from datetime import datetime, timedelta
 
 from .ack import acknowledge_message
-from .routing import decide, explicit_review
+from .routing import explicit_review
 from .triggers import apply_triggers
 from .api import (
     TransientAPIError,
     edit_original_interaction,
-    fetch_latest_message_id,
+    fetch_channel,
     fetch_channel_messages,
+    fetch_latest_message_id,
+    fetch_message,
     fetch_recent_messages,
     post_message,
     start_public_thread,
@@ -64,11 +66,18 @@ def _message_lock(channel_id: str, message_id: str) -> threading.Lock:
 
 
 def _spawn(target) -> None:
+    import contextvars
+    from .tracing import flush_tracing
+
+    ctx = contextvars.copy_context()
+
     def _runner() -> None:
         try:
-            target()
+            ctx.run(target)
         except Exception:
             logging.exception("Review worker failed")
+        finally:
+            flush_tracing()
 
     threading.Thread(target=_runner, name="pr-review", daemon=True).start()
 
@@ -185,24 +194,85 @@ def perform_review(
     source: str = "message",
 ) -> dict:
     """Run one pre-review. Returns a small status dict for the caller."""
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_PR_REVIEW,
+        agent_span,
+        current_agent_name,
+        current_span,
+        discord_source_url,
+        log_decision,
+    )
+
     repository = config.github_repository
-    if not _try_lock(repository, number):
-        return {"status": "busy", "thread_id": None, "detail": "already checking that pr."}
-    try:
-        return _perform_review(
-            config, store, number, channel_id=channel_id, message_id=message_id, source=source,
+    existing_rec = store.review_thread(repository, number) if current_agent_name() is None else None
+    src_channel = channel_id or (existing_rec.get("thread_id") if existing_rec else None) or (existing_rec.get("channel_id") if existing_rec else None)
+    src_message = message_id if channel_id else (None if (existing_rec and existing_rec.get("thread_id")) else (existing_rec.get("message_id") if existing_rec else None))
+    outer_cm = (
+        agent_span(
+            AGENT_PR_REVIEW,
+            session_id=f"{AGENT_PR_REVIEW}:{repository}#{number}",
+            input_value={
+                "repository": repository,
+                "pr_number": int(number),
+                "channel_id": str(channel_id or ""),
+                "message_id": str(message_id or ""),
+                "source": source,
+            },
+            attributes={
+                "pr.repository": repository,
+                "pr.number": int(number),
+                "review.source": source,
+            },
+            source_type="discord",
+            source_url=discord_source_url(getattr(config, "discord_guild_id", None), src_channel, src_message),
+            source_title=f"PR #{number} review ({source})",
         )
-    except Exception as error:
-        logging.exception("Unexpected error during PR review for #%s (%s)", number, source)
-        _record_request_outcome(
-            store, repository, number, message_id, status="failed", error=str(error), increment_attempts=True,
-        )
-        return {"status": "error", "thread_id": None, "detail": "the reviewer hit an error. try /recheck in a bit."}
-    finally:
-        _unlock(repository, number)
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        if not _try_lock(repository, number):
+            log_decision(
+                "review_skipped",
+                "PR review for #%s skipped (%s); already in progress",
+                number,
+                source,
+                attributes={
+                    "pr.number": int(number),
+                    "review.source": source,
+                    "review.skip_reason": "in_flight_dedupe",
+                },
+            )
+            outcome = {"status": "busy", "thread_id": None, "detail": "already checking that pr.", "skip_reason": "in_flight_dedupe"}
+            target_span = outer_span if outer_span is not None else current_span()
+            target_span.set_attributes({"review.status": "busy", "review.skip_reason": "in_flight_dedupe"})
+            target_span.set_output(outcome)
+            return outcome
+        try:
+            outcome = _perform_review(
+                config, store, number, channel_id=channel_id, message_id=message_id, source=source,
+            )
+            if outer_span is not None:
+                outer_span.set_output(outcome)
+            return outcome
+        except Exception as error:
+            logging.exception("Unexpected error during PR review for #%s (%s)", number, source)
+            _record_request_outcome(
+                store, repository, number, message_id, status="failed", error=str(error), increment_attempts=True,
+            )
+            outcome = {"status": "error", "thread_id": None, "detail": "the reviewer hit an error. try /recheck in a bit."}
+            if outer_span is not None:
+                outer_span.set_attributes({"review.status": "error"})
+                outer_span.set_output(outcome)
+            return outcome
+        finally:
+            _unlock(repository, number)
 
 
 def _perform_review(config, store, number, *, channel_id, message_id, source) -> dict:
+    from .tracing import current_span, log_decision
+
     repository = config.github_repository
     record = store.review_thread(repository, number)
     request_message_id = message_id if is_discord_id(message_id) else (record["message_id"] if record else None)
@@ -212,7 +282,24 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         detail = f"checked recently. try again in {minutes}m."
         if record:
             detail = f"checked recently. see <#{record['thread_id']}>. try again in {minutes}m."
-        logging.info("PR review for #%s skipped (%s); cooldown %ss", number, source, remaining)
+        log_decision(
+            "review_skipped",
+            "PR review for #%s skipped (%s); cooldown %ss",
+            number,
+            source,
+            remaining,
+            attributes={
+                "pr.number": int(number),
+                "review.source": source,
+                "review.skip_reason": "cooldown",
+                "review.cooldown_remaining_seconds": int(remaining),
+            },
+        )
+        current_span().set_attributes({
+            "review.status": "cooldown",
+            "review.skip_reason": "cooldown",
+            "review.cooldown_remaining_seconds": int(remaining),
+        })
         if record and record.get("last_reviewed_at"):
             _record_request_outcome(store, repository, number, request_message_id, status="done")
         if source == "recheck" and record:
@@ -220,10 +307,31 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
                 _post(record["thread_id"], config.discord_token, detail)
             except Exception:
                 logging.warning("Could not post the cooldown note for #%s", number)
-        return {"status": "cooldown", "thread_id": record["thread_id"] if record else None, "detail": detail}
+        return {
+            "status": "cooldown",
+            "thread_id": record["thread_id"] if record else None,
+            "detail": detail,
+            "skip_reason": "cooldown",
+            "pr_number": int(number),
+        }
     day = datetime.now(UTC).date().isoformat()
     if not store.claim_daily_run(day, config.review_daily_run_budget):
         detail = "ran out of budget for today. try again tomorrow."
+        log_decision(
+            "review_skipped",
+            "PR review for #%s skipped (%s); daily run budget exhausted",
+            number,
+            source,
+            attributes={
+                "pr.number": int(number),
+                "review.source": source,
+                "review.skip_reason": "daily_budget",
+            },
+        )
+        current_span().set_attributes({
+            "review.status": "budget",
+            "review.skip_reason": "daily_budget",
+        })
         _record_request_outcome(
             store, repository, number, request_message_id, status="failed", error=detail, increment_attempts=True,
         )
@@ -232,8 +340,20 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
                 _post(record["thread_id"], config.discord_token, detail)
             except Exception:
                 logging.exception("Could not post the daily budget note for #%s", number)
-        return {"status": "budget", "thread_id": record["thread_id"] if record else None, "detail": detail}
-    logging.info("Reviewing #%s (%s)", number, source)
+        return {
+            "status": "budget",
+            "thread_id": record["thread_id"] if record else None,
+            "detail": detail,
+            "skip_reason": "daily_budget",
+            "pr_number": int(number),
+        }
+    log_decision(
+        "review_started",
+        "Reviewing #%s (%s)",
+        number,
+        source,
+        attributes={"pr.number": int(number), "review.source": source},
+    )
     thread_channel = channel_id or (record["channel_id"] if record else None)
     thread_message = message_id or (record["message_id"] if record else None)
     try:
@@ -242,7 +362,7 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         _record_request_outcome(
             store, repository, number, request_message_id, status="failed", error=str(error), increment_attempts=True,
         )
-        return {"status": "error", "thread_id": None, "detail": str(error)}
+        return {"status": "error", "thread_id": None, "detail": str(error), "pr_number": int(number)}
     try:
         history = ""
         try:
@@ -257,17 +377,64 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         _record_request_outcome(
             store, repository, number, request_message_id, status="failed", error=str(error), increment_attempts=True,
         )
-        return {"status": "error", "thread_id": thread_id, "detail": "the reviewer hit an error. try /recheck in a bit."}
+        return {"status": "error", "thread_id": thread_id, "detail": "the reviewer hit an error. try /recheck in a bit.", "pr_number": int(number)}
     store.mark_review_done(repository, number, iso(datetime.now(UTC)), result.head_sha or "")
     _record_request_outcome(store, repository, number, request_message_id, status="done", increment_attempts=True)
+    posted_ids = list(getattr(result, "posted_message_ids", ()) or ())
+    primary_msg_id = posted_ids[0] if posted_ids else ""
+    findings = list(getattr(result, "findings", ()) or ())
     if result.verdict_posted:
-        logging.info(
+        log_decision(
+            "review_verdict_posted",
             "Posted a %s review for #%s in thread %s",
-            "ready" if result.ready else "needs-work", number, thread_id,
+            "ready" if result.ready else "needs-work",
+            number,
+            thread_id,
+            attributes={
+                "pr.number": int(number),
+                "discord.thread_id": str(thread_id),
+                "review.verdict": result.verdict or ("ready" if result.ready else "needs_changes"),
+                "review.ready": bool(result.ready),
+                "review.findings_count": len(findings),
+                "review.posted_message_id": primary_msg_id,
+                "review.posted_message_ids": posted_ids,
+            },
         )
     elif result.exhausted:
-        logging.info("Review for #%s ran out of budget (%s)", number, result.exhausted)
-    return {"status": "posted", "thread_id": thread_id, "detail": result.text}
+        log_decision(
+            "review_exhausted",
+            "Review for #%s ran out of budget (%s)",
+            number,
+            result.exhausted,
+            attributes={
+                "pr.number": int(number),
+                "discord.thread_id": str(thread_id),
+                "review.exhausted": str(result.exhausted),
+            },
+        )
+    current_span().set_attributes({
+        "pr.number": int(number),
+        "discord.thread_id": str(thread_id),
+        "review.status": "posted",
+        "review.verdict": result.verdict or "",
+        "review.verdict_posted": bool(result.verdict_posted),
+        "review.findings_count": len(findings),
+        "review.findings": findings[:10],
+        "review.posted_message_id": primary_msg_id,
+        "review.posted_message_ids": posted_ids,
+    })
+    return {
+        "status": "posted",
+        "pr_number": int(number),
+        "thread_id": thread_id,
+        "verdict": result.verdict,
+        "ready": result.ready,
+        "findings_count": len(findings),
+        "findings": findings[:10],
+        "posted_message_id": primary_msg_id,
+        "posted_message_ids": posted_ids,
+        "detail": result.text,
+    }
 
 
 def _ephemeral(content: str) -> dict:
@@ -506,7 +673,7 @@ def schedule_webhook_recheck(config: Config, store: Store, event: str, payload: 
 
 
 def _classify_complete(config: Config, system: str, text: str, *, session_id: str | None = None) -> str:
-    from .tracing import build_trace_metadata
+    from .tracing import AGENT_PR_REVIEW, build_trace_metadata
     model = config.review_classifier_model or config.review_model
     return complete_litellm(
         model,
@@ -514,7 +681,7 @@ def _classify_complete(config: Config, system: str, text: str, *, session_id: st
             {"role": "system", "content": system},
             {"role": "user", "content": text},
         ],
-        metadata=build_trace_metadata("pr_review_classifier", session_id=session_id),
+        metadata=build_trace_metadata(AGENT_PR_REVIEW, session_id=session_id),
     )
 
 
@@ -523,25 +690,53 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
     if not config.review_classify:
         numbers = should_review_message(message, config.github_repository, require_ask=config.review_require_ask)
         return bool(numbers), numbers
-    from .tracing import agent_span
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_PR_REVIEW,
+        OPENINFERENCE_SPAN_KIND_CHAIN,
+        agent_span,
+        child_span,
+        current_agent_name,
+        discord_source_url,
+        truncate_source_title,
+    )
 
     text = message.get("content") or ""
     channel_id = message.get("channel_id") or message.get("id") or ""
-    session_id = f"pr_review_classifier:{channel_id}" if channel_id else None
-    with agent_span(
-        "pr_review_classifier",
-        session_id=session_id,
-        input_value=text[:800],
-        attributes={"discord.channel_id": str(channel_id)},
-    ) as span:
-        asked = classify_review_request(
-            text,
-            config.github_repository,
-            complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
+    guild_id = str(message.get("guild_id") or getattr(config, "discord_guild_id", None) or "")
+    msg_id = str(message.get("id") or "")
+    session_id = f"{AGENT_PR_REVIEW}:classifier:{channel_id}" if channel_id else None
+    outer_cm = (
+        agent_span(
+            AGENT_PR_REVIEW,
+            session_id=session_id,
+            input_value=text[:800],
+            attributes={"discord.channel_id": str(channel_id)},
+            source_type="discord",
+            source_url=discord_source_url(guild_id, message.get("channel_id"), msg_id),
+            source_title=truncate_source_title(text, fallback="PR review request"),
         )
-        numbers = should_review_message(message, config.github_repository, require_ask=False) if asked else []
-        span.set_output({"asked": asked, "numbers": numbers})
-        return asked, numbers
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        with child_span(
+            "pr_review_classifier",
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=text[:800],
+            attributes={"discord.channel_id": str(channel_id)},
+        ) as span:
+            asked = classify_review_request(
+                text,
+                config.github_repository,
+                complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
+            )
+            numbers = should_review_message(message, config.github_repository, require_ask=False) if asked else []
+            out = {"asked": asked, "numbers": numbers}
+            span.set_output(out)
+            if outer_span is not None:
+                outer_span.set_output(out)
+            return asked, numbers
 
 
 def _mentioned_numbers_in_thread(text: str, repository: str, records: list[dict]) -> list[dict]:
@@ -557,8 +752,217 @@ def _mentioned_numbers_in_thread(text: str, repository: str, records: list[dict]
     return [known[num] for num in mentioned]
 
 
+_ARIA_MENTION_RE = re.compile(r"(?i)(?:^|[\s,(:])@aria\b")
+_DISCORD_USER_MENTION_RE = re.compile(r"<@!?([1-9][0-9]{0,19})>")
+
+
+def _mentions_bot(config: Config, message: dict) -> bool:
+    """True when a Discord message explicitly @mentions Aria / this bot."""
+    text = str(message.get("content") or "")
+    bot_ids: set[str] = set()
+    for candidate in (message.get("bot_user_id"), config.discord_application_id):
+        if is_discord_id(candidate):
+            bot_ids.add(str(candidate))
+    if bot_ids:
+        for match in _DISCORD_USER_MENTION_RE.finditer(text):
+            if match.group(1) in bot_ids:
+                return True
+    mentions = message.get("mentions")
+    if isinstance(mentions, list):
+        for entry in mentions:
+            if not isinstance(entry, dict):
+                continue
+            mid = str(entry.get("id") or "")
+            if mid and mid in bot_ids:
+                return True
+            if entry.get("bot"):
+                uname = str(entry.get("username") or entry.get("global_name") or "").lower()
+                if "aria" in uname or not bot_ids:
+                    return True
+    return _ARIA_MENTION_RE.search(text) is not None
+
+
+def _bot_review_messages(messages: list[dict]) -> list[dict]:
+    """Return non-status bot messages in a thread that represent actual PR reviews."""
+    found: list[dict] = []
+    for msg in messages:
+        author = msg.get("author") or {}
+        if not author.get("bot"):
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        lowered = content.lower()
+        if any(lowered.startswith(prefix) for prefix in _NON_REVIEW_BOT_PREFIXES):
+            continue
+        found.append(msg)
+    return found
+
+
+def _extract_pr_numbers_from_text(text: str, repository: str, *, allow_hash: bool = False) -> list[int]:
+    numbers: list[int] = []
+    for num in should_review_message({"content": text, "author": {"bot": False}}, repository, require_ask=False):
+        if num not in numbers:
+            numbers.append(num)
+    if allow_hash:
+        for match in _HASH_PR_RE.finditer(text or ""):
+            num = int(match.group(1))
+            if num not in numbers:
+                numbers.append(num)
+    return numbers
+
+
+def _rehydrate_review_thread_rows(
+    store: Store,
+    *,
+    repository: str,
+    numbers: list[int],
+    channel_id: str,
+    message_id: str,
+    thread_id: str,
+    created_at_iso: str,
+    thread_messages: list[dict],
+    fallback_reviewed_at_iso: str,
+) -> list[dict]:
+    from .tracing import log_decision
+
+    multi_pr = len(numbers) > 1
+    for number in numbers:
+        bot_msg = _match_bot_review_message(thread_messages, number, multi_pr=multi_pr)
+        reviewed_dt = _message_created_at(bot_msg) if bot_msg else None
+        reviewed_iso = iso(reviewed_dt) if reviewed_dt is not None else fallback_reviewed_at_iso
+        store.save_review_thread(
+            repository=repository,
+            number=number,
+            channel_id=channel_id,
+            message_id=message_id,
+            thread_id=thread_id,
+            created_at=created_at_iso,
+        )
+        if bot_msg is not None or reviewed_dt is not None:
+            store.mark_review_done(repository, number, reviewed_iso, "")
+    log_decision(
+        "review_thread_rehydrated",
+        "Rehydrated review_threads for thread %s (%s) in channel %s from Discord history",
+        thread_id,
+        ", ".join(f"#{n}" for n in numbers),
+        channel_id,
+        attributes={
+            "discord.thread_id": str(thread_id),
+            "discord.channel_id": str(channel_id),
+            "discord.message_id": str(message_id),
+            "review.pr_numbers": list(numbers),
+            "review.rehydrated": True,
+        },
+    )
+    return [
+        rec for rec in store.review_threads_by_discord(thread_id)
+        if rec["repository"].lower() == repository.lower()
+    ]
+
+
+def rehydrate_review_thread(
+    config: Config,
+    store: Store,
+    thread_id: str,
+    *,
+    parent_id: str | None = None,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Rehydrate ``review_threads`` for a Discord thread after a SQLite DB wipe.
+
+    Inspects the thread's parent starter message (``thread_id == starter_message_id``
+    for Discord message threads) and the bot's own prior review messages in the thread.
+    Returns the rehydrated ``review_threads`` rows for ``config.github_repository``,
+    or ``[]`` if the thread is not a review thread / cannot be rehydrated.
+    """
+    if not is_discord_id(thread_id) or not config.discord_token:
+        return []
+    moment = now or datetime.now(UTC)
+    now_iso = iso(moment)
+    repo = config.github_repository
+
+    resolved_parent = str(parent_id or "") if is_discord_id(parent_id) else ""
+    thread_name = ""
+    if not resolved_parent:
+        try:
+            channel_info = fetch_channel(thread_id, config.discord_token)
+            if isinstance(channel_info, dict):
+                raw_parent = str(channel_info.get("parent_id") or "")
+                if is_discord_id(raw_parent):
+                    resolved_parent = raw_parent
+                thread_name = str(channel_info.get("name") or "")
+        except Exception as error:
+            logging.debug("Could not fetch thread metadata for %s during rehydration: %s", thread_id, error)
+
+    try:
+        thread_messages = fetch_recent_messages(thread_id, config.discord_token, limit=50)
+    except Exception as error:
+        logging.warning("Could not read thread %s messages during review_threads rehydration: %s", thread_id, error)
+        thread_messages = []
+
+    starter_msg: dict | None = None
+    if is_discord_id(resolved_parent):
+        try:
+            fetched = fetch_message(resolved_parent, thread_id, config.discord_token)
+            if isinstance(fetched, dict) and fetched.get("id"):
+                starter_msg = fetched
+        except Exception as error:
+            logging.debug(
+                "Could not fetch starter message %s in parent %s during rehydration: %s",
+                thread_id, resolved_parent, error,
+            )
+
+    bot_reviews = _bot_review_messages(thread_messages)
+    numbers: list[int] = []
+    if starter_msg is not None:
+        for num in _extract_pr_numbers_from_text(str(starter_msg.get("content") or ""), repo, allow_hash=False):
+            if num not in numbers:
+                numbers.append(num)
+    for bmsg in bot_reviews:
+        for num in _extract_pr_numbers_from_text(str(bmsg.get("content") or ""), repo, allow_hash=True):
+            if num not in numbers:
+                numbers.append(num)
+    if not numbers and bot_reviews and thread_name:
+        for num in _extract_pr_numbers_from_text(thread_name, repo, allow_hash=True):
+            if num not in numbers:
+                numbers.append(num)
+
+    in_review_channel = (
+        bool(resolved_parent)
+        and (
+            config.review_watch_all_channels
+            or not config.review_channel_ids
+            or resolved_parent in config.review_channel_ids
+        )
+    )
+    if not numbers or (not bot_reviews and not in_review_channel):
+        return []
+
+    created_dt = _message_created_at(starter_msg) if starter_msg is not None else None
+    created_iso = iso(created_dt) if created_dt is not None else now_iso
+    save_channel_id = resolved_parent if is_discord_id(resolved_parent) else thread_id
+    save_message_id = str((starter_msg or {}).get("id") or thread_id)
+    if not is_discord_id(save_message_id):
+        save_message_id = thread_id
+
+    return _rehydrate_review_thread_rows(
+        store,
+        repository=repo,
+        numbers=numbers,
+        channel_id=save_channel_id,
+        message_id=save_message_id,
+        thread_id=thread_id,
+        created_at_iso=created_iso,
+        thread_messages=thread_messages,
+        fallback_reviewed_at_iso=now_iso,
+    )
+
+
 def handle_thread_message(config: Config, store: Store, message: dict) -> None:
     """Answer a follow-up inside a review thread, or re-review when they say they fixed it."""
+    from .tracing import current_span, log_decision
+
     if not config.pr_review_enabled:
         return
     author = message.get("author") or {}
@@ -569,14 +973,51 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
         rec for rec in (store.review_threads_by_discord(channel_id) if is_discord_id(channel_id) else [])
         if rec["repository"].lower() == config.github_repository.lower()
     ]
+    if not records and is_discord_id(channel_id):
+        records = rehydrate_review_thread(
+            config,
+            store,
+            channel_id,
+            parent_id=str(message.get("parent_id") or "") or None,
+        )
     if not records:
+        log_decision(
+            "review_thread_skipped",
+            "Skipping message in thread %s: no review_threads record and could not rehydrate from Discord history",
+            channel_id or "unknown",
+            attributes={
+                "discord.thread_id": channel_id,
+                "review.skip_reason": "unknown_review_thread",
+            },
+        )
         return
     text = message.get("content") or ""
     message_id = message.get("id")
     matched = _mentioned_numbers_in_thread(text, config.github_repository, records) if len(records) > 1 else []
-    if wants_recheck(text):
-        _ack(config, channel_id, message_id, message)
+    recheck_by_phrase = wants_recheck(text)
+    recheck_by_mention = _mentions_bot(config, message)
+    if recheck_by_phrase or recheck_by_mention:
+        trigger_reason = "phrase" if recheck_by_phrase else "bot_mention"
         targets = matched or records
+        target_nums = [int(rec["number"]) for rec in targets]
+        current_span().set_attributes({
+            "review.request_detected": True,
+            "review.recheck_trigger": trigger_reason,
+            "review.pr_numbers": target_nums,
+        })
+        log_decision(
+            "review_recheck_requested",
+            "Re-review requested in thread %s for %s (trigger=%s)",
+            channel_id,
+            ", ".join(f"#{n}" for n in target_nums),
+            trigger_reason,
+            attributes={
+                "discord.thread_id": channel_id,
+                "review.pr_numbers": target_nums,
+                "review.recheck_trigger": trigger_reason,
+            },
+        )
+        _ack(config, channel_id, message_id, message)
         if len(targets) == 1:
             perform_review(config, store, int(targets[0]["number"]), source="recheck")
         else:
@@ -592,7 +1033,18 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
         datetime.now(UTC),
     )
     if remaining:
-        logging.info("Skipping follow-up on #%s; cooldown has %ss left", number, remaining)
+        log_decision(
+            "review_skipped",
+            "Skipping follow-up on #%s; cooldown has %ss left",
+            number,
+            remaining,
+            attributes={
+                "pr.number": number,
+                "discord.thread_id": channel_id,
+                "review.skip_reason": "followup_cooldown",
+                "review.cooldown_remaining_seconds": int(remaining),
+            },
+        )
         return
     day = datetime.now(UTC).date().isoformat()
     if not store.claim_daily_run(day, config.review_daily_run_budget):
@@ -612,33 +1064,55 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
     store.mark_followup(config.github_repository, number, iso(datetime.now(UTC)))
 
 
-def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
+def handle_review_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> dict:
+    """Process a Discord channel message already routed to ``pr_review_agent``."""
+    from .tracing import current_span, log_decision
+
     message_id = str(message.get("id") or "")
-    if channel_id in config.review_channel_ids and is_discord_id(message_id):
-        try:
-            store.advance_review_cursor(channel_id, message_id)
-        except Exception:
-            logging.warning("Could not advance review cursor for channel %s", channel_id)
-    text = message.get("content") or ""
-    if not explicit_review(text, config.github_repository):
-        _answer_if_decided(config, channel_id, message)
-        return
     asked, numbers = message_decision(config, message)
     if asked and not numbers:
         _ack(config, channel_id, message_id, message)
         _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
-        return
+        outcome = {"asked": True, "numbers": [], "planned": [], "skipped": [], "prompted_for_url": True}
+        current_span().set_attributes({
+            "review.request_detected": True,
+            "review.pr_numbers": [],
+            "review.skip_reason": "missing_pr_url",
+        })
+        return outcome
     planned = []
+    skipped = []
     for number in numbers:
         record = store.review_thread(config.github_repository, number)
         if record:
             remaining = cooldown_remaining(record, config.review_cooldown_seconds, datetime.now(UTC))
             if remaining:
-                logging.info("Skipping #%s in channel %s; cooldown has %ss left", number, channel_id, remaining)
+                log_decision(
+                    "review_skipped",
+                    "Skipping #%s in channel %s; cooldown has %ss left",
+                    number,
+                    channel_id,
+                    remaining,
+                    attributes={
+                        "pr.number": int(number),
+                        "discord.channel_id": str(channel_id),
+                        "review.skip_reason": "cooldown",
+                        "review.cooldown_remaining_seconds": int(remaining),
+                    },
+                )
+                skipped.append({"pr_number": int(number), "reason": "cooldown", "remaining_seconds": int(remaining)})
                 continue
         planned.append((number, record))
     if not planned:
-        return
+        skip_reason = skipped[0]["reason"] if skipped else ("not_a_review_request" if not asked else "no_prs_planned")
+        current_span().set_attributes({
+            "review.request_detected": bool(asked),
+            "review.pr_numbers": list(numbers),
+            "review.planned_prs": [],
+            "review.skipped_prs": skipped,
+            "review.skip_reason": skip_reason,
+        })
+        return {"asked": asked, "numbers": numbers, "planned": [], "skipped": skipped, "skip_reason": skip_reason}
     now_iso = iso(datetime.now(UTC))
     if is_discord_id(channel_id) and is_discord_id(message_id):
         for number, record in planned:
@@ -670,37 +1144,39 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
                 config, store, number, channel_id=channel_id, message_id=message_id, source="new",
             ),
         )
+    planned_nums = [int(n) for n, _ in planned]
+    current_span().set_attributes({
+        "review.request_detected": bool(asked),
+        "review.pr_numbers": list(numbers),
+        "review.planned_prs": planned_nums,
+        "review.skipped_prs": skipped,
+    })
+    return {"asked": asked, "numbers": numbers, "planned": planned_nums, "skipped": skipped}
+
+
+def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
+    """Route a channel message through the single message router (PR review or support)."""
+    from .message_router import route_and_dispatch_message
+
+    route_and_dispatch_message(config, store, channel_id, message)
 
 
 def _answer_if_decided(config: Config, channel_id: str, message: dict) -> None:
-    """Jev (or Haiku) decides. Silence leaves the message for a maintainer."""
-    if not config.answers_enabled:
-        return
-    author = message.get("author") or {}
-    if author.get("bot") or message.get("webhook_id"):
-        return
-    decision = decide(
-        config,
-        message.get("content") or "",
-        channel=str(message.get("channel_name") or channel_id),
-    )
-    if not decision.reply:
-        return
-    _ack(config, channel_id, message.get("id"), message)
-    from .questions import answer_question
-    answer_question(
-        config, channel_id, message.get("content") or "",
-        complete=_routed_complete(config, decision.tier, session_id=channel_id),
-    )
+    """Delegate support Q&A to ``support_agent`` when enabled and allowlisted."""
+    from .support_agent import handle_routed_message as handle_support
+
+    handle_support(config, None, channel_id, message)
 
 
 def _routed_complete(config, tier, *, session_id):
     def complete(system, body):
         from .routing import complete_auto
+        from .tracing import AGENT_SUPPORT
+
         return complete_auto(config, [
             {"role": "system", "content": system},
             {"role": "user", "content": body},
-        ], session_id=session_id, tier=tier, agent="discord_qa")
+        ], session_id=session_id, tier=tier, agent=AGENT_SUPPORT)
     return complete
 
 
@@ -727,6 +1203,40 @@ _NON_REVIEW_BOT_PREFIXES = (
 )
 
 
+def _match_bot_review_message(messages: list[dict], number: int, *, multi_pr: bool) -> dict | None:
+    """Return the newest bot review message for ``number`` in ``messages``, or None."""
+    pr_tag = f"#{number}"
+    pr_path = f"/pull/{number}"
+    for msg in _bot_review_messages(messages):
+        content = (msg.get("content") or "").strip()
+        if not multi_pr:
+            return msg
+        if pr_tag in content or pr_path in content.lower():
+            return msg
+    return None
+
+
+def _bot_review_message_in_thread(
+    config: Config,
+    thread_id: str,
+    number: int,
+    *,
+    multi_pr: bool,
+    cache: dict[str, list[dict]],
+) -> dict | None:
+    """Fetch (cached) Discord thread history and return a bot review message for ``number``, if any."""
+    if not is_discord_id(thread_id):
+        return None
+    messages = cache.get(thread_id)
+    if messages is None:
+        try:
+            messages = fetch_recent_messages(thread_id, config.discord_token, limit=20)
+        except Exception:
+            messages = []
+        cache[thread_id] = messages
+    return _match_bot_review_message(messages, number, multi_pr=multi_pr)
+
+
 def _thread_already_has_bot_review(
     config: Config,
     thread_id: str,
@@ -736,32 +1246,9 @@ def _thread_already_has_bot_review(
     cache: dict[str, list[dict]],
 ) -> bool:
     """Check Discord thread history so boot recovery never duplicates a review after a DB reset."""
-    if not is_discord_id(thread_id):
-        return False
-    messages = cache.get(thread_id)
-    if messages is None:
-        try:
-            messages = fetch_recent_messages(thread_id, config.discord_token, limit=20)
-        except Exception:
-            messages = []
-        cache[thread_id] = messages
-    pr_tag = f"#{number}"
-    pr_path = f"/pull/{number}"
-    for msg in messages:
-        author = msg.get("author") or {}
-        if not author.get("bot"):
-            continue
-        content = (msg.get("content") or "").strip()
-        if not content:
-            continue
-        lowered = content.lower()
-        if any(lowered.startswith(prefix) for prefix in _NON_REVIEW_BOT_PREFIXES):
-            continue
-        if not multi_pr:
-            return True
-        if pr_tag in content or pr_path in lowered:
-            return True
-    return False
+    return _bot_review_message_in_thread(
+        config, thread_id, number, multi_pr=multi_pr, cache=cache,
+    ) is not None
 
 
 def recover_pending_reviews(
@@ -849,6 +1336,32 @@ def recover_pending_reviews(
                             config, msg_thread_id, number, multi_pr=multi_pr, cache=thread_msg_cache,
                         )
                     ):
+                        bot_msg = _bot_review_message_in_thread(
+                            config, msg_thread_id, number, multi_pr=multi_pr, cache=thread_msg_cache,
+                        )
+                        created_iso = iso(created_at) if created_at is not None else now_iso
+                        bot_ts = _message_created_at(bot_msg) if bot_msg is not None else None
+                        reviewed_iso = iso(bot_ts) if bot_ts is not None else now_iso
+                        try:
+                            store.save_review_thread(
+                                repository=repo,
+                                number=number,
+                                channel_id=channel_id,
+                                message_id=msg_id,
+                                thread_id=msg_thread_id,
+                                created_at=created_iso,
+                            )
+                            store.mark_review_done(repo, number, reviewed_iso, "")
+                            logging.info(
+                                "Rehydrated review_threads during boot recovery for #%s "
+                                "(thread=%s, channel=%s, starter=%s, last_reviewed_at=%s)",
+                                number, msg_thread_id, channel_id, msg_id, reviewed_iso,
+                            )
+                        except Exception:
+                            logging.warning(
+                                "Could not rehydrate review_threads for #%s in thread %s",
+                                number, msg_thread_id,
+                            )
                         continue
                     unreviewed.append(number)
                 if not unreviewed:

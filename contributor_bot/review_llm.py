@@ -15,7 +15,7 @@ from .reviews import (
     load_review_standards,
     normalize_verdict,
 )
-from .tracing import build_trace_metadata, configure_litellm_tracing
+from .tracing import AGENT_PR_REVIEW, build_trace_metadata, configure_litellm_tracing, current_agent_name
 
 DIFF_CHUNK_CHARS = 20_000
 DIFF_MAX_CHUNKS = 3
@@ -228,7 +228,7 @@ def _merge_messages(notes: list[str], omitted: list[str]) -> list[dict]:
 def run_llm_review(diff: str, model: str, complete=None, *, session_id: str | None = None) -> dict:
     """Review a diff in at most a few chunks, then one combined JSON object."""
     if complete is None:
-        metadata = build_trace_metadata("pr_review", session_id=session_id)
+        metadata = build_trace_metadata(current_agent_name() or AGENT_PR_REVIEW, session_id=session_id)
         complete = lambda m, msgs: complete_litellm(m, msgs, metadata=metadata)
     chunks, omitted = chunk_diff(diff)
     if not chunks:

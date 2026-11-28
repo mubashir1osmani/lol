@@ -174,6 +174,9 @@ class AgentResult:
     output_tokens: int = 0
     tool_calls: int = 0
     step_seconds: list = field(default_factory=list)
+    findings: list = field(default_factory=list)
+    bullets: list = field(default_factory=list)
+    posted_message_ids: list = field(default_factory=list)
 
 
 def _attr(obj, key):
@@ -333,6 +336,8 @@ class ReviewContext:
     posts_left: int = 6
     verdict_ready: bool = False
     verdict: str = ""
+    verdict_findings: list = field(default_factory=list)
+    verdict_bullets: list = field(default_factory=list)
     pinged: bool = False
     verdict_posted: bool = False
     steps: int = 0
@@ -801,8 +806,21 @@ def tool_submit_verdict(ctx: ReviewContext, args: dict) -> str:
     ctx.verdict_posted = True
     ctx.verdict_ready = ready
     ctx.verdict = verdict
+    ctx.verdict_findings = list(findings)
+    ctx.verdict_bullets = list(bullets)
     ctx.pinged = bool(ready and role_id)
-    return _json({"verdict": verdict, "ready": ready, "reasons": list(bullets)})
+    from .tracing import record_span_event
+    record_span_event(
+        "review_verdict_submitted",
+        {
+            "pr.number": int(ctx.number),
+            "review.verdict": verdict,
+            "review.ready": bool(ready),
+            "review.findings_count": len(findings),
+            "review.posted_message_ids": list(ctx.posted_ids),
+        },
+    )
+    return _json({"verdict": verdict, "ready": ready, "reasons": list(bullets), "posted_message_ids": list(ctx.posted_ids)})
 
 
 def tool_ping_maintainer(ctx: ReviewContext, _args: dict) -> str:
@@ -837,16 +855,29 @@ _HANDLERS = {
 
 
 def execute_tool(ctx: ReviewContext, name: str, arguments: dict) -> str:
+    from .tracing import tool_span
+
     handler = _HANDLERS.get(name)
     if handler is None:
         return _json({"error": "unknown tool"})
-    try:
-        return handler(ctx, arguments or {})
-    except ValueError as error:
-        return _json({"error": str(error)})
-    except Exception as error:
-        logging.warning("Review tool %s failed for #%s: %s", name, ctx.number, error)
-        return _json({"error": "that tool failed. try another one or submit what you have."})
+    with tool_span(
+        name,
+        input_value=arguments or {},
+        attributes={"pr.number": int(ctx.number)},
+    ) as span:
+        try:
+            out = handler(ctx, arguments or {})
+            span.set_output(out[:1000] if isinstance(out, str) else out)
+            return out
+        except ValueError as error:
+            out = _json({"error": str(error)})
+            span.set_output(out)
+            return out
+        except Exception as error:
+            logging.warning("Review tool %s failed for #%s: %s", name, ctx.number, error)
+            out = _json({"error": "that tool failed. try another one or submit what you have."})
+            span.set_output(out)
+            return out
 
 
 def _is_context_error(error: BaseException) -> bool:
@@ -1176,14 +1207,14 @@ def _capable_model(config) -> str:
 
 def _run_sdk_session(ctx: ReviewContext, prompt: str, config) -> AgentResult:
     """One Agents SDK run. The model is the Autorouter's capable tier."""
-    from .tracing import build_sdk_trace_metadata, configure_litellm_tracing
+    from .tracing import AGENT_PR_REVIEW, build_sdk_trace_metadata, configure_litellm_tracing
     configure_litellm_tracing()
     sdk = _load_sdk()
     _configure_tracing(sdk, config)
     repo = getattr(config, "github_repository", "") or "BerriAI/litellm"
     trace_metadata = build_sdk_trace_metadata(
-        "pr_review",
-        session_id=f"pr_review:{repo}#{ctx.number}",
+        AGENT_PR_REVIEW,
+        session_id=f"{AGENT_PR_REVIEW}:{repo}#{ctx.number}",
         extra={"repository": repo, "pr_number": ctx.number, "thread_id": ctx.thread_id},
     )
     agent = sdk.Agent(
@@ -1270,7 +1301,14 @@ def _stamp(result: AgentResult, ctx: ReviewContext) -> AgentResult:
 
 def run_review_session(config, store, number: int, thread_id: str, *, mode: str, history: str = "") -> AgentResult:
     """Run the agent for one review or one follow-up question."""
-    from .tracing import agent_span
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_PR_REVIEW,
+        OPENINFERENCE_SPAN_KIND_CHAIN,
+        agent_span,
+        child_span,
+        current_agent_name,
+    )
 
     ctx = ReviewContext(config=config, store=store, number=number, thread_id=thread_id)
     task = (
@@ -1286,53 +1324,105 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
     )
     if history.strip():
         task += "\n\nuntrusted discord history:\n" + _clip(history, 4000)
-    span_name = "pr_review" if mode == "review" else "pr_review_followup"
-    with agent_span(
-        span_name,
-        session_id=f"pr_review:{config.github_repository}#{number}",
-        input_value={
-            "repository": config.github_repository,
-            "pr_number": number,
-            "thread_id": str(thread_id),
-            "mode": mode,
-        },
-        attributes={
-            "pr.repository": config.github_repository,
-            "pr.number": int(number),
-            "discord.thread_id": str(thread_id),
-            "review.mode": mode,
-        },
-    ) as span:
-        try:
-            result = _run_sdk_session(ctx, task, config)
-        except RuntimeError as error:
-            if "not installed" not in str(error):
-                raise
-            result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
-        result.verdict_posted = ctx.verdict_posted
-        result.ready = ctx.verdict_ready if ctx.verdict_posted else None
-        result.verdict = ctx.verdict
-        if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
-            result.head_sha = ctx.snapshot.head_sha
-        if not ctx.verdict_posted and not ctx.posted_ids:
-            note = result.text or "i didn't finish a verdict. try /recheck."
-            lowered = note.lower()
-            if mode == "review" and not result.exhausted and ("ready for maintainer" in lowered or lowered.startswith("looks good")):
-                note = "i didn't file a verdict, so this isn't ready for a maintainer. try /recheck."
-            if mode == "followup" or result.exhausted or mode == "review":
-                try:
-                    _post_text(ctx, note)
-                except Exception:
-                    logging.exception("Could not post the agent note for #%s", number)
-        span.set_output({
-            "verdict_posted": result.verdict_posted,
-            "verdict": result.verdict,
-            "ready": result.ready,
-            "exhausted": result.exhausted,
-            "steps": result.steps,
-            "text": (result.text or "")[:1000],
-        })
-        return result
+    child_name = "pr_review_session" if mode == "review" else "pr_review_followup"
+    input_payload = {
+        "repository": config.github_repository,
+        "pr_number": number,
+        "thread_id": str(thread_id),
+        "mode": mode,
+    }
+    span_attrs = {
+        "pr.repository": config.github_repository,
+        "pr.number": int(number),
+        "discord.thread_id": str(thread_id),
+        "review.mode": mode,
+    }
+    from .tracing import discord_source_url
+    outer_cm = (
+        agent_span(
+            AGENT_PR_REVIEW,
+            session_id=f"{AGENT_PR_REVIEW}:{config.github_repository}#{number}",
+            input_value=input_payload,
+            attributes=span_attrs,
+            source_type="discord",
+            source_url=discord_source_url(getattr(config, "discord_guild_id", None), thread_id),
+            source_title=f"PR #{number} {mode}",
+        )
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        with child_span(
+            child_name,
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=input_payload,
+            attributes=span_attrs,
+        ) as span:
+            try:
+                result = _run_sdk_session(ctx, task, config)
+            except RuntimeError as error:
+                if "not installed" not in str(error):
+                    raise
+                result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
+            result.verdict_posted = ctx.verdict_posted
+            result.ready = ctx.verdict_ready if ctx.verdict_posted else None
+            result.verdict = ctx.verdict
+            result.findings = list(ctx.verdict_findings)
+            result.bullets = list(ctx.verdict_bullets)
+            result.posted_message_ids = list(ctx.posted_ids)
+            if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
+                result.head_sha = ctx.snapshot.head_sha
+            if not ctx.verdict_posted and not ctx.posted_ids:
+                note = result.text or "i didn't finish a verdict. try /recheck."
+                lowered = note.lower()
+                if mode == "review" and not result.exhausted and ("ready for maintainer" in lowered or lowered.startswith("looks good")):
+                    note = "i didn't file a verdict, so this isn't ready for a maintainer. try /recheck."
+                if mode == "followup" or result.exhausted or mode == "review":
+                    try:
+                        _post_text(ctx, note)
+                        result.posted_message_ids = list(ctx.posted_ids)
+                    except Exception:
+                        logging.exception("Could not post the agent note for #%s", number)
+            primary_msg_id = result.posted_message_ids[0] if result.posted_message_ids else ""
+            result_attrs = {
+                "pr.number": int(number),
+                "review.verdict": result.verdict or ("followup" if mode == "followup" else "none"),
+                "review.verdict_posted": bool(result.verdict_posted),
+                "review.findings_count": len(result.findings),
+                "review.findings": result.findings[:10],
+                "review.bullets": result.bullets[:10],
+                "review.posted_message_ids": result.posted_message_ids,
+                "review.posted_message_id": primary_msg_id,
+                "review.steps": int(result.steps),
+            }
+            if result.ready is not None:
+                result_attrs["review.ready"] = bool(result.ready)
+            if result.exhausted:
+                result_attrs["review.exhausted"] = str(result.exhausted)
+            output_payload = {
+                "pr_number": int(number),
+                "mode": mode,
+                "verdict_posted": result.verdict_posted,
+                "verdict": result.verdict,
+                "ready": result.ready,
+                "findings_count": len(result.findings),
+                "findings": result.findings[:10],
+                "bullets": result.bullets[:10],
+                "posted_message_ids": result.posted_message_ids,
+                "posted_message_id": primary_msg_id,
+                "exhausted": result.exhausted,
+                "steps": result.steps,
+                "text": (result.text or "")[:1000],
+            }
+            span.set_attributes(result_attrs)
+            span.set_output(output_payload)
+            from .tracing import current_agent_span
+            target_agent = outer_span if outer_span is not None else current_agent_span()
+            if target_agent is not None and target_agent.active:
+                target_agent.set_attributes(result_attrs)
+                if outer_span is not None:
+                    outer_span.set_output(output_payload)
+            return result
 
 
 def history_text(messages: list[dict]) -> str:

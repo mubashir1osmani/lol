@@ -59,7 +59,22 @@ class NetworkBoundaryTests(unittest.TestCase):
         with mock.patch.object(api, '_open_request') as request:
             with self.assertRaises(ValueError):
                 api._http(Request('https://docs.litellm.ai/release_notes', headers={'Authorization': 'Bearer secret'}))
+            with self.assertRaises(ValueError):
+                api._http(Request('https://docs.litellm.ai/llms.txt', headers={'Authorization': 'Bearer secret'}))
+            with self.assertRaises(ValueError):
+                api._http(Request('https://docs.litellm.ai/llms.txt?q=1'))
+            with self.assertRaises(ValueError):
+                api._http(Request('https://docs.litellm.ai/docs/../admin.md'))
         request.assert_not_called()
+
+    def test_docs_kb_allowlist_permits_llms_txt_blog_rss_and_markdown_docs(self):
+        for url in (
+            "https://docs.litellm.ai/llms.txt",
+            "https://docs.litellm.ai/blog/rss.xml",
+            "https://docs.litellm.ai/docs/proxy/quick_start.md",
+        ):
+            with self.subTest(url=url):
+                api._validate_request(Request(url))
 
     def test_redirects_never_return_a_credentialed_followup_request(self):
         request = Request(

@@ -592,6 +592,18 @@ def _match_authors(
         members_source = diagnostics.members_source
         llm_source = diagnostics.llm_source
         enrichment_deferred = diagnostics.enrichment_deferred
+        from .tracing import current_span
+        current_span().set_attributes({
+            "engagement.contributors": diagnostics.contributor_count,
+            "engagement.members": diagnostics.member_count,
+            "engagement.members_source": diagnostics.members_source,
+            "engagement.candidates": diagnostics.candidate_pair_count,
+            "engagement.matched": diagnostics.matched_count,
+            "engagement.skipped": diagnostics.skipped_count,
+            "engagement.skip_reasons": dict(diagnostics.skip_reasons),
+            "engagement.methods": dict(diagnostics.method_counts),
+            "engagement.llm_source": diagnostics.llm_source,
+        })
     else:
         member_count = 0
         members_source = "stored"
@@ -836,13 +848,33 @@ def poll_merged_prs_for_roles(
         logging.info("Contributor roles poll skipped: another instance holds DB lease %s", lease_key)
         return None
 
+    from contextlib import ExitStack
+    from .tracing import AGENT_ENGAGEMENT, agent_span, current_agent_name
+
     t_start = time.monotonic()
     deadline = (t_start + deadline_seconds) if deadline_seconds is not None else None
     moment_iso = iso(moment)
     org = repo.split("/", 1)[0] if "/" in repo else ""
     token = config.effective_github_token
     search_fn = search_merged_fn or _search_merged_rows_per_day
+    span_stack = ExitStack()
+    outer_poll_span = None
     try:
+        if current_agent_name() is None:
+            outer_poll_span = span_stack.enter_context(
+                agent_span(
+                    AGENT_ENGAGEMENT,
+                    session_id=f"{AGENT_ENGAGEMENT}:roles_poll:{repo}:{moment.date().isoformat()}",
+                    input_value={"task": "roles_poll", "repository": repo, "announce_enabled": bool(config.roles_announce_enabled)},
+                    attributes={
+                        "engagement.task": "roles_poll",
+                        "engagement.repository": repo,
+                        "engagement.announce_enabled": bool(config.roles_announce_enabled),
+                    },
+                    source_type="discord",
+                    source_title="Daily contributor role match",
+                )
+            )
         window_start = moment - timedelta(days=DAILY_LOOKBACK_DAYS)
         window_start_iso = iso(window_start)
 
@@ -1085,13 +1117,56 @@ def poll_merged_prs_for_roles(
         except TransientAPIError as error:
             logging.warning("Batched role announcement deferred due to Discord rate limit: %s", error)
             rate_limited = True
+        from .tracing import current_span, log_decision
+
+        duration_s = round(time.monotonic() - t_start, 3)
         if not config.roles_announce_enabled and roles_granted > 0:
-            logging.info(
+            log_decision(
+                "roles_granted_silent",
                 "Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted %d roles silently",
                 roles_granted,
+                attributes={
+                    "engagement.roles_granted": roles_granted,
+                    "engagement.announce_enabled": False,
+                },
             )
 
-        logging.info(
+        poll_attrs = {
+            "engagement.prs_discovered": len(numbers),
+            "engagement.prs_stored": stored,
+            "engagement.prs_existing": skipped_existing,
+            "engagement.prs_excluded": skipped_excluded,
+            "engagement.files_skipped": files_skipped,
+            "engagement.authors_evaluated": len(author_list),
+            "engagement.authors_matched": matched_count,
+            "engagement.roles_granted": roles_granted,
+            "engagement.duration_seconds": duration_s,
+            "engagement.announce_enabled": bool(config.roles_announce_enabled),
+            "engagement.rate_limited": bool(rate_limited),
+            "engagement.timed_out": bool(timed_out),
+        }
+        active = current_span()
+        active.set_attributes(poll_attrs)
+        poll_output = {
+            "prs_discovered": len(numbers),
+            "prs_stored": stored,
+            "prs_existing": skipped_existing,
+            "prs_excluded": skipped_excluded,
+            "files_skipped": files_skipped,
+            "authors_evaluated": len(author_list),
+            "authors_matched": matched_count,
+            "roles_granted": roles_granted,
+            "duration_seconds": duration_s,
+            "announce_enabled": bool(config.roles_announce_enabled),
+            "rate_limited": bool(rate_limited),
+            "timed_out": bool(timed_out),
+        }
+        active.set_output(poll_output)
+        if outer_poll_span is not None:
+            outer_poll_span.set_attributes(poll_attrs)
+            outer_poll_span.set_output(poll_output)
+        log_decision(
+            "roles_poll_complete",
             "Contributor roles poll for %s complete: discovered=%d stored=%d existing=%d "
             "excluded=%d files_skipped=%d matched=%d/%d roles_granted=%d in %.2fs",
             repo,
@@ -1103,7 +1178,8 @@ def poll_merged_prs_for_roles(
             matched_count,
             len(author_list),
             roles_granted,
-            time.monotonic() - t_start,
+            duration_s,
+            attributes=poll_attrs,
         )
         return RolesPollResult(
             discovered=len(numbers),
@@ -1118,6 +1194,7 @@ def poll_merged_prs_for_roles(
             timed_out=timed_out,
         )
     finally:
+        span_stack.close()
         _try_release_lease(store, lease_key, lease_owner)
         _roles_poll_lock.release()
 
@@ -1292,15 +1369,61 @@ def run_daily_roles_if_due(
             run_date,
             local.strftime("%Y-%m-%d %H:%M %Z"),
         )
+        from contextlib import nullcontext
+        from .tracing import AGENT_ENGAGEMENT, agent_span, current_agent_name
+
         runner = poll_fn or poll_merged_prs_for_roles
-        result = runner(
-            config,
-            store,
-            guild=guild,
-            loop=loop,
-            now=moment,
-            **poll_kwargs,
+        eng_cm = (
+            agent_span(
+                AGENT_ENGAGEMENT,
+                session_id=f"{AGENT_ENGAGEMENT}:daily_roles:{repo}:{run_date}",
+                input_value={"task": "daily_roles", "repository": repo, "run_date": run_date, "force": force},
+                attributes={
+                    "engagement.task": "daily_roles",
+                    "engagement.repository": repo,
+                    "roles.announce_enabled": bool(config.roles_announce_enabled),
+                },
+                source_type="discord",
+                source_title="Daily contributor role match",
+            )
+            if current_agent_name() is None
+            else nullcontext()
         )
+        with eng_cm as eng_span:
+            result = runner(
+                config,
+                store,
+                guild=guild,
+                loop=loop,
+                now=moment,
+                **poll_kwargs,
+            )
+            if eng_span is not None and result is not None:
+                run_summary = {
+                    "prs_discovered": result.discovered,
+                    "prs_stored": result.stored,
+                    "prs_existing": result.skipped_existing,
+                    "prs_excluded": result.skipped_excluded,
+                    "files_skipped": result.files_skipped,
+                    "authors_evaluated": result.authors_evaluated,
+                    "authors_matched": result.authors_matched,
+                    "roles_granted": result.roles_granted,
+                    "announce_enabled": bool(config.roles_announce_enabled),
+                    "rate_limited": bool(result.rate_limited),
+                    "timed_out": bool(result.timed_out),
+                }
+                eng_span.set_attributes({
+                    "engagement.prs_discovered": result.discovered,
+                    "engagement.prs_stored": result.stored,
+                    "engagement.prs_existing": result.skipped_existing,
+                    "engagement.prs_excluded": result.skipped_excluded,
+                    "engagement.files_skipped": result.files_skipped,
+                    "engagement.authors_evaluated": result.authors_evaluated,
+                    "engagement.authors_matched": result.authors_matched,
+                    "engagement.roles_granted": result.roles_granted,
+                    "engagement.announce_enabled": bool(config.roles_announce_enabled),
+                })
+                eng_span.set_output(run_summary)
         if result is None:
             return None
         if result.rate_limited or result.timed_out:
@@ -2031,12 +2154,64 @@ def revalidate_all_grants_on_boot(
                         reason = "not_in_top5_candidates"
                     elif llm_complete is not None or _has_llm_credentials():
                         try:
-                            llm_res = _select_with_llm(
-                                config,
-                                profile,
-                                candidates,
-                                llm_complete=llm_complete,
+                            from contextlib import nullcontext
+                            from .tracing import AGENT_ENGAGEMENT, OPENINFERENCE_SPAN_KIND_CHAIN, agent_span, child_span, current_agent_name
+
+                            outer_cm = (
+                                agent_span(
+                                    AGENT_ENGAGEMENT,
+                                    session_id=f"{AGENT_ENGAGEMENT}:revalidate_grants:{repo}:{moment.date().isoformat()}",
+                                    input_value={"task": "revalidate_grants", "repository": repo, "github_login": login},
+                                    attributes={"engagement.task": "revalidate_grants", "engagement.repository": repo},
+                                    source_type="discord",
+                                    source_title="Contributor grants revalidation",
+                                )
+                                if current_agent_name() is None
+                                else nullcontext()
                             )
+                            with outer_cm:
+                                with child_span(
+                                    "role_matcher",
+                                    kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+                                    input_value={"github_login": login, "discord_id": discord_id},
+                                ) as rspan:
+                                    with child_span(
+                                        "match_contributor",
+                                        kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+                                        input_value={
+                                            "github_login": login,
+                                            "candidate_count": len(candidates),
+                                            "top_score": round(candidates[0].heuristic_score, 4) if candidates else 0.0,
+                                        },
+                                        attributes={
+                                            "contributor.github_login": login,
+                                            "contributor.candidate_count": len(candidates),
+                                            "contributor.top_score": round(candidates[0].heuristic_score, 4) if candidates else 0.0,
+                                        },
+                                    ) as cspan:
+                                        llm_res = _select_with_llm(
+                                            config,
+                                            profile,
+                                            candidates,
+                                            llm_complete=llm_complete,
+                                        )
+                                        accepted = _llm_selection_accepted(llm_res) and llm_res.discord_id == discord_id
+                                        cspan.set_attributes({
+                                            "contributor.method": "llm",
+                                            "contributor.outcome": "matched" if accepted else "skipped",
+                                            "contributor.discord_id": str(llm_res.discord_id or ""),
+                                            "contributor.confidence": round(float(llm_res.confidence), 4),
+                                            "contributor.skip_reason": "" if accepted else ("llm_none_of_these" if not llm_res.discord_id else "llm_below_threshold"),
+                                        })
+                                        cspan.set_output({
+                                            "github_login": login,
+                                            "outcome": "matched" if accepted else "skipped",
+                                            "discord_id": llm_res.discord_id,
+                                            "confidence": round(float(llm_res.confidence), 4),
+                                            "evidence": list(llm_res.evidence),
+                                            "reasoning": llm_res.reason or "",
+                                        })
+                                    rspan.set_output({"selected": llm_res.discord_id, "confidence": llm_res.confidence})
                             if _llm_selection_accepted(llm_res) and llm_res.discord_id == discord_id:
                                 passed = True
                                 reason = f"llm_verified:conf={llm_res.confidence:.2f},signals={len(llm_res.evidence)}"

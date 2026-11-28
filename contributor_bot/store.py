@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS review_threads (
     last_reviewed_at TEXT,
     last_followup_at TEXT,
     head_sha TEXT,
+    merged_at TEXT,
+    merge_commit_sha TEXT,
+    merge_notified_at TEXT,
+    release_url TEXT,
+    release_tag TEXT,
+    release_notified_at TEXT,
+    closed_unmerged_at TEXT,
     PRIMARY KEY (repository, number)
 );
 CREATE INDEX IF NOT EXISTS review_threads_thread_id
@@ -255,6 +262,22 @@ CREATE TABLE IF NOT EXISTS member_identity_notes (
 
 CREATE INDEX IF NOT EXISTS idx_member_identity_notes_login
     ON member_identity_notes(lower(inferred_github_login));
+
+CREATE TABLE IF NOT EXISTS kb_documents (
+    doc_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    content TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kb_documents_source
+    ON kb_documents(source);
+
+CREATE TABLE IF NOT EXISTS kb_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -288,6 +311,18 @@ class Store:
             if columns and "last_followup_at" not in columns:
                 self._conn.execute("ALTER TABLE review_threads ADD COLUMN last_followup_at TEXT")
             self._migrate_review_threads_drop_unique_thread_id()
+            rt_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(review_threads)")}
+            for col in (
+                "merged_at",
+                "merge_commit_sha",
+                "merge_notified_at",
+                "release_url",
+                "release_tag",
+                "release_notified_at",
+                "closed_unmerged_at",
+            ):
+                if rt_columns and col not in rt_columns:
+                    self._conn.execute(f"ALTER TABLE review_threads ADD COLUMN {col} TEXT")
             mw_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(merged_weeks)")}
             if mw_columns and "via" not in mw_columns:
                 self._conn.execute("ALTER TABLE merged_weeks ADD COLUMN via TEXT NOT NULL DEFAULT 'scheduler'")
@@ -2212,6 +2247,166 @@ class Store:
             "acquired_at": row["acquired_at"],
             "expires_at": row["expires_at"],
         }
+
+    # --- PR review thread lifecycle (merge + release tracking) ---
+
+    def active_lifecycle_review_threads(self, repository: str) -> list[dict]:
+        """Return tracked review threads not yet released and not closed unmerged."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM review_threads
+                WHERE repository = ?
+                  AND release_notified_at IS NULL
+                  AND closed_unmerged_at IS NULL
+                ORDER BY created_at ASC, number ASC
+                """,
+                (repository,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_review_thread_merged(
+        self,
+        repository: str,
+        number: int,
+        *,
+        merged_at: str,
+        merge_commit_sha: str = "",
+        notified_at: str | None = None,
+    ) -> None:
+        self._review_key(repository, number)
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE review_threads
+                SET merged_at = COALESCE(merged_at, ?),
+                    merge_commit_sha = CASE WHEN ? != '' THEN ? ELSE merge_commit_sha END,
+                    merge_notified_at = COALESCE(merge_notified_at, ?)
+                WHERE repository = ? AND number = ?
+                """,
+                (merged_at, merge_commit_sha, merge_commit_sha, notified_at, repository, number),
+            )
+            self._conn.commit()
+
+    def mark_review_thread_released(
+        self,
+        repository: str,
+        number: int,
+        *,
+        release_tag: str,
+        release_url: str,
+        notified_at: str,
+    ) -> None:
+        self._review_key(repository, number)
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE review_threads
+                SET release_tag = ?,
+                    release_url = ?,
+                    release_notified_at = ?
+                WHERE repository = ? AND number = ?
+                """,
+                (release_tag, release_url, notified_at, repository, number),
+            )
+            self._conn.commit()
+
+    def mark_review_thread_closed_unmerged(
+        self,
+        repository: str,
+        number: int,
+        *,
+        closed_at: str,
+    ) -> None:
+        self._review_key(repository, number)
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE review_threads
+                SET closed_unmerged_at = ?
+                WHERE repository = ? AND number = ?
+                """,
+                (closed_at, repository, number),
+            )
+            self._conn.commit()
+
+    # --- LiteLLM Knowledge Base cache (support_agent) ---
+
+    def kb_meta_get(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM kb_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def kb_meta_set(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO kb_meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            self._conn.commit()
+
+    def save_kb_documents(self, docs: list[dict], *, replace_sources: tuple[str, ...] = ()) -> int:
+        """Persist KB documents; optionally replace all rows for ``replace_sources``."""
+        with self._lock:
+            with self._conn:
+                if replace_sources:
+                    placeholders = ", ".join("?" for _ in replace_sources)
+                    self._conn.execute(
+                        f"DELETE FROM kb_documents WHERE source IN ({placeholders})",
+                        tuple(replace_sources),
+                    )
+                for doc in docs:
+                    self._conn.execute(
+                        """
+                        INSERT INTO kb_documents (doc_id, source, title, url, content, fetched_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(doc_id) DO UPDATE SET
+                            source = excluded.source,
+                            title = excluded.title,
+                            url = excluded.url,
+                            content = excluded.content,
+                            fetched_at = excluded.fetched_at
+                        """,
+                        (
+                            str(doc["doc_id"]),
+                            str(doc["source"]),
+                            str(doc["title"]),
+                            str(doc["url"]),
+                            str(doc["content"]),
+                            str(doc["fetched_at"]),
+                        ),
+                    )
+        return len(docs)
+
+    def upsert_kb_document(self, doc: dict) -> None:
+        self.save_kb_documents([doc])
+
+    def get_kb_document(self, doc_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT doc_id, source, title, url, content, fetched_at FROM kb_documents WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def load_kb_documents(self, *, source: str | None = None) -> list[dict]:
+        with self._lock:
+            if source:
+                rows = self._conn.execute(
+                    "SELECT doc_id, source, title, url, content, fetched_at FROM kb_documents WHERE source = ? ORDER BY doc_id ASC",
+                    (source,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT doc_id, source, title, url, content, fetched_at FROM kb_documents ORDER BY doc_id ASC"
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _review_key(repository: str, number: int) -> None:
