@@ -163,6 +163,16 @@ CREATE TABLE IF NOT EXISTS author_merged_counts (
     PRIMARY KEY (repository, github_login)
 );
 
+CREATE TABLE IF NOT EXISTS roles_daily_runs (
+    repository TEXT NOT NULL,
+    run_date TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    via TEXT NOT NULL DEFAULT 'scheduler',
+    prs_discovered INTEGER NOT NULL DEFAULT 0,
+    roles_granted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (repository, run_date)
+);
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY,
     applied_at TEXT NOT NULL
@@ -488,6 +498,17 @@ class Store:
                 ORDER BY granted_at, role_key
                 """,
                 (discord_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def all_unannounced_grants(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT discord_id, role_key, role_name, granted_at FROM role_grants
+                WHERE announced_at IS NULL
+                ORDER BY granted_at, discord_id, role_key
+                """
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1017,6 +1038,61 @@ class Store:
                 (key, value, updated_at),
             )
             self._conn.commit()
+
+    def roles_day_completed(self, repository: str, run_date: str) -> bool:
+        return self.roles_day_info(repository, run_date) is not None
+
+    def roles_day_info(self, repository: str, run_date: str) -> dict | None:
+        """Return daily roles run metadata if ``run_date`` (YYYY-MM-DD) already completed."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT run_date, completed_at, via, prs_discovered, roles_granted
+                FROM roles_daily_runs
+                WHERE lower(repository) = lower(?) AND run_date = ?
+                ORDER BY completed_at DESC
+                LIMIT 1
+                """,
+                (repository, run_date),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_roles_day(
+        self,
+        repository: str,
+        run_date: str,
+        completed_at: str,
+        *,
+        via: str = "scheduler",
+        prs_discovered: int = 0,
+        roles_granted: int = 0,
+    ) -> bool:
+        """Record a completed daily contributor-roles run. Returns False if already marked."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT 1 FROM roles_daily_runs WHERE lower(repository) = lower(?) AND run_date = ?",
+                (repository, run_date),
+            ).fetchone()
+            if existing is not None:
+                return False
+            cursor = self._conn.execute(
+                """
+                INSERT INTO roles_daily_runs (
+                    repository, run_date, completed_at, via, prs_discovered, roles_granted
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repository, run_date) DO NOTHING
+                """,
+                (
+                    repository,
+                    run_date,
+                    completed_at,
+                    via,
+                    int(prs_discovered),
+                    int(roles_granted),
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def get_author_merged_count(self, repository: str, github_login: str) -> dict | None:
         key = (github_login or "").strip().lower()

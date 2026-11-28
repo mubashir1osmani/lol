@@ -164,20 +164,25 @@ Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 | Provider Wizard | 3+ merged PRs that touch `litellm/llms/` |
 
 Bots, `MAINTAINER_GITHUB_LOGINS`, GitHub org members, and BerriAI staff handles
-are ignored. Every ~10 minutes (`ROLES_POLL_SECONDS`, default `600`), the bot
-polls newly merged PRs since a SQLite checkpoint, stores their metadata
-(`number`, author, `merged_at`, labels, and changed file paths — fetching file
-lists only when still needed for Agent Builder or Provider Wizard), caches each
-author's lifetime merged PR `total_count` via one GitHub search
-(`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental updates
-from the poller, resolves community PR authors to Discord members using the
-same automatic matcher as the weekly summary (`exact_login`, TypeSafe Jev,
+are ignored. Once a day at `ROLES_DAILY_TIME` (default `10:00`
+`America/Toronto`; on Fridays right after the weekly merge summary, and still
+running independently if the summary fails or skips), the bot checks all PRs
+merged since its SQLite checkpoint, stores their metadata (`number`, author,
+`merged_at`, labels, and changed file paths — fetching file lists only when
+still needed for Agent Builder or Provider Wizard), caches each author's
+lifetime merged PR `total_count` via one GitHub search
+(`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental
+updates, resolves community PR authors to Discord members using the same
+automatic matcher as the weekly summary (`exact_login`, TypeSafe Jev,
 deterministic fallback, cached in SQLite with a 30-day TTL — never assigning on
-ambiguous ties), and grants newly earned roles. Ongoing new role grants post a
-short `<@user> just became an oss champion 🎉` line to
-`ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Roles are sticky: the bot adds them and never
-removes them. Docs Hero is no longer granted; anyone who already has that
-Discord role keeps it.
+ambiguous ties), grants newly earned roles, and **batches all new role
+announcements into a single message** (chunked only if needed, posting nothing
+when there are zero new grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each
+completed local date is recorded in `roles_daily_runs` so restarts and
+redeploys never run or announce twice on the same day, while catching up
+automatically if the bot was offline at `10:00`. Roles are sticky: the bot adds
+them and never removes them. Docs Hero is no longer granted; anyone who already
+has that Discord role keeps it.
 
 ### Minimal setup (no GitHub OAuth or webhook required)
 
@@ -195,9 +200,11 @@ Discord role keeps it.
      `ROLE_PROVIDER_WIZARD_ID` (optional `ROLE_*_NAME` overrides change
      announcement copy only)
    - `ROLE_ANNOUNCEMENTS_CHANNEL_ID`
-   - Optional: `ROLES_POLL_SECONDS=600`, `ROLES_BACKFILL_ON_BOOT=true` (one-time
-     historical backfill on startup), `BACKFILL_SINCE=2023-01-01T00:00:00Z`,
-     `GITHUB_TOKEN` (or `GITHUB_ACTOR_TOKEN`) for higher GitHub read limits.
+   - Optional: `ROLES_DAILY_TIME=10:00` (24-hour `HH:MM` in
+     `MERGED_POST_TIMEZONE`, default `America/Toronto`),
+     `ROLES_BACKFILL_ON_BOOT=true` (one-time historical backfill on startup),
+     `BACKFILL_SINCE=2023-01-01T00:00:00Z`, `GITHUB_TOKEN` (or
+     `GITHUB_ACTOR_TOKEN`) for higher GitHub read limits.
 4. **Historical backfill**: either set `ROLES_BACKFILL_ON_BOOT=true` for a
    one-time boot run, or have a moderator run `/roles-backfill` in Discord
    (ephemeral, rate-limit aware, time-bounded, resumable). Backfill assigns

@@ -301,25 +301,33 @@ def _start_status_rotation_task(discord, client, config: Config):
 
 
 def _start_weekly_task(discord, client, config, store):
-    """Check every 60s so Render restarts before or after the scheduled minute never miss or double-post."""
-    if store is None or not config.merged_weekly_enabled:
+    """Check every 60s so Render restarts before or after scheduled runs never miss or double-post."""
+    roles_daily = bool(config.contributor_roles_enabled)
+    if store is None or (not config.merged_weekly_enabled and not roles_daily):
         return None
     from discord.ext import tasks
+    from .roles_sync import log_roles_daily_boot_status, run_daily_roles_if_due
     from .weekly import log_weekly_boot_status, post_weekly_if_due
 
     @tasks.loop(seconds=60)
     async def merged_weekly_post():
-        try:
-            guild = None
-            if config.discord_guild_id and hasattr(client, "get_guild"):
-                try:
-                    guild = client.get_guild(int(config.discord_guild_id))
-                except (TypeError, ValueError):
-                    guild = None
-            loop = asyncio.get_running_loop()
-            await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
-        except Exception:
-            logging.exception("Weekly merge summary check failed; will retry on next tick")
+        guild = None
+        if config.discord_guild_id and hasattr(client, "get_guild"):
+            try:
+                guild = client.get_guild(int(config.discord_guild_id))
+            except (TypeError, ValueError):
+                guild = None
+        loop = asyncio.get_running_loop()
+        if config.merged_weekly_enabled:
+            try:
+                await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
+            except Exception:
+                logging.exception("Weekly merge summary check failed; will retry on next tick")
+        if roles_daily:
+            try:
+                await asyncio.to_thread(run_daily_roles_if_due, config, store, guild=guild, loop=loop)
+            except Exception:
+                logging.exception("Daily contributor roles check failed; will retry on next tick")
 
     @merged_weekly_post.before_loop
     async def wait_until_ready():
@@ -330,7 +338,10 @@ def _start_weekly_task(discord, client, config, store):
                 guild = client.get_guild(int(config.discord_guild_id))
             except (TypeError, ValueError):
                 guild = None
-        await asyncio.to_thread(log_weekly_boot_status, config, store, guild=guild)
+        if config.merged_weekly_enabled:
+            await asyncio.to_thread(log_weekly_boot_status, config, store, guild=guild)
+        if roles_daily:
+            await asyncio.to_thread(log_roles_daily_boot_status, config, store)
 
     @merged_weekly_post.error
     async def on_weekly_error(error):

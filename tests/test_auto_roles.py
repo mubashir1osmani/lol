@@ -16,7 +16,12 @@ from contributor_bot.interactions import (
 )
 from contributor_bot.matcher import DiscordMemberInfo
 from contributor_bot.roles_sync import (
+    RolesPollResult,
+    log_roles_daily_boot_status,
     poll_merged_prs_for_roles,
+    reset_roles_daily_scheduler_state,
+    roles_daily_schedule_status,
+    run_daily_roles_if_due,
     run_roles_backfill,
     should_run_boot_backfill,
 )
@@ -543,19 +548,22 @@ class AutoRolesBackfillTests(unittest.TestCase):
         self.assertEqual(add_role.call_count, 1)
         self.assertEqual(summary_post.call_count, 1)
 
-    def test_main_run_loop_triggers_roles_poll_and_boot_backfill(self):
+    def test_main_run_loop_runs_daily_roles_after_summary_and_independently_on_summary_failure(self):
         from contributor_bot.main import _run_loop
 
         stop_event = threading.Event()
-        poll_calls = []
-        boot_calls = []
+        events = []
 
-        def fake_poll(cfg, st, **kwargs):
-            poll_calls.append(kwargs)
+        def failing_weekly(cfg, st, **kwargs):
+            events.append("weekly_summary_failed")
+            raise RuntimeError("summary boom")
+
+        def fake_daily_roles(cfg, st, **kwargs):
+            events.append("daily_roles")
             stop_event.set()
 
         def fake_boot(cfg, st, guild=None, loop=None):
-            boot_calls.append((cfg.github_repository, st))
+            events.append("boot_backfill")
 
         def inline_thread(target, args=(), name=None, daemon=None):
             class Started:
@@ -566,16 +574,244 @@ class AutoRolesBackfillTests(unittest.TestCase):
         cfg = get_config(minimal_roles_env(
             self.temp.name,
             ANNOUNCEMENTS_ENABLED="false",
-            MERGED_WEEKLY_ENABLED="false",
+            MERGED_WEEKLY_ENABLED="true",
             ROLES_BACKFILL_ON_BOOT="true",
         ))
-        with mock.patch("contributor_bot.main.poll_merged_prs_for_roles", side_effect=fake_poll), \
+        with mock.patch("contributor_bot.main.log_weekly_boot_status"), \
+             mock.patch("contributor_bot.main.post_weekly_if_due", side_effect=failing_weekly), \
+             mock.patch("contributor_bot.main.run_daily_roles_if_due", side_effect=fake_daily_roles), \
              mock.patch("contributor_bot.main._run_boot_backfill", side_effect=fake_boot), \
              mock.patch("contributor_bot.main.threading.Thread", inline_thread):
             _run_loop(cfg, stop_event, store=self.store, gateway=None)
 
+        self.assertEqual(events, ["weekly_summary_failed", "boot_backfill", "daily_roles"])
+
+
+class DailyRolesSchedulerTests(unittest.TestCase):
+    def setUp(self):
+        reset_roles_daily_scheduler_state()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = get_config(minimal_roles_env(self.temp.name))
+        self.store = Store(self.config.roles_db_path)
+        self.addCleanup(self.store.close)
+
+    def test_daily_schedule_runs_once_per_local_day_with_restart_dedupe(self):
+        # Thursday 09:59 EST (14:59 UTC) -> before 10:00, skip
+        thu_before = datetime(2026, 11, 26, 14, 59, tzinfo=UTC)
+        # Thursday 10:00 EST (15:00 UTC) -> due!
+        thu_ten = datetime(2026, 11, 26, 15, 0, tzinfo=UTC)
+        # Thursday 21:42 EST (2026-11-27 02:42 UTC) -> still 2026-11-26 local, must skip after restart!
+        thu_night = datetime(2026, 11, 27, 2, 42, tzinfo=UTC)
+        # Friday 09:59 EST (14:59 UTC) -> new local day (2026-11-27), before 10:00 -> skip
+        fri_before = datetime(2026, 11, 27, 14, 59, tzinfo=UTC)
+        # Friday 10:00 EST (15:00 UTC) -> due for 2026-11-27!
+        fri_ten = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+
+        poll_calls = []
+
+        def fake_poll(cfg, st, **kwargs):
+            poll_calls.append(kwargs["now"])
+            return RolesPollResult(
+                discovered=7,
+                stored=5,
+                skipped_existing=1,
+                skipped_excluded=1,
+                authors_evaluated=3,
+                authors_matched=2,
+                roles_granted=3,
+            )
+
+        self.assertIsNone(run_daily_roles_if_due(self.config, self.store, thu_before, poll_fn=fake_poll))
+        self.assertEqual(poll_calls, [])
+
+        with self.assertLogs(level="INFO") as logs:
+            res = run_daily_roles_if_due(self.config, self.store, thu_ten, poll_fn=fake_poll)
+        self.assertIsNotNone(res)
         self.assertEqual(len(poll_calls), 1)
-        self.assertEqual(len(boot_calls), 1)
+        self.assertTrue(
+            any("Contributor roles daily run for 2026-11-26: 5 PRs, 3 new grants" in line for line in logs.output)
+        )
+        info = self.store.roles_day_info("BerriAI/litellm", "2026-11-26")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["via"], "scheduler")
+        self.assertEqual(info["roles_granted"], 3)
+
+        # Simulate restart/redeploy later the same local day (2026-11-27 02:42 UTC = 2026-11-26 21:42 EST).
+        self.store.close()
+        reset_roles_daily_scheduler_state()
+        reopened = Store(self.config.roles_db_path)
+        self.store = reopened
+
+        with self.assertLogs(level="INFO") as boot_logs:
+            log_roles_daily_boot_status(self.config, reopened, thu_night)
+        joined = "\n".join(boot_logs.output)
+        self.assertIn(
+            "Contributor roles daily run 2026-11-26 already completed at 2026-11-26T15:00:00+00:00 via scheduler; skipping",
+            joined,
+        )
+        self.assertNotIn("due now", joined)
+
+        with self.assertLogs(level="INFO") as skip_logs:
+            again = run_daily_roles_if_due(self.config, reopened, thu_night, poll_fn=fake_poll)
+        self.assertIsNone(again)
+        self.assertEqual(len(poll_calls), 1)
+        self.assertTrue(
+            any("Contributor roles daily run 2026-11-26 already completed" in line for line in skip_logs.output)
+        )
+
+        # Next day (2026-11-27): waits until 10:00 EST, then runs fresh!
+        self.assertIsNone(run_daily_roles_if_due(self.config, reopened, fri_before, poll_fn=fake_poll))
+        self.assertEqual(len(poll_calls), 1)
+        res_next = run_daily_roles_if_due(self.config, reopened, fri_ten, poll_fn=fake_poll)
+        self.assertIsNotNone(res_next)
+        self.assertEqual(len(poll_calls), 2)
+        self.assertTrue(reopened.roles_day_completed("BerriAI/litellm", "2026-11-27"))
+
+    def test_daily_catch_up_after_downtime_and_rate_limit_retries_without_marking(self):
+        # Bot was down at 10:00 EST and boots at 16:30 EST (21:30 UTC).
+        late_afternoon = datetime(2026, 11, 27, 21, 30, tzinfo=UTC)
+        self.assertIn("due now (will catch up)", roles_daily_schedule_status(self.config, self.store, late_afternoon))
+
+        # 1) First attempt hits GitHub rate limit -> day stays unmarked!
+        now_clock = {"t": 100.0}
+        rate_limited_result = RolesPollResult(
+            discovered=0, stored=0, skipped_existing=0, skipped_excluded=0,
+            authors_evaluated=0, authors_matched=0, roles_granted=0, rate_limited=True,
+        )
+        res1 = run_daily_roles_if_due(
+            self.config,
+            self.store,
+            late_afternoon,
+            clock=lambda: now_clock["t"],
+            poll_fn=lambda *a, **k: rate_limited_result,
+        )
+        self.assertTrue(res1.rate_limited)
+        self.assertFalse(self.store.roles_day_completed("BerriAI/litellm", "2026-11-27"))
+
+        # Within backoff window -> skipped cleanly.
+        self.assertIsNone(
+            run_daily_roles_if_due(
+                self.config,
+                self.store,
+                late_afternoon,
+                clock=lambda: now_clock["t"] + 30.0,
+                poll_fn=mock.Mock(side_effect=AssertionError("should respect backoff")),
+            )
+        )
+
+        # After backoff expires -> catches up and marks 2026-11-27!
+        now_clock["t"] += 400.0
+        ok_result = RolesPollResult(
+            discovered=2, stored=2, skipped_existing=0, skipped_excluded=0,
+            authors_evaluated=1, authors_matched=1, roles_granted=1,
+        )
+        res2 = run_daily_roles_if_due(
+            self.config,
+            self.store,
+            late_afternoon,
+            clock=lambda: now_clock["t"],
+            poll_fn=lambda *a, **k: ok_result,
+        )
+        self.assertEqual(res2.roles_granted, 1)
+        self.assertTrue(self.store.roles_day_completed("BerriAI/litellm", "2026-11-27"))
+
+    def test_daily_roles_batches_announcements_chunks_and_posts_nothing_when_zero_grants(self):
+        members = [
+            _member("5001", "alice-dev", "Alice Dev"),
+            _member("5002", "bob-dev", "Bob Dev"),
+            _member("5003", "carol-dev", "Carol Dev"),
+        ]
+        pulls = {
+            601: {
+                "number": 601, "merged": True, "merged_at": "2026-11-26T18:00:00Z", "title": "alice pr",
+                "user": {"login": "alice-dev", "id": 801, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+            602: {
+                "number": 602, "merged": True, "merged_at": "2026-11-26T19:00:00Z", "title": "bob agent pr",
+                "user": {"login": "bob-dev", "id": 802, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": ["agents"],
+            },
+            603: {
+                "number": 603, "merged": True, "merged_at": "2026-11-27T12:00:00Z", "title": "carol pr",
+                "user": {"login": "carol-dev", "id": 803, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+        }
+        day1 = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+
+        # 1) All 3 contributors fit in ONE batched message instead of 3 separate messages!
+        posted = []
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
+             mock.patch("contributor_bot.rewards.post_message", side_effect=lambda ch, tok, body: (posted.append(body), {"id": "1"})[1]):
+            res = run_daily_roles_if_due(
+                self.config,
+                self.store,
+                day1,
+                search_merged_fn=lambda repo, start, end, tok: set(pulls.keys()),
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+
+        self.assertEqual(res.stored, 3)
+        self.assertEqual(res.roles_granted, 4)  # alice(1), bob(2: contributor + agent_builder), carol(1)
+        self.assertEqual(add_role.call_count, 4)
+        self.assertEqual(len(posted), 1)
+        lines = posted[0]["content"].splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("<@5001> just became a contributor 🎉", lines)
+        self.assertIn("<@5002> just became a contributor and an agent builder 🎉", lines)
+        self.assertIn("<@5003> just became a contributor 🎉", lines)
+        self.assertEqual(set(posted[0]["allowed_mentions"]["users"]), {"5001", "5002", "5003"})
+        self.assertEqual(self.store.all_unannounced_grants(), [])
+
+        # 2) Next day with zero new grants (no new PRs) posts NOTHING and marks the day complete!
+        day2 = datetime(2026, 11, 28, 15, 0, tzinfo=UTC)
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role_zero, \
+             mock.patch("contributor_bot.rewards.post_message") as post_zero, \
+             self.assertLogs(level="INFO") as zero_logs:
+            res_zero = run_daily_roles_if_due(
+                self.config,
+                self.store,
+                day2,
+                search_merged_fn=lambda repo, start, end, tok: set(),
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+        self.assertEqual(res_zero.stored, 0)
+        self.assertEqual(res_zero.roles_granted, 0)
+        add_role_zero.assert_not_called()
+        post_zero.assert_not_called()
+        self.assertTrue(self.store.roles_day_completed("BerriAI/litellm", "2026-11-28"))
+        self.assertTrue(
+            any("Contributor roles daily run for 2026-11-28: 0 PRs, 0 new grants" in line for line in zero_logs.output)
+        )
+
+        # 3) Verify chunking when combined message exceeds limit.
+        chunk_store = Store(str(Path(self.temp.name) / "chunk.db"))
+        self.addCleanup(chunk_store.close)
+        reset_roles_daily_scheduler_state()
+        chunked_posts = []
+        with mock.patch("contributor_bot.rewards.add_member_role"), \
+             mock.patch("contributor_bot.rewards.post_message", side_effect=lambda ch, tok, body: (chunked_posts.append(body), {"id": "2"})[1]):
+            run_daily_roles_if_due(
+                self.config,
+                chunk_store,
+                day1,
+                announcement_chunk_limit=80,
+                search_merged_fn=lambda repo, start, end, tok: set(pulls.keys()),
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+        self.assertEqual(len(chunked_posts), 3)
+        self.assertEqual(chunk_store.all_unannounced_grants(), [])
 
 
 if __name__ == "__main__":

@@ -81,6 +81,7 @@ def apply_roles(
     pr_number: int | None = None,
     shoutout: bool = False,
     announce: bool = True,
+    mark_announced: bool = True,
     lifetime_merged_count: int | None = None,
 ) -> list[str]:
     """Grant any newly earned roles and optionally post one announcement when something is new.
@@ -112,7 +113,7 @@ def apply_roles(
         if store.record_grant(discord_id, key, name, now):
             newly_granted.append(key)
     if not announce:
-        if newly_granted:
+        if newly_granted and mark_announced:
             store.mark_grants_announced(discord_id, newly_granted, now)
         return newly_granted
     pending = store.unannounced_grants(discord_id)
@@ -154,6 +155,98 @@ def apply_roles(
     if want_shoutout and pr_number:
         store.mark_shoutout(config.github_repository, pr_number, now)
     return newly_granted
+
+
+ROLE_ANNOUNCEMENT_CHUNK_LIMIT = 1900
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def announce_pending_role_grants(
+    config: Config,
+    store: Store,
+    *,
+    now: datetime | None = None,
+    limit: int = ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
+    post=None,
+) -> int:
+    """Post all unannounced role grants batched into one message (chunked if needed).
+
+    Posts nothing when there are no unannounced grants. Marks each chunk's grants
+    as announced immediately after that chunk succeeds so retries never duplicate.
+    Returns the number of chunks posted.
+    """
+    rows = store.all_unannounced_grants()
+    if not rows:
+        return 0
+    channel_id = config.role_announcements_channel_id
+    if not channel_id:
+        logging.warning(
+            "ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; %d role grant(s) left unannounced",
+            len(rows),
+        )
+        return 0
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        uid = str(row["discord_id"])
+        grouped.setdefault(uid, []).append(row)
+
+    entries: list[tuple[str, list[str], str]] = []
+    for uid, grants in grouped.items():
+        grants.sort(key=lambda grant: _ROLE_ORDER.get(grant["role_key"], len(ROLE_KEYS)))
+        names = [grant["role_name"] for grant in grants]
+        keys = [grant["role_key"] for grant in grants]
+        entries.append((uid, keys, announcement_text(uid, names)))
+
+    chunks: list[tuple[str, list[tuple[str, list[str]]]]] = []
+    current_lines: list[str] = []
+    current_items: list[tuple[str, list[str]]] = []
+    current_len = 0
+
+    for uid, keys, line in entries:
+        line_len = _utf16_len(line)
+        sep_len = 1 if current_lines else 0
+        if current_lines and (
+            current_len + sep_len + line_len > limit or len(current_items) >= 100
+        ):
+            chunks.append(("\n".join(current_lines), current_items))
+            current_lines = [line]
+            current_items = [(uid, keys)]
+            current_len = line_len
+        else:
+            current_lines.append(line)
+            current_items.append((uid, keys))
+            current_len += sep_len + line_len
+    if current_lines:
+        chunks.append(("\n".join(current_lines), current_items))
+
+    sender = post or post_message
+    announced_at = iso(now or datetime.now(UTC))
+    posted_chunks = 0
+    for content, items in chunks:
+        users = [uid for uid, _keys in items]
+        try:
+            sender(channel_id, config.discord_token, {
+                "content": content,
+                "allowed_mentions": {"parse": [], "users": users},
+            })
+        except TransientAPIError:
+            raise
+        except RuntimeError as error:
+            logging.error(
+                "Could not post batched role announcement in channel %s: %s. "
+                "The bot needs View Channel and Send Messages there.",
+                channel_id,
+                error,
+            )
+            return posted_chunks
+        for uid, keys in items:
+            store.mark_grants_announced(uid, keys, announced_at)
+        posted_chunks += 1
+    return posted_chunks
 
 
 def _maybe_invite(config: Config, store: Store, login: str, github_user_id: int, number: int) -> str:
