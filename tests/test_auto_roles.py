@@ -1070,6 +1070,108 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         self.assertTrue(r2.completed)
         self.assertEqual([c.args[1] for c in add_role2.call_args_list], ["8001"])
 
+    def test_priority_pool_matches_recent_joiners_and_posters_before_full_fallback(self):
+        from types import SimpleNamespace
+        from contributor_bot.matcher import (
+            match_community_contributors_with_diagnostics,
+            member_from_raw,
+            record_recent_poster,
+            reset_guild_members_cache,
+        )
+
+        reset_guild_members_cache()
+        self.addCleanup(reset_guild_members_cache)
+        now = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+
+        # Verify member_from_raw parses joined_at from both REST dicts and discord.Member-style objects.
+        recent_john = member_from_raw({
+            "user": {"id": "9001", "username": "john_recent", "global_name": "John Smith"},
+            "joined_at": "2026-11-20T12:00:00+00:00",  # 7 days ago -> in recent pool
+        })
+        old_john = member_from_raw(SimpleNamespace(
+            id=9002,
+            name="john_ancient",
+            global_name="John Smith",
+            nick=None,
+            display_name="John Smith",
+            bot=False,
+            joined_at=datetime(2024, 1, 10, 12, 0, tzinfo=UTC),  # >30 days ago -> full pool only
+        ))
+        active_poster = member_from_raw({
+            "user": {"id": "9003", "username": "mira_codes", "global_name": "Mira K"},
+            "joined_at": "2024-06-01T12:00:00+00:00",  # joined long ago, BUT posted recently!
+        })
+        old_lookalike = member_from_raw({
+            "user": {"id": "9004", "username": "mira_coder", "global_name": "Mira L"},
+            "joined_at": "2024-02-01T12:00:00+00:00",  # full pool only
+        })
+        veteran = member_from_raw({
+            "user": {"id": "9005", "username": "veteran_dev", "global_name": "Veteran Dev"},
+            "joined_at": "2023-08-01T12:00:00+00:00",  # full pool only
+        })
+        members = [recent_john, old_john, active_poster, old_lookalike, veteran]
+
+        cfg = get_config(minimal_roles_env(self.temp.name, TYPESAFE_API_KEY="jev-test-key"))
+        # Mark 9003 as a recent poster in this guild (cheap in-memory tracking).
+        record_recent_poster(cfg.discord_guild_id, "9003", at=datetime(2026, 11, 26, 10, 0, tzinfo=UTC))
+
+        groups = [
+            # 1) "John Smith" would be an ambiguous tie in full pool, but uniquely matches recent_john in priority pool (0 LLM calls!).
+            {"login": "gh-jsmith", "user_id": 9101, "pulls": []},
+            # 2) Fuzzy match to recent poster 9003 -> Jev sees ONLY 9003 from recent pool, never calls Jev on full pool!
+            {"login": "miracode", "user_id": 9102, "pulls": []},
+            # 3) No match in recent pool -> falls back to full pool and matches veteran (9005)!
+            {"login": "veteran-dev", "user_id": 9103, "pulls": []},
+        ]
+
+        profiles = {
+            "gh-jsmith": {"login": "gh-jsmith", "name": "John Smith", "bio": "", "blog": "", "twitter_username": ""},
+            "miracode": {"login": "miracode", "name": "Mira", "bio": "", "blog": "", "twitter_username": ""},
+            "veteran-dev": {"login": "veteran-dev", "name": "Veteran Dev", "bio": "", "blog": "", "twitter_username": ""},
+        }
+
+        def fake_github_get(url, token, **kwargs):
+            login = url.rsplit("/", 1)[-1]
+            return profiles.get(login, {})
+
+        jev_calls = []
+
+        def fake_jev(body_bytes):
+            import json as _json
+            payload = _json.loads(body_bytes.decode("utf-8"))
+            state = _json.loads(payload["state"])
+            pairs = state["candidate_pairs"]
+            jev_calls.append([(p["github"]["login"], p["discord"]["id"]) for p in pairs])
+            answers = {}
+            for p in pairs:
+                score = 0.93 if (p["github"]["login"] == "miracode" and p["discord"]["id"] == "9003") else 0.1
+                answers[p["pair"]] = {"type": "noul", "noul": score}
+            return {"model": "jev-1.14.0", "answers": answers}
+
+        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": "jev-test-key"}, clear=False), \
+             self.assertLogs(level="INFO") as logs:
+            matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
+                groups,
+                cfg,
+                self.store,
+                now=now,
+                members=members,
+                github_getter=fake_github_get,
+                jev_transport=fake_jev,
+            )
+
+        self.assertEqual(skipped, 0)
+        by_login = {g["login"]: g["discord_id"] for g in matched}
+        self.assertEqual(by_login, {
+            "gh-jsmith": "9001",    # matched recent_john uniquely in priority pool!
+            "miracode": "9003",     # matched recent poster via priority-pool Jev!
+            "veteran-dev": "9005",  # fell back to full member list!
+        })
+        # Exact pool-size log emitted!
+        self.assertTrue(any("match pool: recent=2 full=5" in line for line in logs.output))
+        # Jev was called ONLY ONCE (on the recent pool for miracode -> 9003), NEVER on the full pool (9002 or 9004)!
+        self.assertEqual(jev_calls, [[("miracode", "9003")]])
+
 
 if __name__ == "__main__":
     unittest.main()

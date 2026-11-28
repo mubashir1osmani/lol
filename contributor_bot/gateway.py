@@ -23,6 +23,7 @@ from .interactions import (
     handle_interaction,
     role_slash_commands,
 )
+from .matcher import record_recent_poster
 from .review_job import handle_channel_message, handle_thread_message
 from .store import Store
 
@@ -199,6 +200,7 @@ class Gateway:
         async def on_message(message):
             if self._stop.is_set() or message.author.bot or message.guild is None:
                 return
+            record_recent_poster(str(message.guild.id), str(message.author.id))
             if store is None:
                 return
             try:

@@ -55,11 +55,15 @@ MAX_PAIRS_PER_BATCH = 30
 FUZZY_CANDIDATE_THRESHOLD = 0.72
 MATCH_CACHE_TTL_DAYS = 30
 GITHUB_USER_CACHE_TTL_DAYS = 7
+PRIORITY_POOL_JOINED_DAYS = 30
+RECENT_POSTERS_MAX_PER_GUILD = 5000
 REST_MEMBERS_CACHE_TTL_SECONDS = 900.0
 GUILD_FETCH_TIMEOUT_SECONDS = 60.0
 
 _rest_members_lock = threading.Lock()
 _rest_members_cache: dict[str, tuple[list["DiscordMemberInfo"], float]] = {}
+_recent_posters_lock = threading.Lock()
+_recent_posters: dict[str, dict[str, datetime]] = {}
 
 _DISCORD_USER_URL = re.compile(
     r"https?://(?:www\.)?(?:discord\.com|discordapp\.com)/users/([1-9][0-9]{15,19})\b",
@@ -105,6 +109,44 @@ def reset_guild_members_cache() -> None:
     """Test helper."""
     with _rest_members_lock:
         _rest_members_cache.clear()
+    with _recent_posters_lock:
+        _recent_posters.clear()
+
+
+def record_recent_poster(guild_id: str, discord_id: str, *, at: datetime | None = None) -> None:
+    """Cheaply remember a guild member who recently posted a message (in-memory, bounded)."""
+    if not is_discord_id(str(guild_id or "")) or not is_discord_id(str(discord_id or "")):
+        return
+    moment = at or datetime.now(UTC)
+    key = str(guild_id)
+    uid = str(discord_id)
+    with _recent_posters_lock:
+        bucket = _recent_posters.setdefault(key, {})
+        bucket[uid] = moment
+        if len(bucket) > RECENT_POSTERS_MAX_PER_GUILD:
+            cutoff = moment - timedelta(days=PRIORITY_POOL_JOINED_DAYS)
+            pruned = {k: v for k, v in bucket.items() if v >= cutoff}
+            if len(pruned) > RECENT_POSTERS_MAX_PER_GUILD:
+                newest = sorted(pruned.items(), key=lambda item: item[1], reverse=True)
+                pruned = dict(newest[:RECENT_POSTERS_MAX_PER_GUILD])
+            _recent_posters[key] = pruned
+
+
+def recent_poster_ids_for_guild(
+    guild_id: str | None,
+    *,
+    now: datetime | None = None,
+    days: int = PRIORITY_POOL_JOINED_DAYS,
+) -> frozenset[str]:
+    if not guild_id or not is_discord_id(str(guild_id)):
+        return frozenset()
+    moment = now or datetime.now(UTC)
+    cutoff = moment - timedelta(days=days)
+    with _recent_posters_lock:
+        bucket = _recent_posters.get(str(guild_id))
+        if not bucket:
+            return frozenset()
+        return frozenset(uid for uid, seen_at in bucket.items() if seen_at >= cutoff)
 
 
 @dataclass(frozen=True)
@@ -126,6 +168,7 @@ class DiscordMemberInfo:
     global_name: str = ""
     nick: str = ""
     display_name: str = ""
+    joined_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -495,6 +538,17 @@ def fetch_github_author_profile(
     )
 
 
+def _parse_joined_at(raw: object) -> datetime | None:
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=UTC) if raw.tzinfo is None else raw.astimezone(UTC)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return parse_time(raw)
+        except Exception:
+            return None
+    return None
+
+
 def member_from_raw(member) -> DiscordMemberInfo | None:
     if isinstance(member, DiscordMemberInfo):
         return member
@@ -515,6 +569,7 @@ def member_from_raw(member) -> DiscordMemberInfo | None:
             global_name=global_name,
             nick=nick,
             display_name=display_name,
+            joined_at=_parse_joined_at(member.get("joined_at")),
         )
     if getattr(member, "bot", False):
         return None
@@ -531,6 +586,7 @@ def member_from_raw(member) -> DiscordMemberInfo | None:
         global_name=global_name,
         nick=nick,
         display_name=display_name,
+        joined_at=_parse_joined_at(getattr(member, "joined_at", None)),
     )
 
 
@@ -1363,6 +1419,29 @@ def _search_rest_candidates_for_author(
     return list(found_by_id.values())
 
 
+def _build_priority_pool(
+    guild_members: list[DiscordMemberInfo],
+    now: datetime,
+    *,
+    guild_id: str | None = None,
+    extra_recent_ids: set[str] | frozenset[str] | None = None,
+    days: int = PRIORITY_POOL_JOINED_DAYS,
+) -> list[DiscordMemberInfo]:
+    """Members who joined within ``days`` days OR posted recently in this guild."""
+    cutoff = now - timedelta(days=days)
+    recent_ids = set(recent_poster_ids_for_guild(guild_id, now=now, days=days))
+    if extra_recent_ids:
+        recent_ids.update(str(uid) for uid in extra_recent_ids if uid)
+    pool: list[DiscordMemberInfo] = []
+    for member in guild_members:
+        if member.discord_id in recent_ids:
+            pool.append(member)
+            continue
+        if member.joined_at is not None and member.joined_at >= cutoff:
+            pool.append(member)
+    return pool
+
+
 def match_community_contributors_with_diagnostics(
     groups: list[dict],
     config,
@@ -1379,6 +1458,7 @@ def match_community_contributors_with_diagnostics(
     rest_searcher=None,
     skip_github_enrichment: bool = False,
     deadline: float | None = None,
+    recent_poster_ids: set[str] | frozenset[str] | None = None,
 ) -> tuple[list[dict], int, list[MatchDetail], MatchDiagnostics]:
     """Resolve community PR authors to LiteLLM Discord guild members with diagnostics."""
     moment = now or datetime.now(UTC)
@@ -1503,17 +1583,15 @@ def match_community_contributors_with_diagnostics(
         pending_by_login = {g["login"].strip().casefold(): g for g in pending}
         enrich_deadline = (deadline - 20.0) if deadline is not None else None
         deadline_tripped = False
+        profiles_by_login: dict[str, GitHubAuthorProfile] = {}
 
-        for idx, group in enumerate(pending):
+        def _get_profile(idx: int, group: dict, total_pending: int) -> GitHubAuthorProfile:
+            nonlocal rate_limited, deadline_tripped, enrichment_deferred
             login = group["login"]
             login_key = login.strip().casefold()
-
-            # Fast path: if GitHub login alone uniquely matches a guild member, skip 2 GitHub API calls.
-            login_hits = member_index.exact_tier_hits(login)
-            if len(login_hits) == 1:
-                resolved[login_key] = (group, login_hits[0].discord_id, "exact_login", 0.96)
-                continue
-
+            existing_prof = profiles_by_login.get(login_key)
+            if existing_prof is not None:
+                return existing_prof
             pull_numbers = [
                 int(p["number"])
                 for p in group.get("pulls", ())
@@ -1526,7 +1604,7 @@ def match_community_contributors_with_diagnostics(
                         "Weekly report GitHub enrichment deadline reached after %d/%d pending authors; "
                         "using cached profiles and deferring uncached authors to next run",
                         idx,
-                        len(pending),
+                        total_pending,
                     )
                 cached = _cached_github_profile(store, login, moment, user_id=group.get("user_id"))
                 if cached is not None:
@@ -1557,7 +1635,72 @@ def match_community_contributors_with_diagnostics(
                 if hit_limit:
                     rate_limited = True
                     enrichment_deferred += 1
+            profiles_by_login[login_key] = profile
+            return profile
 
+        recent_members = _build_priority_pool(
+            guild_members,
+            moment,
+            guild_id=guild_id,
+            extra_recent_ids=recent_poster_ids,
+        )
+        logging.info("match pool: recent=%d full=%d", len(recent_members), len(guild_members))
+
+        # Pass 1: priority pool (joined within 30 days or posted recently).
+        if recent_members and len(recent_members) < len(guild_members):
+            recent_index = _MemberIndex(recent_members)
+            recent_candidates: list[CandidatePair] = []
+            for idx, group in enumerate(pending):
+                login = group["login"]
+                login_key = login.strip().casefold()
+                login_hits = recent_index.exact_tier_hits(login)
+                if len(login_hits) == 1:
+                    resolved[login_key] = (group, login_hits[0].discord_id, "exact_login", 0.96)
+                    continue
+                profile = _get_profile(idx, group, len(pending))
+                strong, candidates = score_author_against_members(
+                    profile,
+                    recent_members,
+                    member_index=recent_index,
+                )
+                if strong is not None:
+                    member, method, confidence = strong
+                    resolved[login_key] = (group, member.discord_id, method, confidence)
+                elif candidates:
+                    recent_candidates.extend(candidates)
+
+            if recent_candidates:
+                ambiguous_candidates.extend(recent_candidates)
+                recent_winners, recent_llm_source, _recent_skips = _disambiguate_with_reasons(
+                    config,
+                    recent_candidates,
+                    jev_transport=jev_transport,
+                    haiku_complete=haiku_complete,
+                    deadline=(deadline - 10.0) if deadline is not None else None,
+                )
+                if recent_llm_source != "none":
+                    llm_source = recent_llm_source
+                for login_key, (member, method, confidence) in recent_winners.items():
+                    if login_key not in resolved and login_key in pending_by_login:
+                        resolved[login_key] = (pending_by_login[login_key], member.discord_id, method, confidence)
+
+        # Pass 2: full member list fallback ONLY for authors still unmatched after Pass 1.
+        remaining_pending = [
+            group for group in pending
+            if group["login"].strip().casefold() not in resolved
+        ]
+        full_candidates: list[CandidatePair] = []
+        for idx, group in enumerate(remaining_pending):
+            login = group["login"]
+            login_key = login.strip().casefold()
+
+            if login_key not in profiles_by_login:
+                login_hits = member_index.exact_tier_hits(login)
+                if len(login_hits) == 1:
+                    resolved[login_key] = (group, login_hits[0].discord_id, "exact_login", 0.96)
+                    continue
+
+            profile = _get_profile(idx, group, len(remaining_pending))
             strong, candidates = score_author_against_members(
                 profile,
                 guild_members,
@@ -1567,18 +1710,21 @@ def match_community_contributors_with_diagnostics(
                 member, method, confidence = strong
                 resolved[login_key] = (group, member.discord_id, method, confidence)
             elif candidates:
-                ambiguous_candidates.extend(candidates)
+                full_candidates.extend(candidates)
             else:
                 skip_reason_by_login[login_key] = "no_signal_match"
 
-        if ambiguous_candidates:
-            llm_winners, llm_source, llm_skip_reasons = _disambiguate_with_reasons(
+        if full_candidates:
+            ambiguous_candidates.extend(full_candidates)
+            llm_winners, full_llm_source, llm_skip_reasons = _disambiguate_with_reasons(
                 config,
-                ambiguous_candidates,
+                full_candidates,
                 jev_transport=jev_transport,
                 haiku_complete=haiku_complete,
                 deadline=(deadline - 10.0) if deadline is not None else None,
             )
+            if full_llm_source != "none":
+                llm_source = full_llm_source
             for login_key, (member, method, confidence) in llm_winners.items():
                 if login_key not in resolved and login_key in pending_by_login:
                     resolved[login_key] = (pending_by_login[login_key], member.discord_id, method, confidence)
