@@ -40,6 +40,7 @@ from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
 from .signatures import ed25519_public_key_ok
 from .state import load_state, save_state
+from .tracing import configure_litellm_tracing
 from .weekly import log_weekly_boot_status, post_weekly_if_due, weekly_schedule_status
 
 
@@ -141,6 +142,7 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
+    configure_litellm_tracing()
     if args.test_channel_id is not None:
         url = send_test_message(args.test_channel_id, os.environ.get("DISCORD_BOT_TOKEN", "").strip())
         print(f"Test message sent: {url}")

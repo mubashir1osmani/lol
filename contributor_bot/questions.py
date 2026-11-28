@@ -38,10 +38,20 @@ def answer_question(config, channel_id: str, text: str, *, complete=None) -> Non
     model = config.review_classifier_model or config.review_model or "anthropic/claude-haiku-4-5"
     if complete is None:
         from .review_llm import complete_litellm
-        complete = lambda system, body: complete_litellm(model, [
-            {"role": "system", "content": system},
-            {"role": "user", "content": body},
-        ])
+        from .tracing import build_trace_metadata
+        metadata = build_trace_metadata(
+            "discord_qa",
+            session_id=f"discord_qa:{channel_id}",
+            extra={"channel_id": str(channel_id)},
+        )
+        complete = lambda system, body: complete_litellm(
+            model,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": body},
+            ],
+            metadata=metadata,
+        )
     try:
         reply = complete(_SYSTEM, discord_safe(text)[:1500])
     except Exception as error:

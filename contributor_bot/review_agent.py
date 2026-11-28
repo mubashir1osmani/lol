@@ -152,21 +152,33 @@ def completion_from_response(response) -> Completion:
     return Completion(content, calls, total)
 
 
-def complete_with_tools(model: str, messages: list, tools: list, *, timeout: float) -> Completion:
+def complete_with_tools(
+    model: str,
+    messages: list,
+    tools: list,
+    *,
+    timeout: float,
+    metadata: dict | None = None,
+) -> Completion:
     """One litellm.completion call with tools. Imported only when a review runs."""
     try:
         import litellm
     except ImportError as error:
         raise RuntimeError("litellm is not installed") from error
-    response = litellm.completion(
-        model=model,
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
-        temperature=0.2,
-        max_tokens=MODEL_OUTPUT_TOKENS,
-        timeout=max(5, int(timeout)),
-    )
+    from .tracing import configure_litellm_tracing
+    configure_litellm_tracing()
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "temperature": 0.2,
+        "max_tokens": MODEL_OUTPUT_TOKENS,
+        "timeout": max(5, int(timeout)),
+    }
+    if metadata:
+        kwargs["metadata"] = metadata
+    response = litellm.completion(**kwargs)
     return completion_from_response(response)
 
 
@@ -1003,14 +1015,26 @@ def _capable_model(config) -> str:
 
 def _run_sdk_session(ctx: ReviewContext, prompt: str, config) -> AgentResult:
     """One Agents SDK run. The model is the Autorouter's capable tier."""
+    from .tracing import build_sdk_trace_metadata, configure_litellm_tracing
+    configure_litellm_tracing()
     sdk = _load_sdk()
     _configure_tracing(sdk, config)
+    repo = getattr(config, "github_repository", "") or "BerriAI/litellm"
+    trace_metadata = build_sdk_trace_metadata(
+        "pr_review",
+        session_id=f"pr_review:{repo}#{ctx.number}",
+        extra={"repository": repo, "pr_number": ctx.number, "thread_id": ctx.thread_id},
+    )
     agent = sdk.Agent(
         name="litellm-review",
         instructions=SYSTEM_PROMPT,
         tools=_sdk_tools(sdk),
         model=sdk.LitellmModel(model=_capable_model(config)),
-        model_settings=sdk.ModelSettings(temperature=0.2, max_tokens=MODEL_OUTPUT_TOKENS),
+        model_settings=sdk.ModelSettings(
+            temperature=0.2,
+            max_tokens=MODEL_OUTPUT_TOKENS,
+            metadata=trace_metadata,
+        ),
     )
     turns = step_cap(config.review_max_steps)
     timeout = float(config.review_timeout_seconds or 0)
