@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from contributor_bot.api import TransientAPIError, search_guild_messages
-from contributor_bot.config import Config, get_config
+from contributor_bot.config import get_config
 from contributor_bot.interactions import role_slash_commands
 from contributor_bot.matcher import (
     DiscordMemberInfo,
@@ -17,8 +17,6 @@ from contributor_bot.matcher import (
     _cached_github_profile,
     analyze_member_messages,
     match_community_contributors_with_diagnostics,
-    scan_member_message_evidence,
-    score_author_against_members,
     validate_pr_link_poster_match,
 )
 from contributor_bot.rewards import announce_pending_role_grants, apply_roles
@@ -26,8 +24,6 @@ from contributor_bot.roles_sync import (
     _grant_roles_for_stored_matches,
     poll_merged_prs_for_roles,
     revalidate_all_grants_on_boot,
-    run_daily_roles_if_due,
-    run_roles_backfill,
     should_run_grants_revalidation,
 )
 from contributor_bot.schedule import UTC, iso
@@ -651,7 +647,7 @@ class SilentAnnouncementsLeaseLockAndBootRevalidationTests(unittest.TestCase):
                 self.store,
                 now=self.now,
                 search_merged_fn=lambda r, s, e, t: set(),
-                count_fetcher=lambda r, l, t: 1,
+                count_fetcher=lambda r, login, t: 1,
                 org_members_fetcher=lambda o, t: frozenset(),
                 members=members,
                 graphql_caller=_stub_gql_from_nodes({"quiet-dev": _gql_user_node("quiet-dev", name="Quiet Dev")}),
@@ -661,7 +657,7 @@ class SilentAnnouncementsLeaseLockAndBootRevalidationTests(unittest.TestCase):
         post_msg.assert_not_called()
         self.assertEqual(self.store.all_unannounced_grants(), [])
         self.assertTrue(
-            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in l for l in logs.output)
+            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in line for line in logs.output)
         )
 
         # Turning ROLES_ANNOUNCE_ENABLED=true later must NOT post any backlog!

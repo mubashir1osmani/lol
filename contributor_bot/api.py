@@ -157,7 +157,7 @@ def _graphql_query_allowed(request: Request) -> bool:
     if re.search(r"\bmutation\b", folded, re.I):
         return _allowed_project_v2_mutation(folded)
     lowered = folded.lower()
-    return lowered.startswith("query ") or lowered.startswith("{")
+    return lowered.startswith(("query ", "{"))
 
 
 def _github_request_allowed(method: str, path: str) -> bool:
@@ -420,7 +420,7 @@ def _http(
             else:
                 exc = RuntimeError(message)
             if gh_detail:
-                setattr(exc, "github_error_detail", gh_detail)
+                exc.github_error_detail = gh_detail
             raise exc from error
         except OSError as error:
             if attempt + 1 < attempts:

@@ -1,0 +1,21 @@
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "B",      # flake8-bugbear
+    "PIE",    # flake8-pie
+    "UP",     # pyupgrade
+    "RUF100", # unused noqa directives
+]
+ignore = [
+    "E501",   # long prompt/regex/test fixture lines
+    "E731",   # short inline lambda callbacks used in tests and wrappers
+    "UP017",  # keep existing timezone.utc usages stable across tests
+]
+
+[lint.per-file-ignores]
+"tests/**" = ["B011"]

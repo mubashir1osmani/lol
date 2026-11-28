@@ -1,6 +1,5 @@
 from dataclasses import replace
 from datetime import timedelta
-import json
 from pathlib import Path
 import tempfile
 import unittest

@@ -146,7 +146,7 @@ class NetworkBoundaryTests(unittest.TestCase):
         response.read.return_value = b"{}"
         sha = "a" * 40
         urls = [
-            f"https://api.github.com/repos/BerriAI/litellm/pulls/12/comments?per_page=100",
+            "https://api.github.com/repos/BerriAI/litellm/pulls/12/comments?per_page=100",
             f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/check-runs?per_page=100",
             f"https://api.github.com/repos/BerriAI/litellm/commits/{sha}/status",
             "https://api.github.com/repos/BerriAI/litellm/contents/litellm/proxy/server.py?ref=" + sha,

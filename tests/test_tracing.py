@@ -16,7 +16,7 @@ from contributor_bot.matcher import (
     match_community_contributors_with_diagnostics,
 )
 from contributor_bot.questions import answer_question, _recent as _qa_recent
-from contributor_bot.review_agent import ReviewContext, _run_sdk_session, run_review_session
+from contributor_bot.review_agent import run_review_session
 from contributor_bot.review_job import message_decision
 from contributor_bot.review_llm import complete_litellm
 from contributor_bot.routing import decide, reset_decision_cache

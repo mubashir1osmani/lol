@@ -6,10 +6,8 @@ import signal
 import threading
 import time
 import uuid
-from datetime import datetime
 
 from .api import (
-    TransientAPIError,
     fetch_channel,
     post_message,
     register_guild_commands,
@@ -36,10 +34,9 @@ from .roles_sync import (
     should_run_grants_revalidation,
 )
 from .store import Store
-from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
 from .signatures import ed25519_public_key_ok
-from .state import load_state, save_state
+from .state import save_state
 from .tracing import configure_litellm_tracing, shutdown_tracing
 from .weekly import log_weekly_boot_status, post_weekly_if_due, weekly_schedule_status
 

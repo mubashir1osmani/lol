@@ -1426,13 +1426,6 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def all_links(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT discord_id, github_user_id, github_login, linked_at FROM github_links"
-            ).fetchall()
-        return [dict(row) for row in rows]
-
     def get_cached_github_user(self, github_login: str) -> dict | None:
         key = (github_login or "").strip().lower()
         if not key:

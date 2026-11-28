@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from contributor_bot.api import search_guild_messages
@@ -27,7 +26,6 @@ from contributor_bot.matcher import (
     _excluded_staff_discord_ids,
     _profile_source_norms,
     _resolve_match_model,
-    _select_with_llm,
     fetch_github_profiles_graphql,
     match_community_contributors_with_diagnostics,
     score_author_against_members,
@@ -656,7 +654,6 @@ class TestGraphQLBatchEnrichment(unittest.TestCase):
 class TestListWiseLLMSelection(unittest.TestCase):
     def test_select_with_llm_thresholds_and_none_of_these(self):
         cfg = Config("tok", "123", "456", match_model="anthropic/claude-sonnet-4-5")
-        profile = GitHubAuthorProfile(login="jdoe_dev", name="Jordan Doe")
         members = [
             DiscordMemberInfo("500000000000000001", username="jdoe99", global_name="Jordan D"),
             DiscordMemberInfo("500000000000000002", username="jdoe_alt", global_name="J Doe"),

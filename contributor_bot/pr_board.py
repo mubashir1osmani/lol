@@ -45,7 +45,7 @@ RECENT_CLOSED_LOOKBACK_DAYS = 7
 
 _sync_lock = threading.Lock()
 _meta_lock = threading.Lock()
-_project_meta_cache: dict[tuple[str | None, str | None, int | None, str], tuple["ProjectMetadata", float]] = {}
+_project_meta_cache: dict[tuple[str | None, str | None, int | None, str], tuple[ProjectMetadata, float]] = {}
 
 _PROJECT_FIELDS_FRAGMENT = """
 id

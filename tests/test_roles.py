@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 from contributor_bot import backfill
-from contributor_bot.api import TransientAPIError, fetch_merged_numbers, wait_for_github_budget
+from contributor_bot.api import fetch_merged_numbers, wait_for_github_budget
 from contributor_bot.config import get_config
 from contributor_bot.present import announcement_text, my_prs_text, review_status
 from contributor_bot.rewards import apply_roles, assign_role
