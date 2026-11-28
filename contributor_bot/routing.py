@@ -192,18 +192,33 @@ def decide(config, text: str, *, channel: str = "", context: str = "", transport
         "context": (context or "")[:500],
         "message": (text or "")[:1500],
     })
+    from .tracing import agent_span
+
     api_key = os.environ.get("TYPESAFE_API_KEY", "").strip() or getattr(config, "typesafe_api_key", None)
     model = getattr(config, "review_decision_model", None) or "jev-latest"
     threshold = float(getattr(config, "decision_reply_threshold", 0.7) or 0.7)
-    if api_key or transport is not None:
-        try:
-            payload = call_jev(model, state, api_key or "", transport)
-            decision = _from_jev(payload, threshold)
-        except Exception as error:
-            logging.warning("Jev decision failed, using the Haiku fallback: %s", error)
+    with agent_span(
+        "message_router",
+        session_id=f"message_router:{channel or 'unknown'}",
+        input_value={"channel": channel, "message": (text or "")[:800]},
+        attributes={"discord.channel": str(channel)},
+    ) as span:
+        if api_key or transport is not None:
+            try:
+                payload = call_jev(model, state, api_key or "", transport)
+                decision = _from_jev(payload, threshold)
+            except Exception as error:
+                logging.warning("Jev decision failed, using the Haiku fallback: %s", error)
+                decision = _haiku_decision(config, text)
+        else:
             decision = _haiku_decision(config, text)
-    else:
-        decision = _haiku_decision(config, text)
+        span.set_output({
+            "reply": decision.reply,
+            "route": decision.route,
+            "tier": decision.tier,
+            "source": decision.source,
+            "reason": decision.reason,
+        })
     logging.info(
         "Decision should_reply=%s route=%s model=%s source=%s cost_usd=%.8f",
         decision.reply, decision.route, decision.model_id or model, decision.source, decision.cost_usd,

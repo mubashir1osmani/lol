@@ -1109,6 +1109,8 @@ def _stamp(result: AgentResult, ctx: ReviewContext) -> AgentResult:
 
 def run_review_session(config, store, number: int, thread_id: str, *, mode: str, history: str = "") -> AgentResult:
     """Run the agent for one review or one follow-up question."""
+    from .tracing import agent_span
+
     ctx = ReviewContext(config=config, store=store, number=number, thread_id=thread_id)
     task = (
         f"Review pull request #{number} in {config.github_repository}. "
@@ -1121,26 +1123,50 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
     )
     if history.strip():
         task += "\n\nuntrusted discord history:\n" + _clip(history, 4000)
-    try:
-        result = _run_sdk_session(ctx, task, config)
-    except RuntimeError as error:
-        if "not installed" not in str(error):
-            raise
-        result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
-    result.verdict_posted = ctx.verdict_posted
-    result.ready = ctx.verdict_ready if ctx.verdict_posted else None
-    if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
-        result.head_sha = ctx.snapshot.head_sha
-    if not ctx.verdict_posted and not ctx.posted_ids:
-        note = result.text or "i didn't finish a verdict. try /recheck."
-        if mode == "review" and not result.exhausted and "ready for maintainer" in note.lower():
-            note = "i didn't file a verdict, so this isn't ready for a maintainer. try /recheck."
-        if mode == "followup" or result.exhausted or mode == "review":
-            try:
-                _post_text(ctx, note)
-            except Exception:
-                logging.exception("Could not post the agent note for #%s", number)
-    return result
+    span_name = "pr_review" if mode == "review" else "pr_review_followup"
+    with agent_span(
+        span_name,
+        session_id=f"pr_review:{config.github_repository}#{number}",
+        input_value={
+            "repository": config.github_repository,
+            "pr_number": number,
+            "thread_id": str(thread_id),
+            "mode": mode,
+        },
+        attributes={
+            "pr.repository": config.github_repository,
+            "pr.number": int(number),
+            "discord.thread_id": str(thread_id),
+            "review.mode": mode,
+        },
+    ) as span:
+        try:
+            result = _run_sdk_session(ctx, task, config)
+        except RuntimeError as error:
+            if "not installed" not in str(error):
+                raise
+            result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
+        result.verdict_posted = ctx.verdict_posted
+        result.ready = ctx.verdict_ready if ctx.verdict_posted else None
+        if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
+            result.head_sha = ctx.snapshot.head_sha
+        if not ctx.verdict_posted and not ctx.posted_ids:
+            note = result.text or "i didn't finish a verdict. try /recheck."
+            if mode == "review" and not result.exhausted and "ready for maintainer" in note.lower():
+                note = "i didn't file a verdict, so this isn't ready for a maintainer. try /recheck."
+            if mode == "followup" or result.exhausted or mode == "review":
+                try:
+                    _post_text(ctx, note)
+                except Exception:
+                    logging.exception("Could not post the agent note for #%s", number)
+        span.set_output({
+            "verdict_posted": result.verdict_posted,
+            "ready": result.ready,
+            "exhausted": result.exhausted,
+            "steps": result.steps,
+            "text": (result.text or "")[:1000],
+        })
+        return result
 
 
 def history_text(messages: list[dict]) -> str:

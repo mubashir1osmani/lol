@@ -2568,8 +2568,9 @@ def _disambiguate_with_reasons(
         for login_key, pairs in items:
             results_list.append(_run_one(login_key, pairs))
     else:
+        from .tracing import submit_with_context
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(_run_one, login_key, pairs) for login_key, pairs in items]
+            futures = [submit_with_context(pool, _run_one, login_key, pairs) for login_key, pairs in items]
             for fut in as_completed(futures):
                 results_list.append(fut.result())
 
@@ -3290,6 +3291,82 @@ def match_community_contributors_with_diagnostics(
     sleep_fn=time.sleep,
 ) -> tuple[list[dict], int, list[MatchDetail], MatchDiagnostics]:
     """Resolve community PR authors to LiteLLM Discord guild members with diagnostics."""
+    from .tracing import agent_span
+
+    moment = now or datetime.now(UTC)
+    repo = getattr(config, "github_repository", "") or "repo"
+    logins_preview = [str(g.get("login") or "") for g in groups[:50] if g.get("login")]
+    with agent_span(
+        "role_matcher",
+        session_id=f"role_matcher:{repo}:{moment.date().isoformat()}",
+        input_value={
+            "repository": repo,
+            "contributor_count": len(groups),
+            "logins": logins_preview,
+        },
+        attributes={
+            "matcher.repository": repo,
+            "matcher.contributor_count": len(groups),
+        },
+    ) as span:
+        matched_groups, skipped_count, details, diagnostics = _match_community_contributors_with_diagnostics_impl(
+            groups,
+            config,
+            store,
+            guild=guild,
+            loop=loop,
+            now=moment,
+            members=members,
+            github_getter=github_getter,
+            graphql_caller=graphql_caller,
+            llm_complete=llm_complete,
+            jev_transport=jev_transport,
+            haiku_complete=haiku_complete,
+            rest_fetcher=rest_fetcher,
+            rest_searcher=rest_searcher,
+            message_searcher=message_searcher,
+            allow_live_message_search=allow_live_message_search,
+            skip_github_enrichment=skip_github_enrichment,
+            deadline=deadline,
+            recent_poster_ids=recent_poster_ids,
+            org_members=org_members,
+            sleep_fn=sleep_fn,
+        )
+        span.set_output({
+            "matched": diagnostics.matched_count,
+            "skipped": diagnostics.skipped_count,
+            "methods": dict(diagnostics.method_counts),
+            "skip_reasons": dict(diagnostics.skip_reasons),
+            "llm_source": diagnostics.llm_source,
+        })
+        return matched_groups, skipped_count, details, diagnostics
+
+
+def _match_community_contributors_with_diagnostics_impl(
+    groups: list[dict],
+    config,
+    store,
+    *,
+    guild=None,
+    loop=None,
+    now: datetime | None = None,
+    members: list[DiscordMemberInfo] | None = None,
+    github_getter=None,
+    graphql_caller=None,
+    llm_complete=None,
+    jev_transport=None,
+    haiku_complete=None,
+    rest_fetcher=None,
+    rest_searcher=None,
+    message_searcher=None,
+    allow_live_message_search: bool | None = None,
+    skip_github_enrichment: bool = False,
+    deadline: float | None = None,
+    recent_poster_ids: set[str] | frozenset[str] | None = None,
+    org_members: frozenset[str] = frozenset(),
+    sleep_fn=time.sleep,
+) -> tuple[list[dict], int, list[MatchDetail], MatchDiagnostics]:
+    """Core implementation of contributor matching."""
     moment = now or datetime.now(UTC)
     moment_iso = iso(moment)
     guild_id = getattr(config, "discord_guild_id", None) or (str(getattr(guild, "id", "")) if guild is not None else None)
