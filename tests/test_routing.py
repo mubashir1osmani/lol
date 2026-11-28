@@ -284,27 +284,32 @@ class WeeklyTests(unittest.TestCase):
                 for item in guild_members:
                     yield item
 
-        jev_requests = []
+        llm_requests = []
 
-        def fake_jev(body_bytes):
-            payload = json.loads(body_bytes.decode("utf-8"))
-            jev_requests.append(payload)
-            state = json.loads(payload["state"])
-            answers = {}
-            for item in state["candidate_pairs"]:
-                gh_login = item["github"]["login"]
-                if gh_login == "gh-fuzzy-win":
-                    answers[item["pair"]] = {"type": "noul", "noul": 0.91}
-                else:
-                    answers[item["pair"]] = {"type": "noul", "noul": 0.62}
-            return {"model": "jev-1.14.0", "answers": answers, "usage": {"input_tokens": 300, "output_tokens": 20}}
+        def fake_llm(model, messages):
+            payload = json.loads(messages[1]["content"])
+            llm_requests.append((model, payload))
+            gh_login = payload["github_author"]["login"]
+            cands = payload["candidates"]
+            if gh_login == "gh-fuzzy-win":
+                return json.dumps({
+                    "discord_id": cands[0]["discord_id"],
+                    "confidence": 0.91,
+                    "reason": "commit name and email local match mvance",
+                    "evidence": ["commit name Marcus Vance matches Marcus V", "email local mvance matches username"],
+                })
+            return json.dumps({
+                "discord_id": cands[0]["discord_id"],
+                "confidence": 0.62,
+                "reason": "weak overlap only",
+                "evidence": ["initials overlap"],
+            })
 
         config = Config(
             "token", "123", "456",
             discord_guild_id="333",
             discord_application_id="444",
-            typesafe_api_key="ts-key",
-            review_decision_model="jev-latest",
+            match_model="anthropic/claude-sonnet-4-5",
             discord_members_intent=True,
         )
 
@@ -315,15 +320,15 @@ class WeeklyTests(unittest.TestCase):
                 store,
                 now=datetime(2026, 11, 26, tzinfo=timezone.utc),
                 guild=_FetchGuild(),
-                jev_transport=fake_jev,
+                llm_complete=fake_llm,
             )
 
-        # Single batched Jev call containing both fuzzy pairs; >=0.85 accepted, 0.62 rejected.
-        self.assertEqual(len(jev_requests), 1)
-        self.assertEqual(jev_requests[0]["model"], "jev-latest")
-        self.assertEqual(len(jev_requests[0]["questions"]), 2)
-        for q in jev_requests[0]["questions"].values():
-            self.assertEqual(q["type"], "noul")
+        # List-wise LLM called once per ambiguous author (2 authors); >=0.90 accepted, 0.62 rejected.
+        self.assertEqual(len(llm_requests), 2)
+        self.assertEqual({m for m, _p in llm_requests}, {"anthropic/claude-sonnet-4-5"})
+        self.assertEqual({p["github_author"]["login"] for _m, p in llm_requests}, {"gh-fuzzy-win", "gh-fuzzy-low"})
+        for _m, p in llm_requests:
+            self.assertIn("none of these", p["options"])
 
         self.assertEqual(report.matched_count, 6)
         self.assertEqual(report.skipped_count, 2)
@@ -334,7 +339,7 @@ class WeeklyTests(unittest.TestCase):
             "gh-bio-user": ("200000000000000003", "bio_discord_handle"),
             "gh-twit-user": ("200000000000000004", "twitter_match"),
             "gh-name-user": ("200000000000000005", "exact_name"),
-            "gh-fuzzy-win": ("200000000000000006", "jev"),
+            "gh-fuzzy-win": ("200000000000000006", "llm"),
         })
         body = "\n".join(report.chunks)
         for uid in ("100000000000000001", "200000000000000002", "200000000000000003", "200000000000000004", "200000000000000005", "200000000000000006"):
@@ -344,55 +349,72 @@ class WeeklyTests(unittest.TestCase):
         self.assertNotIn("totally-unknown", body)
         self.assertTrue(any("6 contributors matched in Discord, 2 unmatched skipped" in entry for entry in logs.output))
 
-        # Second run reuses SQLite persisted matches for the 5 auto-matched users:
-        # no GitHub profile/commit calls for already-persisted authors and no Jev call for gh-fuzzy-win.
+        # Second run reuses SQLite persisted matches for the 5 auto-matched users AND negative cache for skipped:
+        # 0 GitHub profile calls AND 0 LLM calls on rerun!
         self.assertEqual(len(store.all_confirmed_matches()), 5)
         github_calls["users"] = 0
         github_calls["commits"] = 0
-        jev_requests.clear()
+        llm_requests.clear()
         with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
             report2 = build_weekly_report(
                 config,
                 store,
                 now=datetime(2026, 11, 26, tzinfo=timezone.utc),
                 guild=SimpleNamespace(members=guild_members),
-                jev_transport=fake_jev,
+                llm_complete=fake_llm,
             )
         self.assertEqual(report2.matched_count, 6)
         self.assertEqual(report2.skipped_count, 2)
-        # Both persisted matches AND SQLite github_users_cache prevent redundant /users calls on rerun.
         self.assertEqual(github_calls["users"], 0)
+        self.assertEqual(len(llm_requests), 0)
         methods2 = {d.github_login: d.method for d in report2.match_details}
         self.assertEqual(methods2["paveln83"], "sqlite:exact_login")
-        self.assertEqual(methods2["gh-fuzzy-win"], "sqlite:jev")
+        self.assertEqual(methods2["gh-fuzzy-win"], "sqlite:llm")
 
-        # Haiku fallback when TYPESAFE_API_KEY is absent.
-        store2 = Store(str(Path(directory.name) / "haiku.db"))
+        # Fallback to review_model when MATCH_MODEL is unset.
+        store2 = Store(str(Path(directory.name) / "fallback.db"))
         self.addCleanup(store2.close)
-        cfg_no_ts = Config("token", "123", "456", discord_guild_id="333", discord_application_id="444", typesafe_api_key=None)
-        haiku_calls = []
+        cfg_fallback = Config(
+            "token", "123", "456",
+            discord_guild_id="333",
+            discord_application_id="444",
+            review_model="anthropic/claude-sonnet-4-5",
+            match_model="",
+        )
+        fallback_calls = []
 
-        def fake_haiku(model, messages):
-            haiku_calls.append((model, messages))
-            data = json.loads(messages[1]["content"])
-            out = {}
-            for item in data["candidate_pairs"]:
-                out[item["pair"]] = 0.89 if item["github"]["login"] == "gh-fuzzy-win" else 0.2
-            return json.dumps(out)
+        def fake_fallback(model, messages):
+            payload = json.loads(messages[1]["content"])
+            fallback_calls.append((model, payload["github_author"]["login"]))
+            cands = payload["candidates"]
+            if payload["github_author"]["login"] == "gh-fuzzy-win":
+                return json.dumps({
+                    "discord_id": cands[0]["discord_id"],
+                    "confidence": 0.85,
+                    "reason": "two signals match",
+                    "evidence": ["commit name matches", "email local matches"],
+                })
+            return json.dumps({
+                "discord_id": None,
+                "confidence": 0.2,
+                "reason": "none of these",
+                "evidence": [],
+            })
 
-        with mock.patch.dict("os.environ", {"TYPESAFE_API_KEY": ""}, clear=False), \
+        with mock.patch.dict("os.environ", {"MATCH_MODEL": ""}, clear=False), \
                 mock.patch("contributor_bot.weekly.github_get_json", side_effect=fake_gh):
-            report_haiku = build_weekly_report(
-                cfg_no_ts,
+            report_fb = build_weekly_report(
+                cfg_fallback,
                 store2,
                 now=datetime(2026, 11, 26, tzinfo=timezone.utc),
                 guild=SimpleNamespace(members=guild_members),
-                haiku_complete=fake_haiku,
+                llm_complete=fake_fallback,
             )
-        self.assertEqual(len(haiku_calls), 1)
-        haiku_methods = {d.github_login: d.method for d in report_haiku.match_details}
-        self.assertEqual(haiku_methods["gh-fuzzy-win"], "haiku")
-        self.assertNotIn("gh-fuzzy-low", haiku_methods)
+        self.assertEqual(len(fallback_calls), 2)
+        self.assertEqual({m for m, _l in fallback_calls}, {"anthropic/claude-sonnet-4-5"})
+        fb_methods = {d.github_login: d.method for d in report_fb.match_details}
+        self.assertEqual(fb_methods["gh-fuzzy-win"], "llm")
+        self.assertNotIn("gh-fuzzy-low", fb_methods)
 
     def test_ambiguous_collision_goes_to_jev_and_noreply_email_strips_id(self):
         from contributor_bot.matcher import (
@@ -1250,7 +1272,7 @@ class WeeklyTests(unittest.TestCase):
             queries_seen.clear()
             report_next = build_weekly_report(cfg_lookup, restarted_store, next_friday, guild=guild_with_channels)
             self.assertEqual(report_next.since, fri_after_restart)
-            self.assertTrue(any("2026-11-27T15%3A07%3A00Z" in q for q in queries_seen))
+            self.assertTrue(any("merged%3A2026-11-27..2026-11-27" in q for q in queries_seen))
 
     def test_dispatch_command_defers_first_and_handles_10062_gracefully(self):
         import asyncio

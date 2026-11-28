@@ -669,78 +669,145 @@ def _github_get(
     return github_get_json(url, token, pace=pace)
 
 
+def _iter_utc_dates(since: datetime, until: datetime) -> list[str]:
+    """Inclusive list of UTC YYYY-MM-DD date strings covering [since, until]."""
+    start_day = since.astimezone(UTC).date()
+    end_day = until.astimezone(UTC).date()
+    if end_day < start_day:
+        return [start_day.isoformat()]
+    days: list[str] = []
+    cursor = start_day
+    while cursor <= end_day:
+        days.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return days
+
+
+def _item_outside_window(item: dict, since: datetime, until: datetime) -> bool:
+    """Return True only when an item carries a parseable merged/closed timestamp outside [since, until]."""
+    pr_meta = item.get("pull_request") if isinstance(item.get("pull_request"), dict) else {}
+    raw_ts = pr_meta.get("merged_at") or item.get("closed_at")
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return False
+    try:
+        ts = parse_time(raw_ts)
+    except Exception:
+        return False
+    return ts < since.astimezone(UTC) or ts > until.astimezone(UTC)
+
+
 def _search_merged_pages(
     repository: str,
     since: datetime,
     token: str | None,
     *,
+    until: datetime | None = None,
     pace: bool = False,
-    max_pages: int = 5,
+    max_pages: int = 10,
     deadline: float | None = None,
 ) -> tuple[list[dict], bool]:
-    cutoff = since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    found = []
+    """Fetch merged PRs across per-day ``merged:D..D`` windows, paged up to ``max_pages`` (cap 10)."""
+    end_moment = until if until is not None else datetime.now(UTC)
+    page_cap = max(1, min(int(max_pages), 10))
+    found: list[dict] = []
     seen_numbers: set[int] = set()
     rate_limited = False
-    page = 1
-    while page <= max_pages:
-        if deadline is not None and found and time.monotonic() >= deadline:
-            logging.warning(
-                "Weekly report search deadline reached on page %d; returning %d rows",
-                page,
-                len(found),
-            )
+    stop_all = False
+
+    for day_str in _iter_utc_dates(since, end_moment):
+        if stop_all:
             break
-        params = urlencode({
-            "q": f"repo:{repository} is:pr is:merged merged:>={cutoff}",
-            "sort": "updated",
-            "order": "desc",
-            "per_page": 100,
-            "page": page,
-        })
-        try:
-            payload = _github_get(
-                f"{GITHUB_API}/search/issues?{params}",
-                token,
-                pace=pace,
-                attempts=2,
-                timeout=15.0,
-                max_retry_delay=5.0,
-            )
-        except Exception as error:
-            if _is_rate_limit_error(error):
-                retry_after = getattr(error, "retry_after", None)
-                if found:
-                    logging.warning("GitHub search rate limit hit on page %d; returning %d rows", page, len(found))
-                    rate_limited = True
-                    break
-                raise WeeklyFetchError(str(error), rate_limited=True, retry_after=retry_after) from error
-            raise WeeklyFetchError(str(error)) from error
-        items = payload.get("items") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
-            break
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            user = item.get("user") if isinstance(item.get("user"), dict) else {}
-            number = item.get("number")
-            if not isinstance(number, int) or number in seen_numbers:
-                continue
-            seen_numbers.add(number)
-            found.append({
-                "number": number,
-                "title": item.get("title") if isinstance(item.get("title"), str) else "",
-                "url": item.get("html_url") if isinstance(item.get("html_url"), str)
-                else f"https://github.com/{repository}/pull/{number}",
-                "login": user.get("login") if isinstance(user.get("login"), str) else "",
-                "type": user.get("type") if isinstance(user.get("type"), str) else "",
-                "user_id": user.get("id") if isinstance(user.get("id"), int) else None,
-                "author_association": item.get("author_association")
-                if isinstance(item.get("author_association"), str) else "",
+        day_count = 0
+        day_warned = False
+        page = 1
+        while page <= page_cap:
+            if deadline is not None and found and time.monotonic() >= deadline:
+                logging.warning(
+                    "Weekly report search deadline reached on %s page %d; returning %d rows",
+                    day_str,
+                    page,
+                    len(found),
+                )
+                stop_all = True
+                break
+            params = urlencode({
+                "q": f"repo:{repository} is:pr is:merged merged:{day_str}..{day_str}",
+                "sort": "updated",
+                "order": "desc",
+                "per_page": 100,
+                "page": page,
             })
-        if len(items) < 100:
-            break
-        page += 1
+            try:
+                payload = _github_get(
+                    f"{GITHUB_API}/search/issues?{params}",
+                    token,
+                    pace=pace,
+                    attempts=2,
+                    timeout=15.0,
+                    max_retry_delay=5.0,
+                )
+            except Exception as error:
+                if _is_rate_limit_error(error):
+                    retry_after = getattr(error, "retry_after", None)
+                    if found:
+                        logging.warning(
+                            "GitHub search rate limit hit on %s page %d; returning %d rows",
+                            day_str,
+                            page,
+                            len(found),
+                        )
+                        rate_limited = True
+                        stop_all = True
+                        break
+                    raise WeeklyFetchError(str(error), rate_limited=True, retry_after=retry_after) from error
+                raise WeeklyFetchError(str(error)) from error
+            total_count = payload.get("total_count") if isinstance(payload, dict) else None
+            if not day_warned and isinstance(total_count, int) and total_count >= 1000:
+                logging.warning(
+                    "GitHub merged PR search window %s..%s for %s hit %d results (>=1000 GitHub search cap)",
+                    day_str,
+                    day_str,
+                    repository,
+                    total_count,
+                )
+                day_warned = True
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                break
+            day_count += len(items)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if _item_outside_window(item, since, end_moment):
+                    continue
+                user = item.get("user") if isinstance(item.get("user"), dict) else {}
+                number = item.get("number")
+                if not isinstance(number, int) or number in seen_numbers:
+                    continue
+                seen_numbers.add(number)
+                found.append({
+                    "number": number,
+                    "title": item.get("title") if isinstance(item.get("title"), str) else "",
+                    "url": item.get("html_url") if isinstance(item.get("html_url"), str)
+                    else f"https://github.com/{repository}/pull/{number}",
+                    "login": user.get("login") if isinstance(user.get("login"), str) else "",
+                    "type": user.get("type") if isinstance(user.get("type"), str) else "",
+                    "user_id": user.get("id") if isinstance(user.get("id"), int) else None,
+                    "author_association": item.get("author_association")
+                    if isinstance(item.get("author_association"), str) else "",
+                })
+            if len(items) < 100:
+                break
+            if page == page_cap and not day_warned and day_count >= 1000:
+                logging.warning(
+                    "GitHub merged PR search window %s..%s for %s reached %d results (10-page / 1000-row cap)",
+                    day_str,
+                    day_str,
+                    repository,
+                    day_count,
+                )
+                day_warned = True
+            page += 1
     return found, rate_limited
 
 
@@ -749,11 +816,14 @@ def fetch_merged_community(
     since: datetime,
     token: str | None,
     *,
+    until: datetime | None = None,
     pace: bool = False,
-    max_pages: int = 5,
+    max_pages: int = 10,
 ) -> list[dict]:
-    """Merged pull requests since ``since``. Search is discovery; each row is one issue."""
-    rows, _rate_limited = _search_merged_pages(repository, since, token, pace=pace, max_pages=max_pages)
+    """Merged pull requests in ``[since, until]`` across per-day search windows."""
+    rows, _rate_limited = _search_merged_pages(
+        repository, since, token, until=until, pace=pace, max_pages=max_pages,
+    )
     return rows
 
 
@@ -825,6 +895,8 @@ def build_weekly_report(
     max_chunks: int | None = None,
     limit: int = WEEKLY_CHUNK_LIMIT,
     members=None,
+    llm_complete=None,
+    graphql_caller=None,
     jev_transport=None,
     haiku_complete=None,
     title_summarizer=None,
@@ -844,6 +916,7 @@ def build_weekly_report(
         config.github_repository,
         window_since,
         token,
+        until=moment,
         pace=pace,
         deadline=(deadline - 45.0) if deadline is not None else None,
     )
@@ -871,11 +944,14 @@ def build_weekly_report(
         now=moment,
         members=members,
         github_getter=github_get_json,
+        graphql_caller=graphql_caller,
+        llm_complete=llm_complete,
         jev_transport=jev_transport,
         haiku_complete=haiku_complete,
         rest_fetcher=rest_fetcher,
         rest_searcher=rest_searcher,
         deadline=deadline,
+        org_members=org_members,
     )
     if matched and not rate_limited:
         matched = _mark_first_time_contributors(

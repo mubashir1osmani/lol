@@ -119,6 +119,7 @@ class Config:
     review_decision_model: str = "jev-latest"
     decision_reply_threshold: float = 0.7
     fast_model: str = "anthropic/claude-haiku-4-5"
+    match_model: str = ""
     discord_members_intent: bool = False
     bot_status_text: str = "skedaddling 🏃‍♂️"
     bot_status_rotate: bool = False
@@ -230,6 +231,9 @@ def get_config(env: dict[str, str] | None = None) -> Config:
     board_status_field = values.get("PR_BOARD_STATUS_FIELD", "").strip() or "Status"
     if len(board_status_field) > 80 or any(ch in board_status_field for ch in "\r\n"):
         raise ValueError("PR_BOARD_STATUS_FIELD must be a single-line field name")
+    match_model = values.get("MATCH_MODEL", "").strip()
+    if match_model and not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", match_model):
+        raise ValueError("MATCH_MODEL must be a LiteLLM model name, like anthropic/claude-sonnet-4-5")
 
     return Config(
         discord_token=token,
@@ -296,6 +300,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         review_decision_model=values.get("REVIEW_DECISION_MODEL", "").strip() or "jev-latest",
         decision_reply_threshold=_threshold(values),
         fast_model=values.get("REVIEW_FAST_MODEL", "").strip() or "anthropic/claude-haiku-4-5",
+        match_model=match_model,
         discord_members_intent=members_intent,
         bot_status_text=(values.get("BOT_STATUS_TEXT", "").strip() or "skedaddling 🏃‍♂️")[:128],
         bot_status_rotate=_flag(values, "BOT_STATUS_ROTATE", False),

@@ -173,11 +173,35 @@ lists only when still needed for Agent Builder or Provider Wizard), caches each
 author's lifetime merged PR `total_count` via one GitHub search
 (`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental
 updates, resolves only those 7-day community PR authors to Discord members using
-the same automatic matcher as the weekly summary (matching a priority pool of
-members who joined in the past 7 days first, then falling back to the full
-member list only for unmatched authors; `exact_login`, TypeSafe Jev,
-deterministic fallback, cached in SQLite with a 30-day TTL — never assigning on
-ambiguous ties), grants newly earned roles, and **batches all new role
+the same automatic matcher as the weekly summary:
+
+- **Complete per-day PR fetch**: merged PR searches split into per-day UTC
+  `merged:D..D` windows (up to 10 pages / 1,000 rows per day, deduplicated by
+  PR number, logging a warning if any single day reaches 1,000).
+- **GraphQL batch enrichment**: fetches GitHub profiles 50 logins per query
+  (`name`, `bio`, `company`, `email`, `twitterUsername`, `websiteUrl`,
+  `socialAccounts`, and profile `HEAD:README.md` capped at 4 KB) plus commit
+  author names/emails, cached in SQLite (`github_users_cache`) for 7 days.
+- **Deterministic + PR-link poster matching**: checks Discord IDs/handles in
+  bio/blog/README/socials, exact normalized login/Twitter/name, and a
+  `pr_link_poster` tier (`pr_link_posters` table populated live in
+  `on_message`, from `review_threads`, and via mod-only `/links-backfill`).
+  Staff and BerriAI org members are excluded from PR-link attribution; a sole
+  non-staff poster is accepted at `0.92` when they linked 2+ distinct PRs by
+  the author, or 1 PR with name similarity `>= 0.50` or an ownership phrase
+  (e.g. `my pr`, `I opened`, `please review`), and otherwise passed to the LLM.
+- **Priority pool + list-wise LLM selection**: checks a priority pool of
+  members who joined or posted in the past 7 days first, then falls back to the
+  full member list for unmatched authors. Ambiguous/fuzzy authors get a
+  list-wise LLM call (`MATCH_MODEL`, falling back to `REVIEW_MODEL` or
+  `anthropic/claude-sonnet-4-5`) over up to 5 candidates plus explicit
+  `"none of these"`, accepting `>= 0.80` with `>= 2` corroborating signals or
+  `>= 0.90` alone. Confirmed matches are cached in SQLite for 30 days, and
+  definitive non-matches are negatively cached in `match_attempts` for 7 days
+  (skipping unchanged profiles/candidates unless new `pr_link_posters` evidence
+  or a signature change appears).
+
+It then grants newly earned roles, and **batches all new role
 announcements into a single message** (chunked only if needed, posting nothing
 when there are zero new grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each
 completed local date is recorded in `roles_daily_runs` so restarts and
@@ -220,9 +244,11 @@ has that Discord role keeps it.
 
 `DISCORD_PUBLIC_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_*`, and the
 Interactions Endpoint URL are all **optional** and not required. `/link-github`
-and `/unlink-github` stay hidden unless GitHub OAuth is configured. `/my-prs`
-shows an ephemeral PR snapshot for any auto-matched (or manually mapped)
-contributor, and `/roles-backfill` is mod-only (`Manage Messages`).
+and `/unlink-github` stay hidden unless GitHub OAuth is configured. `/my-prs` shows an ephemeral PR snapshot for any auto-matched (or manually
+mapped) contributor, `/roles-backfill` is mod-only (`Manage Messages`), and
+`/links-backfill` is mod-only (`Manage Messages`) to backfill `pr_link_posters`
+from stored `review_threads` and Discord guild message search (paging up to
+offset 9975 with HTTP 202 retry handling).
 
 ### Optional webhook / GitHub OAuth
 

@@ -18,6 +18,7 @@ from .backfill import backfill_merged_pulls
 from .config import get_config, is_discord_id, load_dotenv
 from .gateway import start_gateway, stop_gateway
 from .interactions import (
+    LINKS_BACKFILL_SLASH_COMMANDS,
     MERGED_SLASH_COMMANDS,
     PR_BOARD_SLASH_COMMANDS,
     REVIEW_SLASH_COMMANDS,
@@ -233,6 +234,8 @@ def start_contributor_roles(config):
         commands.extend(REVIEW_SLASH_COMMANDS)
     if config.merged_weekly_enabled and config.discord_guild_id:
         commands.extend(MERGED_SLASH_COMMANDS)
+    if (config.contributor_roles_enabled or config.merged_weekly_enabled) and config.discord_guild_id:
+        commands.extend(LINKS_BACKFILL_SLASH_COMMANDS)
     if config.pr_board_enabled and config.discord_guild_id:
         commands.extend(PR_BOARD_SLASH_COMMANDS)
     # When discord.py is installed, gateway.py syncs guild commands via CommandTree on

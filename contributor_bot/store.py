@@ -128,7 +128,27 @@ CREATE TABLE IF NOT EXISTS github_users_cache (
     bio TEXT NOT NULL DEFAULT '',
     email_local TEXT NOT NULL DEFAULT '',
     commit_name TEXT NOT NULL DEFAULT '',
+    profile_json TEXT NOT NULL DEFAULT '',
     fetched_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pr_link_posters (
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    discord_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    message_text TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo, pr_number, message_id)
+);
+CREATE INDEX IF NOT EXISTS pr_link_posters_repo_pr
+    ON pr_link_posters (repo, pr_number);
+
+CREATE TABLE IF NOT EXISTS match_attempts (
+    login TEXT PRIMARY KEY,
+    attempted_at TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    outcome TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pr_board_items (
@@ -210,6 +230,11 @@ class Store:
             guc_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(github_users_cache)")}
             if guc_columns and "commit_name" not in guc_columns:
                 self._conn.execute("ALTER TABLE github_users_cache ADD COLUMN commit_name TEXT NOT NULL DEFAULT ''")
+            if guc_columns and "profile_json" not in guc_columns:
+                self._conn.execute("ALTER TABLE github_users_cache ADD COLUMN profile_json TEXT NOT NULL DEFAULT ''")
+            plp_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(pr_link_posters)")}
+            if plp_columns and "message_text" not in plp_columns:
+                self._conn.execute("ALTER TABLE pr_link_posters ADD COLUMN message_text TEXT NOT NULL DEFAULT ''")
             # One-time migration for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
             # Guarded by schema_migrations so it runs at most once and never touches legitimate public posts.
             migration_name = "clear_bogus_2026_w48_preview_v1"
@@ -919,7 +944,8 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT github_login, name, blog, twitter_username, bio, email_local, commit_name, fetched_at
+                SELECT github_login, name, blog, twitter_username, bio, email_local,
+                       commit_name, profile_json, fetched_at
                 FROM github_users_cache
                 WHERE github_login = ?
                 """,
@@ -937,6 +963,7 @@ class Store:
         bio: str = "",
         email_local: str = "",
         commit_name: str = "",
+        profile_json: str = "",
         fetched_at: str,
     ) -> None:
         key = (github_login or "").strip().lower()
@@ -946,8 +973,9 @@ class Store:
             self._conn.execute(
                 """
                 INSERT INTO github_users_cache (
-                    github_login, name, blog, twitter_username, bio, email_local, commit_name, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    github_login, name, blog, twitter_username, bio, email_local,
+                    commit_name, profile_json, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(github_login) DO UPDATE SET
                     name = excluded.name,
                     blog = excluded.blog,
@@ -957,6 +985,10 @@ class Store:
                     commit_name = CASE
                         WHEN excluded.commit_name != '' THEN excluded.commit_name
                         ELSE github_users_cache.commit_name
+                    END,
+                    profile_json = CASE
+                        WHEN excluded.profile_json != '' THEN excluded.profile_json
+                        ELSE github_users_cache.profile_json
                     END,
                     fetched_at = excluded.fetched_at
                 """,
@@ -968,6 +1000,7 @@ class Store:
                     (bio or "")[:400],
                     (email_local or "")[:120],
                     (commit_name or "")[:200],
+                    (profile_json or "")[:16000],
                     fetched_at,
                 ),
             )
@@ -1212,6 +1245,161 @@ class Store:
             ).fetchone()
             self._conn.commit()
         return int(row["total_count"]) if row else None
+
+    def record_pr_link_poster(
+        self,
+        repo: str,
+        pr_number: int,
+        discord_id: str,
+        message_id: str,
+        ts: str,
+        *,
+        message_text: str = "",
+    ) -> bool:
+        """Record a non-bot Discord user who posted a PR link. Returns True if newly inserted."""
+        norm_repo = (repo or "").strip().lower()
+        if (
+            not _REPO.fullmatch(norm_repo)
+            or not isinstance(pr_number, int)
+            or pr_number <= 0
+            or not is_discord_id(str(discord_id or ""))
+            or not is_discord_id(str(message_id or ""))
+        ):
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO pr_link_posters (
+                    repo, pr_number, discord_id, message_id, ts, message_text
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    norm_repo,
+                    pr_number,
+                    str(discord_id),
+                    str(message_id),
+                    str(ts or ""),
+                    (message_text or "")[:500],
+                ),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def has_pr_link_poster_message(self, repo: str, pr_number: int, message_id: str) -> bool:
+        norm_repo = (repo or "").strip().lower()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM pr_link_posters
+                WHERE repo = ? AND pr_number = ? AND message_id = ?
+                """,
+                (norm_repo, pr_number, str(message_id)),
+            ).fetchone()
+        return row is not None
+
+    def pr_link_posters_for_pulls(self, repo: str, pr_numbers: list[int] | set[int]) -> list[dict]:
+        """Return all pr_link_posters rows matching ``repo`` and any PR in ``pr_numbers``."""
+        norm_repo = (repo or "").strip().lower()
+        nums = sorted({int(n) for n in pr_numbers if isinstance(n, int) and n > 0})
+        if not norm_repo or not nums:
+            return []
+        out: list[dict] = []
+        with self._lock:
+            for offset in range(0, len(nums), 500):
+                chunk = nums[offset: offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT repo, pr_number, discord_id, message_id, ts, message_text
+                    FROM pr_link_posters
+                    WHERE repo = ? AND pr_number IN ({placeholders})
+                    ORDER BY pr_number ASC, ts ASC, message_id ASC
+                    """,
+                    [norm_repo, *chunk],
+                ).fetchall()
+                out.extend(dict(row) for row in rows)
+        return out
+
+    def pr_link_posters_count(self, repo: str | None = None) -> int:
+        with self._lock:
+            if repo is None:
+                row = self._conn.execute("SELECT COUNT(*) AS n FROM pr_link_posters").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM pr_link_posters WHERE repo = ?",
+                    (repo.strip().lower(),),
+                ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def all_review_threads(self, repository: str | None = None) -> list[dict]:
+        with self._lock:
+            if repository is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT repository, number, channel_id, message_id, thread_id, created_at
+                    FROM review_threads
+                    ORDER BY number DESC
+                    """
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT repository, number, channel_id, message_id, thread_id, created_at
+                    FROM review_threads
+                    WHERE lower(repository) = ?
+                    ORDER BY number DESC
+                    """,
+                    (repository.strip().lower(),),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_match_attempt(self, login: str) -> dict | None:
+        key = (login or "").strip().lower()
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT login, attempted_at, signature, outcome
+                FROM match_attempts
+                WHERE login = ?
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_match_attempt(
+        self,
+        login: str,
+        *,
+        attempted_at: str,
+        signature: str,
+        outcome: str,
+    ) -> None:
+        key = (login or "").strip().lower()
+        if not key:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO match_attempts (login, attempted_at, signature, outcome)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(login) DO UPDATE SET
+                    attempted_at = excluded.attempted_at,
+                    signature = excluded.signature,
+                    outcome = excluded.outcome
+                """,
+                (key, str(attempted_at), str(signature), str(outcome)),
+            )
+            self._conn.commit()
+
+    def delete_match_attempt(self, login: str) -> None:
+        key = (login or "").strip().lower()
+        if not key:
+            return
+        with self._lock:
+            self._conn.execute("DELETE FROM match_attempts WHERE login = ?", (key,))
+            self._conn.commit()
 
     @staticmethod
     def _review_key(repository: str, number: int) -> None:
