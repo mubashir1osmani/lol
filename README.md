@@ -164,20 +164,27 @@ Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 | Provider Wizard | 3+ merged PRs that touch `litellm/llms/` |
 
 Bots, `MAINTAINER_GITHUB_LOGINS`, GitHub org members, and BerriAI staff handles
-are ignored. Every ~10 minutes (`ROLES_POLL_SECONDS`, default `600`), the bot
-polls newly merged PRs since a SQLite checkpoint, stores their metadata
+are ignored. Once a day at `ROLES_DAILY_TIME` (default `10:00`
+`America/Toronto`; on Fridays right after the weekly merge summary, and still
+running independently if the summary fails or skips), the bot checks PRs merged
+in the **rolling past 7 days** (not full history), stores their metadata
 (`number`, author, `merged_at`, labels, and changed file paths — fetching file
 lists only when still needed for Agent Builder or Provider Wizard), caches each
 author's lifetime merged PR `total_count` via one GitHub search
-(`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental updates
-from the poller, resolves community PR authors to Discord members using the
-same automatic matcher as the weekly summary (`exact_login`, TypeSafe Jev,
+(`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental
+updates, resolves only those 7-day community PR authors to Discord members using
+the same automatic matcher as the weekly summary (matching a priority pool of
+members who joined in the past 7 days first, then falling back to the full
+member list only for unmatched authors; `exact_login`, TypeSafe Jev,
 deterministic fallback, cached in SQLite with a 30-day TTL — never assigning on
-ambiguous ties), and grants newly earned roles. Ongoing new role grants post a
-short `<@user> just became an oss champion 🎉` line to
-`ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Roles are sticky: the bot adds them and never
-removes them. Docs Hero is no longer granted; anyone who already has that
-Discord role keeps it.
+ambiguous ties), grants newly earned roles, and **batches all new role
+announcements into a single message** (chunked only if needed, posting nothing
+when there are zero new grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each
+completed local date is recorded in `roles_daily_runs` so restarts and
+redeploys never run or announce twice on the same day, while catching up
+automatically if the bot was offline at `10:00`. Roles are sticky: the bot adds
+them and never removes them. Docs Hero is no longer granted; anyone who already
+has that Discord role keeps it.
 
 ### Minimal setup (no GitHub OAuth or webhook required)
 
@@ -195,14 +202,21 @@ Discord role keeps it.
      `ROLE_PROVIDER_WIZARD_ID` (optional `ROLE_*_NAME` overrides change
      announcement copy only)
    - `ROLE_ANNOUNCEMENTS_CHANNEL_ID`
-   - Optional: `ROLES_POLL_SECONDS=600`, `ROLES_BACKFILL_ON_BOOT=true` (one-time
-     historical backfill on startup), `BACKFILL_SINCE=2023-01-01T00:00:00Z`,
-     `GITHUB_TOKEN` (or `GITHUB_ACTOR_TOKEN`) for higher GitHub read limits.
+   - Optional: `ROLES_DAILY_TIME=10:00` (24-hour `HH:MM` in
+     `MERGED_POST_TIMEZONE`, default `America/Toronto`),
+     `ROLES_BACKFILL_ON_BOOT=true` (one-time historical backfill on startup),
+     `BACKFILL_SINCE=2023-01-01T00:00:00Z`, `GITHUB_TOKEN` (or
+     `GITHUB_ACTOR_TOKEN`) for higher GitHub read limits.
 4. **Historical backfill**: either set `ROLES_BACKFILL_ON_BOOT=true` for a
    one-time boot run, or have a moderator run `/roles-backfill` in Discord
-   (ephemeral, rate-limit aware, time-bounded, resumable). Backfill assigns
-   roles silently and posts **at most a single summary line** to
-   `ROLE_ANNOUNCEMENTS_CHANNEL_ID` (never one message per contributor).
+   (ephemeral, newest-first so recent contributors get roles first, rate-limit
+   aware, time-bounded, and resumable across `/roles-backfill` runs via SQLite
+   `backfill_windows` + cursor until all windows complete — full history is
+   never run by the daily job). Confirmed
+   matches from the weekly merge summary (`github_discord_matches`) are reused
+   directly without re-running the LLM. Backfill assigns roles silently and
+   posts **at most a single summary line** to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`
+   (never one message per contributor).
 
 `DISCORD_PUBLIC_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_*`, and the
 Interactions Endpoint URL are all **optional** and not required. `/link-github`

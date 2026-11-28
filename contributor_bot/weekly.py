@@ -1417,6 +1417,22 @@ def post_weekly_if_due(
         except Exception:
             logging.exception("Weekly merge summary failed while posting to channel %s for %s", channel, key)
             raise
+        if store is not None and hasattr(store, "save_confirmed_match"):
+            for detail in report.match_details:
+                try:
+                    existing_match = store.get_confirmed_match(detail.github_login) if hasattr(store, "get_confirmed_match") else None
+                    if existing_match is None or (detail.github_user_id and not existing_match.get("github_user_id")):
+                        clean_method = detail.method.removeprefix("sqlite:") or "weekly_summary"
+                        store.save_confirmed_match(
+                            detail.github_login,
+                            detail.discord_id,
+                            method=clean_method,
+                            confidence=detail.confidence,
+                            matched_at=iso(moment),
+                            github_user_id=detail.github_user_id,
+                        )
+                except Exception as error:
+                    logging.warning("Could not persist weekly match for %s: %s", detail.github_login, error)
         logging.info(
             "Posted weekly merge summary for %s to channel %s via %s (%d contributors, %d chunks)",
             key,

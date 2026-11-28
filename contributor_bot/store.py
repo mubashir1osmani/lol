@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS github_users_cache (
     twitter_username TEXT NOT NULL DEFAULT '',
     bio TEXT NOT NULL DEFAULT '',
     email_local TEXT NOT NULL DEFAULT '',
+    commit_name TEXT NOT NULL DEFAULT '',
     fetched_at TEXT NOT NULL
 );
 
@@ -163,6 +164,16 @@ CREATE TABLE IF NOT EXISTS author_merged_counts (
     PRIMARY KEY (repository, github_login)
 );
 
+CREATE TABLE IF NOT EXISTS roles_daily_runs (
+    repository TEXT NOT NULL,
+    run_date TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    via TEXT NOT NULL DEFAULT 'scheduler',
+    prs_discovered INTEGER NOT NULL DEFAULT 0,
+    roles_granted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (repository, run_date)
+);
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY,
     applied_at TEXT NOT NULL
@@ -196,6 +207,9 @@ class Store:
             mw_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(merged_weeks)")}
             if mw_columns and "via" not in mw_columns:
                 self._conn.execute("ALTER TABLE merged_weeks ADD COLUMN via TEXT NOT NULL DEFAULT 'scheduler'")
+            guc_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(github_users_cache)")}
+            if guc_columns and "commit_name" not in guc_columns:
+                self._conn.execute("ALTER TABLE github_users_cache ADD COLUMN commit_name TEXT NOT NULL DEFAULT ''")
             # One-time migration for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
             # Guarded by schema_migrations so it runs at most once and never touches legitimate public posts.
             migration_name = "clear_bogus_2026_w48_preview_v1"
@@ -415,34 +429,59 @@ class Store:
             ).fetchall()
         return [_pull_dict(row) for row in rows]
 
-    def all_pull_authors(self, repository: str) -> list[dict]:
+    def all_pull_authors(self, repository: str, *, merged_since: str | None = None) -> list[dict]:
         """Return distinct PR authors stored for ``repository``, with latest login and PR count."""
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT
-                    github_user_id,
-                    (
-                        SELECT p2.github_login
-                        FROM merged_pull_requests p2
-                        WHERE p2.repository = p1.repository
-                          AND p2.github_user_id = p1.github_user_id
-                        ORDER BY p2.merged_at DESC, p2.number DESC
-                        LIMIT 1
-                    ) AS github_login,
-                    COUNT(*) AS pull_count
-                FROM merged_pull_requests p1
-                WHERE repository = ?
-                GROUP BY github_user_id
-                ORDER BY github_user_id
-                """,
-                (repository,),
-            ).fetchall()
+            if merged_since:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        github_user_id,
+                        (
+                            SELECT p2.github_login
+                            FROM merged_pull_requests p2
+                            WHERE p2.repository = p1.repository
+                              AND p2.github_user_id = p1.github_user_id
+                            ORDER BY p2.merged_at DESC, p2.number DESC
+                            LIMIT 1
+                        ) AS github_login,
+                        COUNT(*) AS pull_count,
+                        MAX(merged_at) AS last_merged_at
+                    FROM merged_pull_requests p1
+                    WHERE repository = ? AND merged_at >= ?
+                    GROUP BY github_user_id
+                    ORDER BY last_merged_at DESC, github_user_id DESC
+                    """,
+                    (repository, merged_since),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        github_user_id,
+                        (
+                            SELECT p2.github_login
+                            FROM merged_pull_requests p2
+                            WHERE p2.repository = p1.repository
+                              AND p2.github_user_id = p1.github_user_id
+                            ORDER BY p2.merged_at DESC, p2.number DESC
+                            LIMIT 1
+                        ) AS github_login,
+                        COUNT(*) AS pull_count,
+                        MAX(merged_at) AS last_merged_at
+                    FROM merged_pull_requests p1
+                    WHERE repository = ?
+                    GROUP BY github_user_id
+                    ORDER BY last_merged_at DESC, github_user_id DESC
+                    """,
+                    (repository,),
+                ).fetchall()
         return [
             {
                 "github_user_id": int(row["github_user_id"]),
                 "github_login": str(row["github_login"]),
                 "pull_count": int(row["pull_count"]),
+                "last_merged_at": str(row["last_merged_at"] or ""),
             }
             for row in rows
         ]
@@ -488,6 +527,17 @@ class Store:
                 ORDER BY granted_at, role_key
                 """,
                 (discord_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def all_unannounced_grants(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT discord_id, role_key, role_name, granted_at FROM role_grants
+                WHERE announced_at IS NULL
+                ORDER BY granted_at, discord_id, role_key
+                """
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -824,15 +874,26 @@ class Store:
             )
             self._conn.commit()
 
-    def all_confirmed_matches(self) -> list[dict]:
+    def all_confirmed_matches(self, *, matched_since: str | None = None) -> list[dict]:
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
-                FROM github_discord_matches
-                ORDER BY github_login
-                """
-            ).fetchall()
+            if matched_since:
+                rows = self._conn.execute(
+                    """
+                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                    FROM github_discord_matches
+                    WHERE matched_at >= ?
+                    ORDER BY github_login
+                    """,
+                    (matched_since,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                    FROM github_discord_matches
+                    ORDER BY github_login
+                    """
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def confirmed_match_for_discord(self, discord_id: str) -> dict | None:
@@ -858,7 +919,7 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT github_login, name, blog, twitter_username, bio, email_local, fetched_at
+                SELECT github_login, name, blog, twitter_username, bio, email_local, commit_name, fetched_at
                 FROM github_users_cache
                 WHERE github_login = ?
                 """,
@@ -875,6 +936,7 @@ class Store:
         twitter_username: str = "",
         bio: str = "",
         email_local: str = "",
+        commit_name: str = "",
         fetched_at: str,
     ) -> None:
         key = (github_login or "").strip().lower()
@@ -884,14 +946,18 @@ class Store:
             self._conn.execute(
                 """
                 INSERT INTO github_users_cache (
-                    github_login, name, blog, twitter_username, bio, email_local, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    github_login, name, blog, twitter_username, bio, email_local, commit_name, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(github_login) DO UPDATE SET
                     name = excluded.name,
                     blog = excluded.blog,
                     twitter_username = excluded.twitter_username,
                     bio = excluded.bio,
                     email_local = excluded.email_local,
+                    commit_name = CASE
+                        WHEN excluded.commit_name != '' THEN excluded.commit_name
+                        ELSE github_users_cache.commit_name
+                    END,
                     fetched_at = excluded.fetched_at
                 """,
                 (
@@ -901,6 +967,7 @@ class Store:
                     (twitter_username or "")[:100],
                     (bio or "")[:400],
                     (email_local or "")[:120],
+                    (commit_name or "")[:200],
                     fetched_at,
                 ),
             )
@@ -1017,6 +1084,61 @@ class Store:
                 (key, value, updated_at),
             )
             self._conn.commit()
+
+    def roles_day_completed(self, repository: str, run_date: str) -> bool:
+        return self.roles_day_info(repository, run_date) is not None
+
+    def roles_day_info(self, repository: str, run_date: str) -> dict | None:
+        """Return daily roles run metadata if ``run_date`` (YYYY-MM-DD) already completed."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT run_date, completed_at, via, prs_discovered, roles_granted
+                FROM roles_daily_runs
+                WHERE lower(repository) = lower(?) AND run_date = ?
+                ORDER BY completed_at DESC
+                LIMIT 1
+                """,
+                (repository, run_date),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_roles_day(
+        self,
+        repository: str,
+        run_date: str,
+        completed_at: str,
+        *,
+        via: str = "scheduler",
+        prs_discovered: int = 0,
+        roles_granted: int = 0,
+    ) -> bool:
+        """Record a completed daily contributor-roles run. Returns False if already marked."""
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT 1 FROM roles_daily_runs WHERE lower(repository) = lower(?) AND run_date = ?",
+                (repository, run_date),
+            ).fetchone()
+            if existing is not None:
+                return False
+            cursor = self._conn.execute(
+                """
+                INSERT INTO roles_daily_runs (
+                    repository, run_date, completed_at, via, prs_discovered, roles_granted
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repository, run_date) DO NOTHING
+                """,
+                (
+                    repository,
+                    run_date,
+                    completed_at,
+                    via,
+                    int(prs_discovered),
+                    int(roles_granted),
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def get_author_merged_count(self, repository: str, github_login: str) -> dict | None:
         key = (github_login or "").strip().lower()
