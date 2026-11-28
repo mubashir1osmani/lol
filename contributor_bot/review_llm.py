@@ -7,6 +7,8 @@ roles keep working when the package is not installed.
 import json
 import re
 
+from .tracing import build_trace_metadata, configure_litellm_tracing
+
 DIFF_CHUNK_CHARS = 20_000
 DIFF_MAX_CHUNKS = 3
 
@@ -117,19 +119,29 @@ def parse_review_json(text: str) -> dict:
     }
 
 
-def complete_litellm(model: str, messages: list[dict], *, timeout: float = 60.0) -> str:
+def complete_litellm(
+    model: str,
+    messages: list[dict],
+    *,
+    timeout: float = 60.0,
+    metadata: dict | None = None,
+) -> str:
     """One ``litellm.completion`` call. Provider keys come from the process environment."""
     try:
         import litellm
     except ImportError as error:
         raise RuntimeError("litellm is not installed") from error
-    response = litellm.completion(
-        model=model,
-        messages=messages,
-        temperature=0.2,
-        max_tokens=700,
-        timeout=timeout,
-    )
+    configure_litellm_tracing()
+    kwargs: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 700,
+        "timeout": timeout,
+    }
+    if metadata:
+        kwargs["metadata"] = metadata
+    response = litellm.completion(**kwargs)
     choices = getattr(response, "choices", None)
     if choices is None and isinstance(response, dict):
         choices = response.get("choices")
@@ -182,9 +194,11 @@ def _merge_messages(notes: list[str], omitted: list[str]) -> list[dict]:
     ]
 
 
-def run_llm_review(diff: str, model: str, complete=None) -> dict:
+def run_llm_review(diff: str, model: str, complete=None, *, session_id: str | None = None) -> dict:
     """Review a diff in at most a few chunks, then one combined JSON object."""
-    complete = complete_litellm if complete is None else complete
+    if complete is None:
+        metadata = build_trace_metadata("pr_review", session_id=session_id)
+        complete = lambda m, msgs: complete_litellm(m, msgs, metadata=metadata)
     chunks, omitted = chunk_diff(diff)
     if not chunks:
         return {

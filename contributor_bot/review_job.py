@@ -412,12 +412,17 @@ def schedule_webhook_recheck(config: Config, store: Store, event: str, payload: 
     _spawn(lambda: perform_review(config, store, number, source="webhook"))
 
 
-def _classify_complete(config: Config, system: str, text: str) -> str:
+def _classify_complete(config: Config, system: str, text: str, *, session_id: str | None = None) -> str:
+    from .tracing import build_trace_metadata
     model = config.review_classifier_model or config.review_model
-    return complete_litellm(model, [
-        {"role": "system", "content": system},
-        {"role": "user", "content": text},
-    ])
+    return complete_litellm(
+        model,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+        metadata=build_trace_metadata("pr_review_classifier", session_id=session_id),
+    )
 
 
 def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
@@ -426,10 +431,12 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
         numbers = should_review_message(message, config.github_repository, require_ask=config.review_require_ask)
         return bool(numbers), numbers
     text = message.get("content") or ""
+    channel_id = message.get("channel_id") or message.get("id") or ""
+    session_id = f"pr_review_classifier:{channel_id}" if channel_id else None
     asked = classify_review_request(
         text,
         config.github_repository,
-        complete=lambda system, body: _classify_complete(config, system, body),
+        complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
     )
     if not asked:
         return False, []
@@ -540,7 +547,7 @@ def _routed_complete(config, tier, *, session_id):
         return complete_auto(config, [
             {"role": "system", "content": system},
             {"role": "user", "content": body},
-        ], session_id=session_id, tier=tier)
+        ], session_id=session_id, tier=tier, agent="discord_qa")
     return complete
 
 
