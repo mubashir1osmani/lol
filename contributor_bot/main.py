@@ -32,7 +32,7 @@ from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
 from .signatures import ed25519_public_key_ok
 from .state import load_state, save_state
-from .weekly import post_weekly_if_due, weekly_schedule_status
+from .weekly import log_weekly_boot_status, post_weekly_if_due, weekly_schedule_status
 
 
 def moderator_channel(channel_id: str, token: str) -> dict:
@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.post_weekly_now:
         store = Store(config.roles_db_path)
         try:
-            posted = post_weekly_if_due(config, store, force=True)
+            posted = post_weekly_if_due(config, store, force=True, via="cli")
         finally:
             store.close()
         if posted is None:
@@ -316,7 +316,10 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                 config.roles_backfill_on_boot,
             )
     if config.merged_weekly_enabled:
-        logging.info("Weekly contributor summary: %s", weekly_schedule_status(config, store))
+        if store is not None:
+            log_weekly_boot_status(config, store)
+        else:
+            logging.info("Weekly contributor summary: %s", weekly_schedule_status(config, store))
     if config.announcements_enabled:
         logging.info(
             "Legacy roundup poller (ANNOUNCEMENTS_ENABLED) is retired; "

@@ -1429,7 +1429,8 @@ class WeeklyTests(unittest.TestCase):
                 return []
             raise api.TransientAPIError("api.github.com returned HTTP 403", retry_after=1800.0)
 
-        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fail_403):
+        with mock.patch("contributor_bot.weekly.github_get_json", side_effect=fail_403), \
+                mock.patch("contributor_bot.weekly.fetch_recent_messages", return_value=[]):
             result = post_weekly_if_due(cfg_actor, store, friday)
         self.assertIsNone(result)
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
@@ -1444,6 +1445,7 @@ class WeeklyTests(unittest.TestCase):
             pr_review_enabled=False,
         )
         with mock.patch("contributor_bot.main.poll_once") as legacy_poll, \
+                mock.patch("contributor_bot.weekly.fetch_recent_messages", return_value=[]), \
                 self.assertLogs(level="INFO") as logs:
             _run_loop(cfg_legacy_on, stop_event, store=store, gateway=None)
         legacy_poll.assert_not_called()
@@ -1688,6 +1690,7 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
             return "posted"
 
         with mock.patch("contributor_bot.main.post_weekly_if_due", side_effect=flaky_weekly), \
+                mock.patch("contributor_bot.weekly.fetch_recent_messages", return_value=[]), \
                 self.assertLogs(level="INFO") as logs:
             _run_loop(cfg, stop_event, store=store, gateway=None)
 
