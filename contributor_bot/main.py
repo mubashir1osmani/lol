@@ -29,9 +29,11 @@ from .pr_board import sync_pr_board
 from .review_job import poll_review_channels
 from .roles_sync import (
     log_roles_daily_boot_status,
+    revalidate_pr_link_poster_matches_on_boot,
     run_daily_roles_if_due,
     run_roles_backfill,
     should_run_boot_backfill,
+    should_run_pr_link_poster_revalidation,
 )
 from .store import Store
 from .schedule import UTC, parse_time
@@ -359,6 +361,11 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                 except Exception:
                     logging.exception("Weekly merge summary watchdog check failed")
             if roles_daily:
+                if should_run_pr_link_poster_revalidation(config, store):
+                    try:
+                        revalidate_pr_link_poster_matches_on_boot(config, store, guild=guild, loop=loop)
+                    except Exception:
+                        logging.exception("Boot pr_link_poster re-validation failed")
                 if not boot_backfill_started and should_run_boot_backfill(config, store):
                     boot_backfill_started = True
                     logging.info("Starting one-time contributor roles backfill on boot (ROLES_BACKFILL_ON_BOOT=true)")

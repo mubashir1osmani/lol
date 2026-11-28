@@ -628,6 +628,8 @@ def _interaction_payload(interaction, *, guild=None, loop=None) -> dict:
         for name, value in getattr(namespace, "__dict__", {}).items():
             if name.startswith("_") or value is None:
                 continue
+            if hasattr(value, "id"):
+                value = str(value.id)
             options.append({"name": name, "value": value})
     place = interaction_place(interaction)
     member_payload: dict = {"user": {"id": str(interaction.user.id)}}
@@ -668,6 +670,8 @@ _DEFERRED_COMMAND_EPHEMERAL = {
     "merged-this-week": True,
     "my-prs": True,
     "roles-backfill": True,
+    "roles-why": True,
+    "roles-revoke": True,
     "links-backfill": True,
 }
 
@@ -744,14 +748,33 @@ def _bind_command_tree(discord, client, config: Config, store: Store | None):
         tree.command(name=spec["name"], description=spec["description"], guild=guild)(wrapped)
 
     if config.contributor_roles_enabled:
+        member_type = getattr(discord, "User", str)
         for spec in role_slash_commands(config):
-            async def callback(interaction):
-                await _dispatch_command(discord, interaction, config, store, client=client)
+            if spec["name"] == "roles-why":
+                async def roles_why(interaction, member: member_type):  # type: ignore[valid-type]
+                    await _dispatch_command(discord, interaction, config, store, client=client)
 
-            callback.__name__ = spec["name"].replace("-", "_")
-            if spec.get("default_member_permissions"):
-                callback = app.default_permissions(manage_messages=True)(callback)
-            add(spec, callback)
+                cb = app.describe(member=spec["options"][0]["description"])(roles_why)
+                cb = app.default_permissions(manage_messages=True)(cb)
+                add(spec, cb)
+            elif spec["name"] == "roles-revoke":
+                async def roles_revoke(interaction, member: member_type, login: str | None = None):  # type: ignore[valid-type]
+                    await _dispatch_command(discord, interaction, config, store, client=client)
+
+                cb = app.describe(
+                    member=spec["options"][0]["description"],
+                    login=spec["options"][1]["description"],
+                )(roles_revoke)
+                cb = app.default_permissions(manage_messages=True)(cb)
+                add(spec, cb)
+            else:
+                async def callback(interaction):
+                    await _dispatch_command(discord, interaction, config, store, client=client)
+
+                callback.__name__ = spec["name"].replace("-", "_")
+                if spec.get("default_member_permissions"):
+                    callback = app.default_permissions(manage_messages=True)(callback)
+                add(spec, callback)
     if config.pr_review_enabled:
         recheck_spec = next(spec for spec in REVIEW_SLASH_COMMANDS if spec["name"] == "recheck")
         review_spec = next(spec for spec in REVIEW_SLASH_COMMANDS if spec["name"] == "review-pr")

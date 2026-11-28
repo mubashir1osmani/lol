@@ -91,7 +91,7 @@ _DISCORD_HANDLE_IN_TEXT = re.compile(
 _LEGACY_DISCORD_TAG = re.compile(r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]{2,32})#[0-9]{4}\b")
 _NOREPLY_ID_PREFIX = re.compile(r"^[0-9]+\+(.+)$")
 _PR_LINK_OWNERSHIP_RE = re.compile(
-    r"\b(?:my pr|i\s+(?:opened|made|raised|submitted)|please review)\b",
+    r"\b(?:my\s+pr|i\s+(?:opened|made|raised|submitted))\b",
     re.IGNORECASE,
 )
 _GENERIC_WEBSITE_HOSTS = frozenset({
@@ -245,6 +245,7 @@ class MatchDetail:
     discord_username: str = ""
     pr_count: int = 0
     github_user_id: int | None = None
+    evidence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1333,6 +1334,18 @@ def load_guild_members(
     return members
 
 
+def _member_login_fields(member: DiscordMemberInfo) -> tuple[str, ...]:
+    """Fields eligible for exact_login matching: username and global_name ONLY (never nick)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for val in (member.username, member.global_name):
+        cleaned = (val or "").strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return tuple(out)
+
+
 def _member_fields(member: DiscordMemberInfo) -> tuple[str, ...]:
     seen: set[str] = set()
     out: list[str] = []
@@ -1344,11 +1357,11 @@ def _member_fields(member: DiscordMemberInfo) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _member_tokens(member: DiscordMemberInfo) -> tuple[set[str], set[str], set[str]]:
+def _tokens_for_fields(fields: tuple[str, ...]) -> tuple[set[str], set[str], set[str]]:
     raw_lower: set[str] = set()
     strict_set: set[str] = set()
     base_set: set[str] = set()
-    for field in _member_fields(member):
+    for field in fields:
         lowered = field.casefold()
         if lowered:
             raw_lower.add(lowered)
@@ -1361,6 +1374,10 @@ def _member_tokens(member: DiscordMemberInfo) -> tuple[set[str], set[str], set[s
     return raw_lower, strict_set, base_set
 
 
+def _member_tokens(member: DiscordMemberInfo) -> tuple[set[str], set[str], set[str]]:
+    return _tokens_for_fields(_member_fields(member))
+
+
 class _MemberIndex:
     """Precomputed O(1) lookup tables over a guild's members for fast matching at scale."""
 
@@ -1371,6 +1388,10 @@ class _MemberIndex:
         self.by_raw: dict[str, list[DiscordMemberInfo]] = {}
         self.by_strict: dict[str, list[DiscordMemberInfo]] = {}
         self.by_base: dict[str, list[DiscordMemberInfo]] = {}
+        # Username/global_name-only tables for exact_login (never matches server nicknames).
+        self.login_by_raw: dict[str, list[DiscordMemberInfo]] = {}
+        self.login_by_strict: dict[str, list[DiscordMemberInfo]] = {}
+        self.login_by_base: dict[str, list[DiscordMemberInfo]] = {}
         self.by_bigram: dict[str, list[int]] = {}
         self.entries: list[tuple[DiscordMemberInfo, set[str], set[str], set[str], tuple[str, ...]]] = []
 
@@ -1385,6 +1406,15 @@ class _MemberIndex:
                 self.by_strict.setdefault(tok, []).append(member)
             for tok in base_s:
                 self.by_base.setdefault(tok, []).append(member)
+
+            l_raw, l_strict, l_base = _tokens_for_fields(_member_login_fields(member))
+            for tok in l_raw:
+                self.login_by_raw.setdefault(tok, []).append(member)
+            for tok in l_strict:
+                self.login_by_strict.setdefault(tok, []).append(member)
+            for tok in l_base:
+                self.login_by_base.setdefault(tok, []).append(member)
+
             seen_bigrams: set[str] = set()
             for norm in norms:
                 if len(norm) < 4:
@@ -1395,27 +1425,40 @@ class _MemberIndex:
                         seen_bigrams.add(bg)
                         self.by_bigram.setdefault(bg, []).append(idx)
 
-    def exact_tier_hits(self, value: str) -> list[DiscordMemberInfo]:
-        """Match exact/strict normalized form first; strip trailing digit suffixes only if no strict hit."""
+    @staticmethod
+    def _lookup_tables(
+        value: str,
+        raw_map: dict[str, list[DiscordMemberInfo]],
+        strict_map: dict[str, list[DiscordMemberInfo]],
+        base_map: dict[str, list[DiscordMemberInfo]],
+    ) -> list[DiscordMemberInfo]:
         cleaned = (value or "").strip()
         if not cleaned:
             return []
         hits_by_id: dict[str, DiscordMemberInfo] = {}
         lowered = cleaned.casefold()
         if len(lowered) >= 3:
-            for member in self.by_raw.get(lowered, ()):
+            for member in raw_map.get(lowered, ()):
                 hits_by_id[member.discord_id] = member
         strict = normalize_strict(cleaned)
         if len(strict) >= 4:
-            for member in self.by_strict.get(strict, ()):
+            for member in strict_map.get(strict, ()):
                 hits_by_id[member.discord_id] = member
         if hits_by_id:
             return list(hits_by_id.values())
         base = normalize_base(cleaned)
         if len(base) >= 4:
-            for member in self.by_base.get(base, ()):
+            for member in base_map.get(base, ()):
                 hits_by_id[member.discord_id] = member
         return list(hits_by_id.values())
+
+    def exact_login_hits(self, value: str) -> list[DiscordMemberInfo]:
+        """Match exact_login ONLY against Discord username and global_name (never nick)."""
+        return self._lookup_tables(value, self.login_by_raw, self.login_by_strict, self.login_by_base)
+
+    def exact_tier_hits(self, value: str) -> list[DiscordMemberInfo]:
+        """Match exact/strict normalized form first; strip trailing digit suffixes only if no strict hit."""
+        return self._lookup_tables(value, self.by_raw, self.by_strict, self.by_base)
 
     def exact_field_indices(self, value: str) -> set[int]:
         """Indices of members matching ``value`` via raw, strict, or base token."""
@@ -1597,14 +1640,15 @@ def _profile_source_norms(profile: GitHubAuthorProfile) -> list[tuple[str, str]]
 
 
 def _author_member_name_similarity(profile: GitHubAuthorProfile, member: DiscordMemberInfo) -> float:
-    """Maximum normalized SequenceMatcher similarity between author identifiers and member fields."""
-    author_norms: set[str] = set()
-    for val in (profile.login, profile.name, profile.twitter_username, *profile.commit_names, *profile.email_locals):
-        if val:
-            author_norms.update(_name_variants(val))
-    member_norms: set[str] = set()
-    for val in _member_fields(member):
-        member_norms.update(_name_variants(val))
+    """Maximum normalized SequenceMatcher similarity between full GitHub login/name and Discord username/global_name."""
+    author_norms = {
+        norm for val in (profile.login, profile.name)
+        if val and (norm := normalize_strict(val))
+    }
+    member_norms = {
+        norm for val in _member_login_fields(member)
+        if (norm := normalize_strict(val))
+    }
     best = 0.0
     for a in author_norms:
         if len(a) < 3:
@@ -1614,14 +1658,73 @@ def _author_member_name_similarity(profile: GitHubAuthorProfile, member: Discord
                 continue
             if a == b:
                 return 1.0
+            if len(a) < 4 or len(b) < 4:
+                continue
             ratio = difflib.SequenceMatcher(None, a, b).ratio()
             if ratio > best:
                 best = ratio
-            if len(a) >= 4 and len(b) >= 4 and (a in b or b in a):
+            if a in b or b in a:
                 sub_ratio = max(ratio, min(len(a), len(b)) / max(len(a), len(b)))
                 if sub_ratio > best:
                     best = sub_ratio
     return best
+
+
+def multi_author_poster_ids(
+    pr_link_rows: list[dict],
+    pr_number_to_author: dict[int, str],
+) -> frozenset[str]:
+    """Return Discord IDs who linked PRs belonging to >= 2 different GitHub authors (reviewers/triagers)."""
+    authors_by_poster: dict[str, set[str]] = {}
+    for row in pr_link_rows:
+        uid = str(row.get("discord_id") or "")
+        pr_num = row.get("pr_number")
+        if not is_discord_id(uid) or not isinstance(pr_num, int):
+            continue
+        author = (pr_number_to_author.get(pr_num) or "").strip().lower()
+        if author:
+            authors_by_poster.setdefault(uid, set()).add(author)
+    return frozenset(uid for uid, authors in authors_by_poster.items() if len(authors) >= 2)
+
+
+def validate_pr_link_poster_match(
+    profile: GitHubAuthorProfile,
+    member: DiscordMemberInfo,
+    ev: PRLinkPosterEvidence,
+    *,
+    eligible_posters: list[PRLinkPosterEvidence],
+    excluded_discord_ids: frozenset[str] | set[str] = frozenset(),
+    multi_author_ids: frozenset[str] | set[str] = frozenset(),
+    rejected_discord_ids: frozenset[str] | set[str] = frozenset(),
+) -> tuple[bool, str]:
+    """Validate whether a PR-link poster qualifies for auto-accept under strict rules.
+
+    Never auto-accepts on link count alone: requires sole eligible poster AND
+    (ownership text like 'my pr' / 'I opened/made/raised/submitted' OR
+    name similarity >= 0.50 to the GitHub login/name). Rejects staff and
+    multi-author posters (reviewers/triagers).
+    """
+    uid = member.discord_id
+    if uid in excluded_discord_ids:
+        return False, "staff_or_org_member"
+    if uid in multi_author_ids:
+        return False, "multi_author_poster"
+    if uid in rejected_discord_ids:
+        return False, "rejected_pair"
+    if not ev.pr_numbers:
+        return False, "no_pr_links"
+    if len(eligible_posters) != 1 or eligible_posters[0].discord_id != uid:
+        return False, "multiple_posters"
+    has_ownership = _has_pr_ownership_text(ev.message_texts)
+    name_sim = _author_member_name_similarity(profile, member)
+    if has_ownership or name_sim >= PR_LINK_POSTER_NAME_SIMILARITY_THRESHOLD:
+        reasons = [f"pr_link_poster:{len(set(ev.pr_numbers))}_prs"]
+        if has_ownership:
+            reasons.append("ownership_text")
+        if name_sim >= PR_LINK_POSTER_NAME_SIMILARITY_THRESHOLD:
+            reasons.append(f"name_sim:{name_sim:.2f}")
+        return True, ", ".join(reasons)
+    return False, f"no_ownership_text_and_low_name_sim({name_sim:.2f})"
 
 
 def _has_pr_ownership_text(message_texts: tuple[str, ...] | list[str]) -> bool:
@@ -1723,6 +1826,8 @@ def score_author_against_members(
     member_index: _MemberIndex | None = None,
     pr_link_posters: list[PRLinkPosterEvidence] | None = None,
     excluded_discord_ids: frozenset[str] | set[str] = frozenset(),
+    multi_author_ids: frozenset[str] | set[str] = frozenset(),
+    rejected_discord_ids: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[tuple[DiscordMemberInfo, str, float] | None, list[CandidatePair]]:
     """Return either a unique deterministic strong match OR ranked fuzzy/ambiguous candidates."""
     index = member_index if member_index is not None else _MemberIndex(members)
@@ -1739,7 +1844,11 @@ def score_author_against_members(
         ("social_discord_id", social_ids),
     )
     for source_name, uids in id_sources:
-        hits = [index.by_id[uid] for uid in uids if uid in index.by_id]
+        hits = [
+            index.by_id[uid]
+            for uid in uids
+            if uid in index.by_id and uid not in rejected_discord_ids
+        ]
         if len(hits) == 1:
             return (hits[0], source_name, 0.99), []
 
@@ -1757,7 +1866,8 @@ def score_author_against_members(
         hits_by_id: dict[str, DiscordMemberInfo] = {}
         for handle in handles:
             for member in index.exact_tier_hits(handle):
-                hits_by_id[member.discord_id] = member
+                if member.discord_id not in rejected_discord_ids:
+                    hits_by_id[member.discord_id] = member
         hits = list(hits_by_id.values())
         if len(hits) == 1:
             return (hits[0], source_name, 0.98), []
@@ -1765,42 +1875,52 @@ def score_author_against_members(
             entry = ambiguous_strong.setdefault(member.discord_id, (member, []))
             entry[1].append(f"ambiguous_{source_name}")
 
-    # 3. Exact normalized match of login, twitter_username, or GitHub profile name.
+    # 3. Exact normalized match of login (username/global_name ONLY, never nick),
+    # twitter_username, or GitHub profile name.
     strong_tiers = (
-        ("exact_login", profile.login, 0.96),
-        ("twitter_match", profile.twitter_username, 0.95),
-        ("exact_name", profile.name, 0.93),
+        ("exact_login", profile.login, 0.96, index.exact_login_hits),
+        ("twitter_match", profile.twitter_username, 0.95, index.exact_tier_hits),
+        ("exact_name", profile.name, 0.93, index.exact_tier_hits),
     )
-    for method, value, confidence in strong_tiers:
+    for method, value, confidence, lookup_fn in strong_tiers:
         if not value:
             continue
-        hits = index.exact_tier_hits(value)
+        hits = [m for m in lookup_fn(value) if m.discord_id not in rejected_discord_ids]
         if len(hits) == 1:
             return (hits[0], method, confidence), []
         for member in hits:
             entry = ambiguous_strong.setdefault(member.discord_id, (member, []))
             entry[1].append(f"ambiguous_{method}")
 
-    # 4. PR-link poster tier (after exact tiers, before fuzzy; excludes staff/BerriAI org members).
+    # 4. PR-link poster tier (after exact tiers, before fuzzy).
+    # Excludes staff/BerriAI org members, multi-author reviewers/triagers (>=2 distinct authors),
+    # and rejected pairs. NEVER auto-accepts on link count alone: requires ownership text
+    # ('my pr' / 'I opened/made/raised/submitted') OR name similarity >= 0.50 to login/name.
     pr_poster_signals: dict[str, list[str]] = {}
     if pr_link_posters:
-        non_staff = [
+        eligible = [
             ev for ev in pr_link_posters
             if ev.discord_id in index.by_id
             and ev.discord_id not in excluded_discord_ids
+            and ev.discord_id not in multi_author_ids
+            and ev.discord_id not in rejected_discord_ids
             and ev.pr_numbers
         ]
-        if len(non_staff) == 1:
-            ev = non_staff[0]
+        if len(eligible) == 1:
+            ev = eligible[0]
             member = index.by_id[ev.discord_id]
-            distinct_prs = len(set(ev.pr_numbers))
-            if distinct_prs >= 2:
+            ok, _reason = validate_pr_link_poster_match(
+                profile,
+                member,
+                ev,
+                eligible_posters=eligible,
+                excluded_discord_ids=excluded_discord_ids,
+                multi_author_ids=multi_author_ids,
+                rejected_discord_ids=rejected_discord_ids,
+            )
+            if ok:
                 return (member, "pr_link_poster", PR_LINK_POSTER_CONFIDENCE), []
-            if distinct_prs == 1:
-                name_sim = _author_member_name_similarity(profile, member)
-                if name_sim >= PR_LINK_POSTER_NAME_SIMILARITY_THRESHOLD or _has_pr_ownership_text(ev.message_texts):
-                    return (member, "pr_link_poster", PR_LINK_POSTER_CONFIDENCE), []
-        for ev in non_staff:
+        for ev in eligible:
             distinct_prs = len(set(ev.pr_numbers))
             sigs = pr_poster_signals.setdefault(ev.discord_id, [])
             sigs.append(f"pr_link_poster:{distinct_prs}_prs")
@@ -1838,6 +1958,8 @@ def score_author_against_members(
     candidates: list[CandidatePair] = []
     for idx in sorted(candidate_indices):
         member, raw_l, strict_s, base_s, norms = index.entries[idx]
+        if member.discord_id in rejected_discord_ids:
+            continue
         extra_sigs: list[str] = []
         base_floor = 0.0
         if member.discord_id in ambiguous_strong:
@@ -2043,11 +2165,17 @@ def _disambiguate_with_reasons(
     jev_transport=None,  # deprecated legacy kwarg kept for signature compatibility
     haiku_complete=None,  # deprecated alias for llm_complete
     deadline: float | None = None,
-) -> tuple[dict[str, tuple[DiscordMemberInfo, str, float]], str, dict[str, str], dict[str, tuple[float, str]]]:
+) -> tuple[
+    dict[str, tuple[DiscordMemberInfo, str, float]],
+    str,
+    dict[str, str],
+    dict[str, tuple[float, str]],
+    dict[str, tuple[str, ...]],
+]:
     """Run list-wise _select_with_llm per author in a thread pool (with deterministic fallback)."""
     del jev_transport
     if not candidates:
-        return {}, "none", {}, {}
+        return {}, "none", {}, {}, {}
 
     complete_fn = llm_complete if llm_complete is not None else haiku_complete
     by_login: dict[str, list[CandidatePair]] = {}
@@ -2062,16 +2190,20 @@ def _disambiguate_with_reasons(
         fallback_winners = _deterministic_candidate_fallback(candidates)
         skip_reasons: dict[str, str] = {}
         skip_meta: dict[str, tuple[float, str]] = {}
+        ev_map: dict[str, tuple[str, ...]] = {}
         for login_key, pairs in by_login.items():
             if login_key not in fallback_winners:
                 skip_reasons[login_key] = "llm_unavailable"
                 skip_meta[login_key] = (pairs[0].heuristic_score if pairs else 0.0, "no LLM credentials configured")
+            else:
+                ev_map[login_key] = pairs[0].signals
         source = "deterministic_fallback" if fallback_winners else "unavailable"
-        return fallback_winners, source, skip_reasons, skip_meta
+        return fallback_winners, source, skip_reasons, skip_meta, ev_map
 
     winners: dict[str, tuple[DiscordMemberInfo, str, float]] = {}
     skip_reasons = {}
     skip_meta = {}
+    evidence_by_login: dict[str, tuple[str, ...]] = {}
     any_llm_succeeded = False
     model_used = _resolve_match_model(config)
 
@@ -2123,6 +2255,10 @@ def _disambiguate_with_reasons(
             model_used = res.model
         if _llm_selection_accepted(res) and res.discord_id in member_map:
             winners[login_key] = (member_map[res.discord_id], "llm", res.confidence)
+            ev_items = list(res.evidence)
+            if res.reason and res.reason not in ev_items:
+                ev_items.append(f"reason: {res.reason}")
+            evidence_by_login[login_key] = tuple(ev_items)
         elif not res.discord_id:
             skip_reasons[login_key] = "llm_none_of_these"
             skip_meta[login_key] = (max(res.confidence, top_heur), res.reason or "none of these")
@@ -2137,9 +2273,17 @@ def _disambiguate_with_reasons(
             winners[login_key] = win
             skip_reasons.pop(login_key, None)
             skip_meta.pop(login_key, None)
-        return winners, ("deterministic_fallback" if fallback_winners else "unavailable"), skip_reasons, skip_meta
+            if login_key in by_login and by_login[login_key]:
+                evidence_by_login[login_key] = by_login[login_key][0].signals
+        return (
+            winners,
+            ("deterministic_fallback" if fallback_winners else "unavailable"),
+            skip_reasons,
+            skip_meta,
+            evidence_by_login,
+        )
 
-    return winners, (f"llm:{model_used}" if any_llm_succeeded else "unavailable"), skip_reasons, skip_meta
+    return winners, (f"llm:{model_used}" if any_llm_succeeded else "unavailable"), skip_reasons, skip_meta, evidence_by_login
 
 
 def disambiguate_candidates(
@@ -2151,7 +2295,7 @@ def disambiguate_candidates(
     haiku_complete=None,
 ) -> dict[str, tuple[DiscordMemberInfo, str, float]]:
     """Run list-wise LLM selection across ambiguous/fuzzy candidates (or deterministic fallback)."""
-    winners, _source, _reasons, _meta = _disambiguate_with_reasons(
+    winners, _source, _reasons, _meta, _ev = _disambiguate_with_reasons(
         config,
         candidates,
         llm_complete=llm_complete,
@@ -2313,10 +2457,21 @@ def match_community_contributors_with_diagnostics(
         members_source = "injected"
 
     resolved: dict[str, tuple[dict, str, str, float]] = {}  # login_lower -> (group, discord_id, method, confidence)
+    evidence_by_login: dict[str, tuple[str, ...]] = {}
     sqlite_resolved_keys: set[str] = set()
     pending: list[dict] = []
     skip_reason_by_login: dict[str, str] = {}
     skip_meta_by_login: dict[str, tuple[float, str]] = {}
+
+    rejected_pairs: set[tuple[str, str]] = set()
+    if store is not None and hasattr(store, "all_match_rejections"):
+        try:
+            rejected_pairs = store.all_match_rejections()
+        except Exception as error:
+            logging.warning("Could not load match_rejections: %s", error)
+    rejected_by_login: dict[str, set[str]] = {}
+    for r_login, r_uid in rejected_pairs:
+        rejected_by_login.setdefault(r_login.casefold(), set()).add(r_uid)
 
     manual_map = getattr(config, "github_discord_map", None) or {}
     for group in groups:
@@ -2327,17 +2482,20 @@ def match_community_contributors_with_diagnostics(
         discord_id = group.get("discord_id")
         if discord_id and is_discord_id(str(discord_id)):
             resolved[login_key] = (group, str(discord_id), "prelinked", 1.0)
+            evidence_by_login[login_key] = ("prelinked",)
             continue
 
         if store is not None and isinstance(user_id, int) and hasattr(store, "link_for_github_user"):
             link = store.link_for_github_user(user_id)
             if link and is_discord_id(link.get("discord_id")):
                 resolved[login_key] = (group, str(link["discord_id"]), "link_store", 1.0)
+                evidence_by_login[login_key] = ("github_links",)
                 continue
 
         mapped_id = manual_map.get(login_key)
         if mapped_id and is_discord_id(str(mapped_id)):
             resolved[login_key] = (group, str(mapped_id), "config_map", 1.0)
+            evidence_by_login[login_key] = ("GITHUB_DISCORD_MAP",)
             continue
 
         # Persisted SQLite automatic match (computed once, expires after MATCH_CACHE_TTL_DAYS).
@@ -2345,14 +2503,18 @@ def match_community_contributors_with_diagnostics(
             cached = store.get_confirmed_match(login)
             if cached and is_discord_id(cached.get("discord_id")) and _match_is_fresh(cached.get("matched_at"), moment):
                 cid = str(cached["discord_id"])
-                resolved[login_key] = (
-                    group,
-                    cid,
-                    f"sqlite:{cached['method']}",
-                    float(cached.get("confidence") or 1.0),
-                )
-                sqlite_resolved_keys.add(login_key)
-                continue
+                if (login_key, cid) not in rejected_pairs:
+                    resolved[login_key] = (
+                        group,
+                        cid,
+                        f"sqlite:{cached['method']}",
+                        float(cached.get("confidence") or 1.0),
+                    )
+                    raw_ev = str(cached.get("evidence") or "").strip()
+                    if raw_ev:
+                        evidence_by_login[login_key] = (raw_ev,)
+                    sqlite_resolved_keys.add(login_key)
+                    continue
 
         pending.append(group)
 
@@ -2426,22 +2588,56 @@ def match_community_contributors_with_diagnostics(
             config, store, guild_members, org_members=org_members, org=org,
         )
 
-        # Load PR-link poster evidence for all pending authors in one batched SQLite query.
+        # Load PR-link poster evidence for all pending authors AND detect multi-author
+        # reviewers/triagers across the whole repository's pr_link_posters table.
         pr_nums_by_login: dict[str, list[int]] = {}
         all_pr_nums: set[int] = set()
+        pr_number_to_author: dict[int, str] = {}
+        for group in groups:
+            g_login = group["login"].strip().lower()
+            for p in group.get("pulls", ()):
+                if isinstance(p, dict) and isinstance(p.get("number"), int) and p["number"] > 0:
+                    pr_number_to_author[int(p["number"])] = g_login
         for group in pending:
             login_key = group["login"].strip().casefold()
             nums = _author_pull_numbers(group, store, repository)
             pr_nums_by_login[login_key] = nums
             all_pr_nums.update(nums)
+            for num in nums:
+                pr_number_to_author[num] = login_key
 
+        all_repo_pr_links: list[dict] = []
         pr_link_rows_by_pr: dict[int, list[dict]] = {}
-        if store is not None and repository and all_pr_nums and hasattr(store, "pr_link_posters_for_pulls"):
+        if store is not None and repository and hasattr(store, "all_pr_link_posters"):
             try:
-                for row in store.pr_link_posters_for_pulls(repository, all_pr_nums):
+                all_repo_pr_links = store.all_pr_link_posters(repository)
+                for row in all_repo_pr_links:
+                    pr_num = int(row["pr_number"])
+                    if pr_num in all_pr_nums:
+                        pr_link_rows_by_pr.setdefault(pr_num, []).append(row)
+            except Exception as error:
+                logging.warning("Could not load pr_link_posters for matching: %s", error)
+        elif store is not None and repository and all_pr_nums and hasattr(store, "pr_link_posters_for_pulls"):
+            try:
+                all_repo_pr_links = store.pr_link_posters_for_pulls(repository, all_pr_nums)
+                for row in all_repo_pr_links:
                     pr_link_rows_by_pr.setdefault(int(row["pr_number"]), []).append(row)
             except Exception as error:
                 logging.warning("Could not load pr_link_posters for matching: %s", error)
+
+        if all_repo_pr_links and store is not None and repository and hasattr(store, "pr_authors_for_numbers"):
+            unknown_nums = {
+                int(row["pr_number"])
+                for row in all_repo_pr_links
+                if isinstance(row.get("pr_number"), int) and int(row["pr_number"]) not in pr_number_to_author
+            }
+            if unknown_nums:
+                try:
+                    pr_number_to_author.update(store.pr_authors_for_numbers(repository, unknown_nums))
+                except Exception as error:
+                    logging.warning("Could not resolve PR authors for pr_link_posters: %s", error)
+
+        multi_author_ids = multi_author_poster_ids(all_repo_pr_links, pr_number_to_author)
 
         pr_link_rows_by_login: dict[str, list[dict]] = {}
         pr_link_evidence_by_login: dict[str, list[PRLinkPosterEvidence]] = {}
@@ -2462,15 +2658,19 @@ def match_community_contributors_with_diagnostics(
         use_priority_pool = bool(recent_members) and len(recent_members) < len(guild_members)
         recent_index = _MemberIndex(recent_members) if use_priority_pool else None
 
-        # Fast path before GitHub API enrichment: unique exact_login match in priority pool (or full pool if no split).
+        # Fast path before GitHub API enrichment: unique exact_login match against
+        # username/global_name ONLY (never nick), skipping rejected pairs.
         need_enrichment: list[dict] = []
         fast_index = recent_index if recent_index is not None else member_index
         for group in pending:
             login = group["login"]
             login_key = login.strip().casefold()
-            login_hits = fast_index.exact_tier_hits(login)
+            rejected_ids = rejected_by_login.get(login_key, set())
+            login_hits = [m for m in fast_index.exact_login_hits(login) if m.discord_id not in rejected_ids]
             if len(login_hits) == 1:
-                resolved[login_key] = (group, login_hits[0].discord_id, "exact_login", 0.96)
+                hit = login_hits[0]
+                resolved[login_key] = (group, hit.discord_id, "exact_login", 0.96)
+                evidence_by_login[login_key] = (f"exact_login:{login}->{hit.username or hit.global_name}",)
                 continue
             need_enrichment.append(group)
 
@@ -2502,6 +2702,8 @@ def match_community_contributors_with_diagnostics(
                 member_index=member_index,
                 pr_link_posters=pr_link_evidence_by_login.get(login_key),
                 excluded_discord_ids=excluded_staff_ids,
+                multi_author_ids=multi_author_ids,
+                rejected_discord_ids=rejected_by_login.get(login_key, set()),
             )
             full_scores_cache[login_key] = (full_strong, full_cands)
             sig = _compute_attempt_signature(profile, full_cands, pr_link_rows_by_login.get(login_key, []))
@@ -2519,6 +2721,20 @@ def match_community_contributors_with_diagnostics(
                     top_h = full_cands[0].heuristic_score if full_cands else 0.0
                     skip_meta_by_login[login_key] = (top_h, "cached negative match within 7d")
 
+        def _strong_evidence(login_key: str, member: DiscordMemberInfo, method: str) -> tuple[str, ...]:
+            if method == "pr_link_poster":
+                evs = [e for e in pr_link_evidence_by_login.get(login_key, ()) if e.discord_id == member.discord_id]
+                if evs:
+                    ev = evs[0]
+                    parts = [f"pr_link_poster:{len(set(ev.pr_numbers))}_prs({','.join(f'#{n}' for n in ev.pr_numbers[:5])})"]
+                    if _has_pr_ownership_text(ev.message_texts):
+                        parts.append("ownership_text")
+                    sim = _author_member_name_similarity(profiles_by_login[login_key], member)
+                    if sim >= PR_LINK_POSTER_NAME_SIMILARITY_THRESHOLD:
+                        parts.append(f"name_sim:{sim:.2f}")
+                    return tuple(parts)
+            return (f"{method}:{member.username or member.global_name or member.discord_id}",)
+
         # Pass 1: priority pool (joined within 7 days / recent posters).
         if use_priority_pool and recent_index is not None:
             recent_candidates: list[CandidatePair] = []
@@ -2533,16 +2749,19 @@ def match_community_contributors_with_diagnostics(
                     member_index=recent_index,
                     pr_link_posters=pr_link_evidence_by_login.get(login_key),
                     excluded_discord_ids=excluded_staff_ids,
+                    multi_author_ids=multi_author_ids,
+                    rejected_discord_ids=rejected_by_login.get(login_key, set()),
                 )
                 if strong is not None:
                     member, method, confidence = strong
                     resolved[login_key] = (group, member.discord_id, method, confidence)
+                    evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
                 elif candidates:
                     recent_candidates.extend(candidates)
 
             if recent_candidates:
                 ambiguous_candidates.extend(recent_candidates)
-                recent_winners, recent_llm_source, _recent_skips, _recent_meta = _disambiguate_with_reasons(
+                recent_winners, recent_llm_source, _recent_skips, _recent_meta, recent_ev = _disambiguate_with_reasons(
                     config,
                     recent_candidates,
                     llm_complete=complete_fn,
@@ -2552,8 +2771,12 @@ def match_community_contributors_with_diagnostics(
                 if recent_llm_source != "none":
                     llm_source = recent_llm_source
                 for login_key, (member, method, confidence) in recent_winners.items():
+                    if (login_key, member.discord_id) in rejected_pairs:
+                        continue
                     if login_key not in resolved and login_key in pending_by_login:
                         resolved[login_key] = (pending_by_login[login_key], member.discord_id, method, confidence)
+                        if login_key in recent_ev:
+                            evidence_by_login[login_key] = recent_ev[login_key]
 
         # Pass 2: full member list fallback ONLY for authors still unmatched after Pass 1.
         full_candidates: list[CandidatePair] = []
@@ -2565,6 +2788,7 @@ def match_community_contributors_with_diagnostics(
             if strong is not None:
                 member, method, confidence = strong
                 resolved[login_key] = (group, member.discord_id, method, confidence)
+                evidence_by_login[login_key] = _strong_evidence(login_key, member, method)
             elif candidates:
                 full_candidates.extend(candidates)
             else:
@@ -2573,7 +2797,7 @@ def match_community_contributors_with_diagnostics(
 
         if full_candidates:
             ambiguous_candidates.extend(full_candidates)
-            llm_winners, full_llm_source, llm_skip_reasons, llm_skip_meta = _disambiguate_with_reasons(
+            llm_winners, full_llm_source, llm_skip_reasons, llm_skip_meta, full_ev = _disambiguate_with_reasons(
                 config,
                 full_candidates,
                 llm_complete=complete_fn,
@@ -2583,36 +2807,99 @@ def match_community_contributors_with_diagnostics(
             if full_llm_source != "none":
                 llm_source = full_llm_source
             for login_key, (member, method, confidence) in llm_winners.items():
+                if (login_key, member.discord_id) in rejected_pairs:
+                    continue
                 if login_key not in resolved and login_key in pending_by_login:
                     resolved[login_key] = (pending_by_login[login_key], member.discord_id, method, confidence)
+                    if login_key in full_ev:
+                        evidence_by_login[login_key] = full_ev[login_key]
             for login_key, reason in llm_skip_reasons.items():
                 if login_key not in resolved:
                     skip_reason_by_login[login_key] = reason
                     if login_key in llm_skip_meta:
                         skip_meta_by_login[login_key] = llm_skip_meta[login_key]
 
-    # Enforce 1-to-1 Discord ID assignment (highest confidence wins; leave conflicts unmatched).
-    claimed_discord: dict[str, tuple[str, float]] = {}
-    for login_key, (_group, discord_id, _method, confidence) in sorted(
-        resolved.items(), key=lambda item: (-item[1][3], item[0])
-    ):
-        existing = claimed_discord.get(discord_id)
-        if existing is None or confidence > existing[1]:
-            if existing is not None:
-                skip_reason_by_login[existing[0]] = "discord_id_conflict"
-                skip_meta_by_login[existing[0]] = (existing[1], f"lost discord_id {discord_id} tie")
-            claimed_discord[discord_id] = (login_key, confidence)
-        else:
-            skip_reason_by_login[login_key] = "discord_id_conflict"
-            skip_meta_by_login[login_key] = (confidence, f"lost discord_id {discord_id} tie")
+    # Strict 1-to-1 bijection enforcement: one Discord member maps to at most one GitHub login
+    # and vice versa. On ANY conflict (intra-batch OR against existing stored mappings), grant
+    # nothing for the conflicting entries and log a WARNING.
+    discord_to_logins: dict[str, set[str]] = {}
+    login_to_discords: dict[str, set[str]] = {}
+    for login_key, (_group, discord_id, _method, _conf) in resolved.items():
+        discord_to_logins.setdefault(discord_id, set()).add(login_key)
+        login_to_discords.setdefault(login_key, set()).add(discord_id)
 
-    winning_logins = {login_key for login_key, _conf in claimed_discord.values()}
+    for m_login, m_uid in manual_map.items():
+        low = str(m_login or "").strip().casefold()
+        uid_s = str(m_uid or "").strip()
+        if low and is_discord_id(uid_s):
+            discord_to_logins.setdefault(uid_s, set()).add(low)
+            login_to_discords.setdefault(low, set()).add(uid_s)
+
+    if store is not None:
+        if hasattr(store, "all_confirmed_matches"):
+            try:
+                for row in store.all_confirmed_matches():
+                    r_login = str(row.get("github_login") or "").strip().casefold()
+                    r_uid = str(row.get("discord_id") or "").strip()
+                    if not (r_login and is_discord_id(r_uid) and (r_login, r_uid) not in rejected_pairs):
+                        continue
+                    r_method = str(row.get("method") or "").strip()
+                    stale_departed = (
+                        r_login in resolved
+                        and resolved[r_login][1] != r_uid
+                        and r_method != "mod_override"
+                        and not _match_is_fresh(row.get("matched_at"), moment)
+                        and bool(member_by_id)
+                        and r_uid not in member_by_id
+                        and not (hasattr(store, "grants_for_discord") and store.grants_for_discord(r_uid))
+                    )
+                    if stale_departed:
+                        continue
+                    discord_to_logins.setdefault(r_uid, set()).add(r_login)
+                    login_to_discords.setdefault(r_login, set()).add(r_uid)
+            except Exception:
+                pass
+        if hasattr(store, "all_links"):
+            try:
+                for row in store.all_links():
+                    r_login = str(row.get("github_login") or "").strip().casefold()
+                    r_uid = str(row.get("discord_id") or "").strip()
+                    if r_login and is_discord_id(r_uid):
+                        discord_to_logins.setdefault(r_uid, set()).add(r_login)
+                        login_to_discords.setdefault(r_login, set()).add(r_uid)
+            except Exception:
+                pass
+
+    winning_logins: set[str] = set()
+    logged_conflicts: set[tuple[str, tuple[str, ...]]] = set()
+    for login_key, (_group, discord_id, _method, confidence) in sorted(resolved.items()):
+        mapped_logins = discord_to_logins.get(discord_id, set())
+        mapped_discords = login_to_discords.get(login_key, set())
+        if len(mapped_logins) > 1 or len(mapped_discords) > 1:
+            conflict_key = (discord_id, tuple(sorted(mapped_logins)))
+            if conflict_key not in logged_conflicts:
+                logged_conflicts.add(conflict_key)
+                logging.warning(
+                    "1-to-1 match conflict for discord_id=%s (github_logins=%s, discord_ids_for_%s=%s); granting nothing",
+                    discord_id,
+                    sorted(mapped_logins),
+                    login_key,
+                    sorted(mapped_discords),
+                )
+            skip_reason_by_login[login_key] = "discord_id_conflict"
+            skip_meta_by_login[login_key] = (
+                confidence,
+                f"1-to-1 conflict on discord_id={discord_id} (logins={sorted(mapped_logins)})",
+            )
+            continue
+        winning_logins.add(login_key)
 
     matched_groups: list[dict] = []
     details: list[MatchDetail] = []
     method_counter: Counter[str] = Counter()
     for login_key in winning_logins:
         group, discord_id, method, confidence = resolved[login_key]
+        ev_tuple = evidence_by_login.get(login_key, ())
         method_counter[method] += 1
         if store is not None and hasattr(store, "delete_match_attempt"):
             try:
@@ -2633,6 +2920,7 @@ def match_community_contributors_with_diagnostics(
                     confidence=confidence,
                     matched_at=moment_iso,
                     github_user_id=group.get("user_id"),
+                    evidence=ev_tuple,
                 )
             except Exception as error:
                 logging.warning("Could not persist match for %s: %s", group["login"], error)
@@ -2642,6 +2930,7 @@ def match_community_contributors_with_diagnostics(
             "discord_id": discord_id,
             "match_method": method,
             "match_confidence": confidence,
+            "match_evidence": ev_tuple,
         })
         member = member_by_id.get(discord_id)
         details.append(MatchDetail(
@@ -2652,6 +2941,7 @@ def match_community_contributors_with_diagnostics(
             discord_username=member.username if member else "",
             pr_count=len(group.get("pulls", ())),
             github_user_id=group.get("user_id") if isinstance(group.get("user_id"), int) else None,
+            evidence=ev_tuple,
         ))
 
     matched_groups.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))

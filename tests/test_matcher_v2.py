@@ -400,7 +400,8 @@ class TestPRLinkPosterSignal(unittest.TestCase):
         self.assertIsNone(strong)
         self.assertEqual(cands, [])
 
-        # 2) One non-staff poster linked >=2 distinct PRs (no other non-staff poster) -> accepted at 0.92!
+        # 2) One non-staff poster linked >=2 distinct PRs WITHOUT ownership text or name similarity >= 0.5
+        #    must NEVER auto-accept on its own — it is only passed as an LLM signal!
         strong, cands = score_author_against_members(
             prof,
             members,
@@ -410,8 +411,24 @@ class TestPRLinkPosterSignal(unittest.TestCase):
             ],
             excluded_discord_ids=excluded,
         )
-        self.assertIsNotNone(strong)
-        self.assertEqual((strong[0].discord_id, strong[1], strong[2]), ("300000000000000002", "pr_link_poster", 0.92))
+        self.assertIsNone(strong)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].member.discord_id, "300000000000000002")
+        self.assertIn("pr_link_poster:2_prs", cands[0].signals)
+
+        # 2b) Multi-author poster (reviewer/triager who linked PRs by >=2 different authors)
+        #     is rejected completely (not even passed to LLM).
+        strong, cands = score_author_against_members(
+            prof,
+            members,
+            pr_link_posters=[
+                PRLinkPosterEvidence("300000000000000002", (1, 2), ("my pr",)),
+            ],
+            excluded_discord_ids=excluded,
+            multi_author_ids=frozenset({"300000000000000002"}),
+        )
+        self.assertIsNone(strong)
+        self.assertEqual(cands, [])
 
         # 3) One non-staff poster linked 1 PR + ownership phrase -> accepted at 0.92!
         strong, _cands = score_author_against_members(

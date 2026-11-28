@@ -69,6 +69,45 @@ ROLES_BACKFILL_SLASH_COMMANDS = [
     },
 ]
 
+ROLES_MOD_SLASH_COMMANDS = [
+    {
+        "name": "roles-why",
+        "description": "Show why a Discord member matched a GitHub author and earned roles",
+        "type": 1,
+        "dm_permission": False,
+        "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
+        "options": [
+            {
+                "type": 6,
+                "name": "member",
+                "description": "Discord member to inspect",
+                "required": True,
+            },
+        ],
+    },
+    {
+        "name": "roles-revoke",
+        "description": "Revoke contributor roles and reject the bad GitHub match",
+        "type": 1,
+        "dm_permission": False,
+        "default_member_permissions": str(_PERM_MANAGE_MESSAGES),
+        "options": [
+            {
+                "type": 6,
+                "name": "member",
+                "description": "Discord member to revoke contributor roles from",
+                "required": True,
+            },
+            {
+                "type": 3,
+                "name": "login",
+                "description": "Optional: set the correct GitHub login for this member instead",
+                "required": False,
+            },
+        ],
+    },
+]
+
 LINKS_BACKFILL_SLASH_COMMANDS = [
     {
         "name": "links-backfill",
@@ -87,7 +126,11 @@ def role_slash_commands(config: Config) -> list[dict]:
     """
     if not config.contributor_roles_enabled:
         return []
-    commands = list(ROLE_BASE_SLASH_COMMANDS) + list(ROLES_BACKFILL_SLASH_COMMANDS)
+    commands = (
+        list(ROLE_BASE_SLASH_COMMANDS)
+        + list(ROLES_BACKFILL_SLASH_COMMANDS)
+        + list(ROLES_MOD_SLASH_COMMANDS)
+    )
     if config.github_oauth_enabled:
         return list(OAUTH_SLASH_COMMANDS) + commands
     return commands
@@ -148,6 +191,24 @@ def _ephemeral(content: str) -> dict:
     }
 
 
+def _option_str(payload: dict, name: str) -> str:
+    options = (payload.get("data") or {}).get("options") or []
+    for opt in options:
+        if isinstance(opt, dict) and opt.get("name") == name:
+            val = opt.get("value")
+            if hasattr(val, "id"):
+                return str(val.id)
+            return str(val or "").strip()
+    return ""
+
+
+def _parse_member_option(payload: dict) -> str:
+    raw = _option_str(payload, "member")
+    if raw.startswith("<@") and raw.endswith(">"):
+        raw = raw[2:-1].lstrip("!")
+    return raw
+
+
 def is_server_moderator(payload: dict) -> bool:
     """True when the invoker has administrator, manage_guild, manage_messages, or moderate_members."""
     member = payload.get("member") or {}
@@ -204,6 +265,31 @@ def handle_interaction(config: Config, store: Store, payload: dict) -> dict:
             app_id,
             guild=payload.get("_guild"),
             loop=payload.get("_loop"),
+        )
+    if name == "roles-why":
+        if not is_server_moderator(payload):
+            return _ephemeral("only mods can run this")
+        target_id = _parse_member_option(payload)
+        if not is_discord_id(target_id):
+            return _ephemeral("please pick a valid Discord member.")
+        from .roles_sync import format_roles_why
+        return _ephemeral(format_roles_why(config, store, target_id))
+    if name == "roles-revoke":
+        if not is_server_moderator(payload):
+            return _ephemeral("only mods can run this")
+        target_id = _parse_member_option(payload)
+        if not is_discord_id(target_id):
+            return _ephemeral("please pick a valid Discord member.")
+        replacement_login = _option_str(payload, "login") or None
+        from .roles_sync import execute_roles_revoke
+        return _ephemeral(
+            execute_roles_revoke(
+                config,
+                store,
+                target_id,
+                moderator_id=discord_id,
+                replacement_login=replacement_login,
+            )
         )
     if name == "links-backfill":
         if not is_server_moderator(payload):

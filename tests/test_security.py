@@ -42,7 +42,7 @@ class NetworkBoundaryTests(unittest.TestCase):
             ("https://discord.com/api/v10/guilds/123/roles", "POST"),
             ("https://api.github.com/search/issues", "POST"),
             ("https://docs.litellm.ai/release_notes", "POST"),
-            ("https://discord.com/api/v10/guilds/123/members/456/roles/789", "DELETE"),
+            ("https://discord.com/api/v10/guilds/123/members/456", "DELETE"),
             ("https://api.github.com/repos/BerriAI/litellm/pulls/1/comments", "POST"),
             ("https://api.github.com/repos/BerriAI/litellm/pulls/1/reviews", "POST"),
             ("https://api.github.com/graphql", "GET"),
@@ -118,6 +118,10 @@ class NetworkBoundaryTests(unittest.TestCase):
                 data=b"", method="PUT",
             ))
             api._http(Request(
+                "https://discord.com/api/v10/guilds/123/members/456/roles/789",
+                method="DELETE",
+            ))
+            api._http(Request(
                 "https://discord.com/api/v10/applications/123/guilds/456/commands",
                 data=b"[]", method="PUT",
             ))
@@ -133,7 +137,7 @@ class NetworkBoundaryTests(unittest.TestCase):
                 "https://discord.com/api/v10/channels/321/messages/654/reactions/t%3A999/@me",
                 data=b"", method="PUT",
             ))
-        self.assertEqual(request.call_count, len(urls) + 7)
+        self.assertEqual(request.call_count, len(urls) + 8)
 
     def test_pr_review_reads_are_allowed_and_graphql_mutations_are_not(self):
         response = mock.MagicMock()

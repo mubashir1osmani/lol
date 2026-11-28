@@ -117,8 +117,20 @@ CREATE TABLE IF NOT EXISTS github_discord_matches (
     discord_id TEXT NOT NULL,
     method TEXT NOT NULL,
     confidence REAL NOT NULL,
-    matched_at TEXT NOT NULL
+    matched_at TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS match_rejections (
+    github_login TEXT NOT NULL,
+    discord_id TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    rejected_by TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (github_login, discord_id)
+);
+CREATE INDEX IF NOT EXISTS match_rejections_discord
+    ON match_rejections (discord_id);
 
 CREATE TABLE IF NOT EXISTS github_users_cache (
     github_login TEXT PRIMARY KEY,
@@ -235,6 +247,9 @@ class Store:
             plp_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(pr_link_posters)")}
             if plp_columns and "message_text" not in plp_columns:
                 self._conn.execute("ALTER TABLE pr_link_posters ADD COLUMN message_text TEXT NOT NULL DEFAULT ''")
+            gdm_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(github_discord_matches)")}
+            if gdm_columns and "evidence" not in gdm_columns:
+                self._conn.execute("ALTER TABLE github_discord_matches ADD COLUMN evidence TEXT NOT NULL DEFAULT ''")
             # One-time migration for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
             # Guarded by schema_migrations so it runs at most once and never touches legitimate public posts.
             migration_name = "clear_bogus_2026_w48_preview_v1"
@@ -529,6 +544,36 @@ class Store:
                 (discord_id,),
             ).fetchall()
         return {row["role_key"] for row in rows}
+
+    def grants_for_discord(self, discord_id: str) -> list[dict]:
+        if not is_discord_id(discord_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT discord_id, role_key, role_name, granted_at, announced_at
+                FROM role_grants
+                WHERE discord_id = ?
+                ORDER BY granted_at ASC, role_key ASC
+                """,
+                (discord_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_grants_for_discord(self, discord_id: str) -> list[str]:
+        """Delete all role_grants rows for ``discord_id`` and return the deleted role keys."""
+        if not is_discord_id(discord_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role_key FROM role_grants WHERE discord_id = ?",
+                (discord_id,),
+            ).fetchall()
+            keys = [row["role_key"] for row in rows]
+            if keys:
+                self._conn.execute("DELETE FROM role_grants WHERE discord_id = ?", (discord_id,))
+                self._conn.commit()
+        return keys
 
     def record_grant(self, discord_id: str, role_key: str, role_name: str, granted_at: str) -> bool:
         """Insert a grant. Return False when this Discord user already has the role key."""
@@ -860,7 +905,7 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
                 FROM github_discord_matches
                 WHERE github_login = ?
                 """,
@@ -877,25 +922,31 @@ class Store:
         confidence: float,
         matched_at: str,
         github_user_id: int | None = None,
+        evidence: str | list[str] | tuple[str, ...] | None = None,
     ) -> None:
         key = (github_login or "").strip().lower()
         if not key or not _LOGIN.fullmatch(key) or not is_discord_id(discord_id):
             raise ValueError("Invalid GitHub login or Discord id")
         uid = github_user_id if isinstance(github_user_id, int) and github_user_id > 0 else None
+        if isinstance(evidence, (list, tuple)):
+            ev_text = json.dumps([str(item) for item in evidence if str(item).strip()])
+        else:
+            ev_text = str(evidence or "")
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO github_discord_matches (
-                    github_login, github_user_id, discord_id, method, confidence, matched_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(github_login) DO UPDATE SET
                     github_user_id = COALESCE(excluded.github_user_id, github_discord_matches.github_user_id),
                     discord_id = excluded.discord_id,
                     method = excluded.method,
                     confidence = excluded.confidence,
-                    matched_at = excluded.matched_at
+                    matched_at = excluded.matched_at,
+                    evidence = CASE WHEN excluded.evidence != '' THEN excluded.evidence ELSE github_discord_matches.evidence END
                 """,
-                (key, uid, discord_id, str(method), float(confidence), matched_at),
+                (key, uid, discord_id, str(method), float(confidence), matched_at, ev_text),
             )
             self._conn.commit()
 
@@ -904,7 +955,7 @@ class Store:
             if matched_since:
                 rows = self._conn.execute(
                     """
-                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
                     FROM github_discord_matches
                     WHERE matched_at >= ?
                     ORDER BY github_login
@@ -914,11 +965,24 @@ class Store:
             else:
                 rows = self._conn.execute(
                     """
-                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
                     FROM github_discord_matches
                     ORDER BY github_login
                     """
                 ).fetchall()
+        return [dict(row) for row in rows]
+
+    def confirmed_matches_by_method(self, method: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
+                FROM github_discord_matches
+                WHERE method = ?
+                ORDER BY github_login
+                """,
+                (str(method),),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def confirmed_match_for_discord(self, discord_id: str) -> dict | None:
@@ -927,7 +991,7 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
                 FROM github_discord_matches
                 WHERE discord_id = ?
                 ORDER BY matched_at DESC
@@ -936,6 +1000,134 @@ class Store:
                 (discord_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def confirmed_matches_for_discord(self, discord_id: str) -> list[dict]:
+        if not is_discord_id(discord_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
+                FROM github_discord_matches
+                WHERE discord_id = ?
+                ORDER BY matched_at DESC, github_login ASC
+                """,
+                (discord_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_confirmed_match(self, github_login: str) -> bool:
+        key = (github_login or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM github_discord_matches WHERE github_login = ?",
+                (key,),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_confirmed_matches_for_discord(self, discord_id: str) -> list[dict]:
+        """Delete all github_discord_matches rows for ``discord_id`` and return the deleted rows."""
+        if not is_discord_id(discord_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at, evidence
+                FROM github_discord_matches
+                WHERE discord_id = ?
+                ORDER BY github_login ASC
+                """,
+                (discord_id,),
+            ).fetchall()
+            deleted = [dict(row) for row in rows]
+            if deleted:
+                self._conn.execute(
+                    "DELETE FROM github_discord_matches WHERE discord_id = ?",
+                    (discord_id,),
+                )
+                self._conn.commit()
+        return deleted
+
+    def add_match_rejection(
+        self,
+        github_login: str,
+        discord_id: str,
+        rejected_at: str,
+        *,
+        rejected_by: str = "",
+        reason: str = "",
+    ) -> None:
+        key = (github_login or "").strip().lower()
+        if not key or not is_discord_id(discord_id):
+            raise ValueError("Invalid GitHub login or Discord id")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO match_rejections (github_login, discord_id, rejected_at, rejected_by, reason)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(github_login, discord_id) DO UPDATE SET
+                    rejected_at = excluded.rejected_at,
+                    rejected_by = excluded.rejected_by,
+                    reason = excluded.reason
+                """,
+                (key, discord_id, str(rejected_at), str(rejected_by or ""), str(reason or "")),
+            )
+            self._conn.commit()
+
+    def remove_match_rejection(self, github_login: str, discord_id: str) -> bool:
+        key = (github_login or "").strip().lower()
+        if not key or not is_discord_id(discord_id):
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM match_rejections WHERE github_login = ? AND discord_id = ?",
+                (key, discord_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def is_match_rejected(self, github_login: str, discord_id: str) -> bool:
+        key = (github_login or "").strip().lower()
+        if not key or not is_discord_id(discord_id):
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM match_rejections WHERE github_login = ? AND discord_id = ?",
+                (key, discord_id),
+            ).fetchone()
+        return row is not None
+
+    def all_match_rejections(self) -> set[tuple[str, str]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT github_login, discord_id FROM match_rejections"
+            ).fetchall()
+        return {(str(row["github_login"]).lower(), str(row["discord_id"])) for row in rows}
+
+    def match_rejections_for_discord(self, discord_id: str) -> list[dict]:
+        if not is_discord_id(discord_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT github_login, discord_id, rejected_at, rejected_by, reason
+                FROM match_rejections
+                WHERE discord_id = ?
+                ORDER BY rejected_at DESC, github_login ASC
+                """,
+                (discord_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def all_links(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT discord_id, github_user_id, github_login, linked_at FROM github_links"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_cached_github_user(self, github_login: str) -> dict | None:
         key = (github_login or "").strip().lower()
@@ -1318,6 +1510,64 @@ class Store:
                     [norm_repo, *chunk],
                 ).fetchall()
                 out.extend(dict(row) for row in rows)
+        return out
+
+    def pr_link_posters_for_discord(self, repo: str, discord_id: str) -> list[dict]:
+        """Return all pr_link_posters rows posted by ``discord_id`` in ``repo``."""
+        norm_repo = (repo or "").strip().lower()
+        if not norm_repo or not is_discord_id(discord_id):
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT repo, pr_number, discord_id, message_id, ts, message_text
+                FROM pr_link_posters
+                WHERE repo = ? AND discord_id = ?
+                ORDER BY pr_number ASC, ts ASC, message_id ASC
+                """,
+                (norm_repo, discord_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def all_pr_link_posters(self, repo: str) -> list[dict]:
+        """Return all pr_link_posters rows for ``repo``."""
+        norm_repo = (repo or "").strip().lower()
+        if not norm_repo:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT repo, pr_number, discord_id, message_id, ts, message_text
+                FROM pr_link_posters
+                WHERE repo = ?
+                ORDER BY pr_number ASC, ts ASC, message_id ASC
+                """,
+                (norm_repo,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def pr_authors_for_numbers(self, repository: str, pr_numbers: list[int] | set[int]) -> dict[int, str]:
+        """Return ``{pr_number: lowercased_github_login}`` for merged PRs stored in SQLite."""
+        nums = sorted({int(n) for n in pr_numbers if isinstance(n, int) and n > 0})
+        if not repository or not nums:
+            return {}
+        out: dict[int, str] = {}
+        with self._lock:
+            for offset in range(0, len(nums), 500):
+                chunk = nums[offset: offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT number, github_login
+                    FROM merged_pull_requests
+                    WHERE lower(repository) = lower(?) AND number IN ({placeholders})
+                    """,
+                    [repository, *chunk],
+                ).fetchall()
+                for row in rows:
+                    login = str(row["github_login"] or "").strip().lower()
+                    if login:
+                        out[int(row["number"])] = login
         return out
 
     def pr_link_posters_count(self, repo: str | None = None) -> int:

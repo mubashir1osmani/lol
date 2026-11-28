@@ -213,9 +213,9 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/messages/search", path)
     ):
         return True
-    # Add an existing role to a member. Creating roles, editing members, and
-    # removing roles stay blocked.
-    if method == "PUT" and re.fullmatch(
+    # Add or remove an existing contributor role on a member. Creating/deleting
+    # roles, kicking/banning/editing members, and deleting channels stay blocked.
+    if method in {"PUT", "DELETE"} and re.fullmatch(
         rf"/api/v10/guilds/{_SNOWFLAKE}/members/{_SNOWFLAKE}/roles/{_SNOWFLAKE}", path
     ):
         return True
@@ -713,6 +713,16 @@ def add_member_role(guild_id: str, user_id: str, role_id: str, token: str) -> No
         f"{DISCORD_API}/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
         data=b"",
         method="PUT",
+        headers=_discord_headers(token),
+    ))
+    if status != 204:
+        raise RuntimeError(f"discord.com returned HTTP {status}")
+
+
+def remove_member_role(guild_id: str, user_id: str, role_id: str, token: str) -> None:
+    status, _headers, _body = _http(Request(
+        f"{DISCORD_API}/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+        method="DELETE",
         headers=_discord_headers(token),
     ))
     if status != 204:

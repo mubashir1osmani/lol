@@ -183,13 +183,19 @@ the same automatic matcher as the weekly summary:
   `socialAccounts`, and profile `HEAD:README.md` capped at 4 KB) plus commit
   author names/emails, cached in SQLite (`github_users_cache`) for 7 days.
 - **Deterministic + PR-link poster matching**: checks Discord IDs/handles in
-  bio/blog/README/socials, exact normalized login/Twitter/name, and a
+  bio/blog/README/socials, exact normalized login (against Discord `username` /
+  `global_name` only, never server `nick`), exact Twitter/name, and a
   `pr_link_poster` tier (`pr_link_posters` table populated live in
   `on_message`, from `review_threads`, and via mod-only `/links-backfill`).
-  Staff and BerriAI org members are excluded from PR-link attribution; a sole
-  non-staff poster is accepted at `0.92` when they linked 2+ distinct PRs by
-  the author, or 1 PR with name similarity `>= 0.50` or an ownership phrase
-  (e.g. `my pr`, `I opened`, `please review`), and otherwise passed to the LLM.
+  Staff, BerriAI org members, and multi-author posters (reviewers/triagers who
+  linked PRs by 2+ different GitHub authors) are excluded from PR-link
+  attribution. `pr_link_poster` never auto-accepts on link count alone: a sole
+  non-staff poster is accepted at `0.92` only when their message includes
+  explicit ownership text (`my pr`, `I opened/made/raised/submitted`) or their
+  Discord handle/name has similarity `>= 0.50` to the GitHub login/name;
+  otherwise it is only an LLM signal. Strict 1-to-1 bijection is enforced
+  between Discord members and GitHub logins (conflicts grant nothing and log a
+  warning).
 - **Priority pool + list-wise LLM selection**: checks a priority pool of
   members who joined or posted in the past 7 days first, then falls back to the
   full member list for unmatched authors. Ambiguous/fuzzy authors get a
@@ -245,8 +251,14 @@ has that Discord role keeps it.
 `DISCORD_PUBLIC_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_*`, and the
 Interactions Endpoint URL are all **optional** and not required. `/link-github`
 and `/unlink-github` stay hidden unless GitHub OAuth is configured. `/my-prs` shows an ephemeral PR snapshot for any auto-matched (or manually
-mapped) contributor, `/roles-backfill` is mod-only (`Manage Messages`), and
-`/links-backfill` is mod-only (`Manage Messages`) to backfill `pr_link_posters`
+mapped) contributor, `/roles-backfill` is mod-only (`Manage Messages`),
+`/roles-why member:<user>` (ephemeral, mod-only) inspects the matched GitHub
+login, method, confidence, evidence, and per-role PR counts, `/roles-revoke
+member:<user> [login:<github_login>]` (ephemeral, mod-only) removes bot-granted
+contributor roles, deletes `role_grants`, and records rejected pairs in
+`match_rejections` so they are never rematched (optionally setting a
+`mod_override` login), and `/links-backfill` is mod-only (`Manage Messages`) to
+backfill `pr_link_posters`
 from stored `review_threads` and Discord guild message search (paging up to
 offset 9975 with HTTP 202 retry handling).
 
