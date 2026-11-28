@@ -298,6 +298,20 @@ class WeeklyTests(unittest.TestCase):
                     "reason": "commit name and email local match mvance",
                     "evidence": ["commit name Marcus Vance matches Marcus V", "email local mvance matches username"],
                 })
+            if gh_login == "gh-twit-user":
+                return json.dumps({
+                    "discord_id": cands[0]["discord_id"],
+                    "confidence": 0.88,
+                    "reason": "twitter handle and profile context match",
+                    "evidence": ["twitter handle CoolTwitter matches global_name", "profile bio matches role"],
+                })
+            if gh_login == "gh-name-user":
+                return json.dumps({
+                    "discord_id": cands[0]["discord_id"],
+                    "confidence": 0.87,
+                    "reason": "full name and commit author match",
+                    "evidence": ["GitHub name Elena Rostova matches member", "username erostova_alt matches initials"],
+                })
             return json.dumps({
                 "discord_id": cands[0]["discord_id"],
                 "confidence": 0.62,
@@ -323,10 +337,13 @@ class WeeklyTests(unittest.TestCase):
                 llm_complete=fake_llm,
             )
 
-        # List-wise LLM called once per ambiguous author (2 authors); >=0.90 accepted, 0.62 rejected.
-        self.assertEqual(len(llm_requests), 2)
+        # List-wise LLM called once per non-deterministic candidate author (twitter/name/fuzzy); >=0.85 with >=2 signals accepted.
+        self.assertEqual(len(llm_requests), 4)
         self.assertEqual({m for m, _p in llm_requests}, {"anthropic/claude-sonnet-4-5"})
-        self.assertEqual({p["github_author"]["login"] for _m, p in llm_requests}, {"gh-fuzzy-win", "gh-fuzzy-low"})
+        self.assertEqual(
+            {p["github_author"]["login"] for _m, p in llm_requests},
+            {"gh-twit-user", "gh-name-user", "gh-fuzzy-win", "gh-fuzzy-low"},
+        )
         for _m, p in llm_requests:
             self.assertIn("none of these", p["options"])
 
@@ -337,8 +354,8 @@ class WeeklyTests(unittest.TestCase):
             "linkedDev": ("100000000000000001", "link_store"),
             "paveln83": ("200000000000000002", "exact_login"),
             "gh-bio-user": ("200000000000000003", "bio_discord_handle"),
-            "gh-twit-user": ("200000000000000004", "twitter_match"),
-            "gh-name-user": ("200000000000000005", "exact_name"),
+            "gh-twit-user": ("200000000000000004", "llm"),
+            "gh-name-user": ("200000000000000005", "llm"),
             "gh-fuzzy-win": ("200000000000000006", "llm"),
         })
         body = "\n".join(report.chunks)
@@ -410,7 +427,7 @@ class WeeklyTests(unittest.TestCase):
                 guild=SimpleNamespace(members=guild_members),
                 llm_complete=fake_fallback,
             )
-        self.assertEqual(len(fallback_calls), 2)
+        self.assertEqual(len(fallback_calls), 4)
         self.assertEqual({m for m, _l in fallback_calls}, {"anthropic/claude-sonnet-4-5"})
         fb_methods = {d.github_login: d.method for d in report_fb.match_details}
         self.assertEqual(fb_methods["gh-fuzzy-win"], "llm")
@@ -887,6 +904,8 @@ class WeeklyTests(unittest.TestCase):
                 return {"login": "gh-jane", "name": "Jane Doe"}
             if url.endswith("/users/gh-sam-99"):
                 return {"login": "gh-sam-99", "name": ""}
+            if url.endswith("/users/octocat"):
+                return {"login": "octocat", "name": "Octo Cat"}
             if "/pulls/12/commits" in url:
                 return [{"author": {"login": "gh-sam-99"}, "commit": {"author": {"name": "Sam Smith", "email": "samsmith@example.com"}}}]
             if url.endswith("/users/alexmullr"):
@@ -915,23 +934,19 @@ class WeeklyTests(unittest.TestCase):
         by_login = {g["login"]: g for g in matched}
         self.assertEqual(by_login["octocat"]["discord_id"], "111111111111111111")
         self.assertEqual(by_login["octocat"]["match_method"], "exact_login")
-        # Matches via Discord display_name even without Jev/Haiku keys.
-        self.assertEqual(by_login["gh-jane"]["discord_id"], "222222222222222222")
-        self.assertEqual(by_login["gh-jane"]["match_method"], "exact_name")
-        # Unique exact normalized commit_name/email_local matched via deterministic_fallback.
-        self.assertEqual(by_login["gh-sam-99"]["discord_id"], "333333333333333333")
-        self.assertEqual(by_login["gh-sam-99"]["match_method"], "deterministic_fallback")
-        # Fuzzy-only pair (alexmullr vs alexmuller) is NOT guessed without an LLM; stranger skipped too.
+        # Without LLM credentials, non-exact-identity candidates (exact_name, commit_name, fuzzy) are NOT guessed!
+        self.assertNotIn("gh-jane", by_login)
+        self.assertNotIn("gh-sam-99", by_login)
         self.assertNotIn("alexmullr", by_login)
         self.assertNotIn("totalstranger", by_login)
-        self.assertEqual(skipped, 2)
+        self.assertEqual(skipped, 4)
         self.assertEqual(diag.contributor_count, 5)
         self.assertEqual(diag.member_count, 4)
-        self.assertEqual(diag.matched_count, 3)
-        self.assertEqual(diag.llm_source, "deterministic_fallback")
+        self.assertEqual(diag.matched_count, 1)
+        self.assertEqual(diag.llm_source, "unavailable")
         skip_map = dict(diag.skip_reasons)
-        self.assertEqual(skip_map.get("llm_unavailable"), 1)
-        self.assertEqual(skip_map.get("no_signal_match"), 1)
+        self.assertEqual(skip_map.get("llm_unavailable"), 2)
+        self.assertEqual(skip_map.get("no_signal_match"), 2)
 
     def test_matcher_empty_and_partial_member_cache_fallbacks(self):
         from types import SimpleNamespace
@@ -1119,6 +1134,8 @@ class WeeklyTests(unittest.TestCase):
         def fake_github(url, _token, **_kwargs):
             if "/orgs/" in url:
                 return []
+            if "/users/" in url:
+                return {"login": url.rsplit("/users/", 1)[1]}
             if "/search/issues" in url:
                 return search_payload
             return []
@@ -1217,6 +1234,8 @@ class WeeklyTests(unittest.TestCase):
         def fake_github(url, _token, **_kwargs):
             if "/orgs/" in url:
                 return []
+            if "/users/" in url:
+                return {"login": url.rsplit("/users/", 1)[1]}
             if "/search/issues" in url:
                 queries_seen.append(url)
                 return {

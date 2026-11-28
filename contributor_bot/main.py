@@ -29,9 +29,11 @@ from .pr_board import sync_pr_board
 from .review_job import poll_review_channels
 from .roles_sync import (
     log_roles_daily_boot_status,
+    revalidate_all_grants_on_boot,
     run_daily_roles_if_due,
     run_roles_backfill,
     should_run_boot_backfill,
+    should_run_grants_revalidation,
 )
 from .store import Store
 from .schedule import UTC, parse_time
@@ -276,8 +278,11 @@ def start_contributor_roles(config):
             "PR review agent is on for %s using %s. It only posts in Discord.",
             ", ".join(config.review_channel_ids), config.review_model,
         )
-    if config.contributor_roles_enabled and not config.role_announcements_channel_id:
-        logging.warning("ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; new roles will be granted without a #shipped post")
+    if config.contributor_roles_enabled:
+        if not config.roles_announce_enabled:
+            logging.info("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); roles will be granted silently")
+        elif not config.role_announcements_channel_id:
+            logging.warning("ROLE_ANNOUNCEMENTS_CHANNEL_ID is unset; new roles will be granted without a #shipped post")
     return server
 
 
@@ -359,6 +364,11 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                 except Exception:
                     logging.exception("Weekly merge summary watchdog check failed")
             if roles_daily:
+                if should_run_grants_revalidation(config, store):
+                    try:
+                        revalidate_all_grants_on_boot(config, store, guild=guild, loop=loop)
+                    except Exception:
+                        logging.exception("Boot all-grants re-validation failed")
                 if not boot_backfill_started and should_run_boot_backfill(config, store):
                     boot_backfill_started = True
                     logging.info("Starting one-time contributor roles backfill on boot (ROLES_BACKFILL_ON_BOOT=true)")

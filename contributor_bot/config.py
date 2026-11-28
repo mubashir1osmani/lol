@@ -75,6 +75,7 @@ class Config:
     github_webhook_secret: str | None = field(default=None, repr=False)
     github_oauth_redirect_uri: str | None = None
     role_announcements_channel_id: str | None = None
+    roles_announce_enabled: bool = False
     discord_invite_url: str | None = None
     pr_comment_invites_enabled: bool = False
     merge_shoutouts_enabled: bool = True
@@ -256,6 +257,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         github_webhook_secret=webhook_secret,
         github_oauth_redirect_uri=None if role_settings is None else role_settings["github_oauth_redirect_uri"],
         role_announcements_channel_id=None if role_settings is None else role_settings["role_announcements_channel_id"],
+        roles_announce_enabled=False if role_settings is None else role_settings["roles_announce_enabled"],
         discord_invite_url=None if role_settings is None else role_settings["discord_invite_url"],
         pr_comment_invites_enabled=False if role_settings is None else role_settings["pr_comment_invites_enabled"],
         merge_shoutouts_enabled=True if role_settings is None else role_settings["merge_shoutouts_enabled"],
@@ -645,6 +647,7 @@ def _role_settings(values: dict[str, str]) -> dict:
         "github_webhook_secret": webhook_secret,
         "github_oauth_redirect_uri": oauth_redirect_uri,
         "role_announcements_channel_id": channel or None,
+        "roles_announce_enabled": _flag(values, "ROLES_ANNOUNCE_ENABLED", False),
         "discord_invite_url": invite_url or None,
         "pr_comment_invites_enabled": invites,
         "merge_shoutouts_enabled": _flag(values, "MERGE_SHOUTOUTS_ENABLED", True),

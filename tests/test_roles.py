@@ -135,6 +135,7 @@ def roles_env(directory, **extra):
         "ROLE_AGENT_BUILDER_ID": "1003",
         "ROLE_PROVIDER_WIZARD_ID": "1004",
         "ROLE_ANNOUNCEMENTS_CHANNEL_ID": "789",
+        "ROLES_ANNOUNCE_ENABLED": "true",
         "GITHUB_TOKEN": "github-secret",
         "ROLES_DB_PATH": str(Path(directory) / "roles.db"),
         "STATE_FILE": str(Path(directory) / "state.json"),

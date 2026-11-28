@@ -213,9 +213,9 @@ def _discord_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(rf"/api/v10/guilds/{_SNOWFLAKE}/messages/search", path)
     ):
         return True
-    # Add an existing role to a member. Creating roles, editing members, and
-    # removing roles stay blocked.
-    if method == "PUT" and re.fullmatch(
+    # Add or remove an existing contributor role on a member. Creating/deleting
+    # roles, kicking/banning/editing members, and deleting channels stay blocked.
+    if method in {"PUT", "DELETE"} and re.fullmatch(
         rf"/api/v10/guilds/{_SNOWFLAKE}/members/{_SNOWFLAKE}/roles/{_SNOWFLAKE}", path
     ):
         return True
@@ -719,6 +719,16 @@ def add_member_role(guild_id: str, user_id: str, role_id: str, token: str) -> No
         raise RuntimeError(f"discord.com returned HTTP {status}")
 
 
+def remove_member_role(guild_id: str, user_id: str, role_id: str, token: str) -> None:
+    status, _headers, _body = _http(Request(
+        f"{DISCORD_API}/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+        method="DELETE",
+        headers=_discord_headers(token),
+    ))
+    if status != 204:
+        raise RuntimeError(f"discord.com returned HTTP {status}")
+
+
 def register_guild_commands(application_id: str, guild_id: str, token: str, commands: list[dict[str, Any]]) -> None:
     response = _request_json(Request(
         f"{DISCORD_API}/applications/{application_id}/guilds/{guild_id}/commands",
@@ -1122,9 +1132,11 @@ def search_guild_members(
 
 def search_guild_messages(
     guild_id: str,
-    content: str,
-    token: str,
+    content: str = "",
+    token: str = "",
     *,
+    author_id: str | None = None,
+    min_id: str | None = None,
     offset: int = 0,
     max_202_retries: int = 6,
     timeout: float = 15.0,
@@ -1132,17 +1144,31 @@ def search_guild_messages(
 ) -> dict[str, Any]:
     """Search guild messages via GET /guilds/{id}/messages/search.
 
-    Handles HTTP 202 (Discord search index still building) with retry_after
-    and bounds offset to Discord's 9975 ceiling.
+    Supports filtering by ``content``, ``author_id``, and/or ``min_id`` (at least
+    one of ``content`` or ``author_id`` is required). Handles HTTP 202 (Discord
+    search index still building) with ``retry_after`` and bounds offset to 9975.
     """
     if not is_discord_id(guild_id):
         raise ValueError("Unexpected Discord guild ID")
     cleaned = (content or "").strip()
-    if not cleaned:
-        raise ValueError("Search content must not be empty")
+    cleaned_author = (author_id or "").strip() if author_id is not None else ""
+    if cleaned_author and not is_discord_id(cleaned_author):
+        raise ValueError("Unexpected Discord author ID")
+    cleaned_min = (min_id or "").strip() if min_id is not None else ""
+    if cleaned_min and not is_discord_id(cleaned_min):
+        raise ValueError("Unexpected Discord min_id")
+    if not cleaned and not cleaned_author:
+        raise ValueError("Search content or author_id must not be empty")
     if not isinstance(offset, int) or offset < 0 or offset > 9975:
         raise ValueError("Search offset must be between 0 and 9975")
-    params = urlencode({"content": cleaned, "offset": offset})
+    query_params: dict[str, Any] = {"offset": offset}
+    if cleaned:
+        query_params["content"] = cleaned
+    if cleaned_author:
+        query_params["author_id"] = cleaned_author
+    if cleaned_min:
+        query_params["min_id"] = cleaned_min
+    params = urlencode(query_params)
     url = f"{DISCORD_API}/guilds/{guild_id}/messages/search?{params}"
     for attempt in range(max(1, max_202_retries) + 1):
         status, headers, body = _http(

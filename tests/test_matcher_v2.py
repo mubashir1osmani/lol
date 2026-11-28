@@ -400,7 +400,8 @@ class TestPRLinkPosterSignal(unittest.TestCase):
         self.assertIsNone(strong)
         self.assertEqual(cands, [])
 
-        # 2) One non-staff poster linked >=2 distinct PRs (no other non-staff poster) -> accepted at 0.92!
+        # 2) One non-staff poster linked >=2 distinct PRs WITHOUT ownership text or name similarity >= 0.5
+        #    must NEVER auto-accept on its own — it is only passed as an LLM signal!
         strong, cands = score_author_against_members(
             prof,
             members,
@@ -410,8 +411,24 @@ class TestPRLinkPosterSignal(unittest.TestCase):
             ],
             excluded_discord_ids=excluded,
         )
-        self.assertIsNotNone(strong)
-        self.assertEqual((strong[0].discord_id, strong[1], strong[2]), ("300000000000000002", "pr_link_poster", 0.92))
+        self.assertIsNone(strong)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].member.discord_id, "300000000000000002")
+        self.assertIn("pr_link_poster:2_prs", cands[0].signals)
+
+        # 2b) Multi-author poster (reviewer/triager who linked PRs by >=2 different authors)
+        #     is rejected completely (not even passed to LLM).
+        strong, cands = score_author_against_members(
+            prof,
+            members,
+            pr_link_posters=[
+                PRLinkPosterEvidence("300000000000000002", (1, 2), ("my pr",)),
+            ],
+            excluded_discord_ids=excluded,
+            multi_author_ids=frozenset({"300000000000000002"}),
+        )
+        self.assertIsNone(strong)
+        self.assertEqual(cands, [])
 
         # 3) One non-staff poster linked 1 PR + ownership phrase -> accepted at 0.92!
         strong, _cands = score_author_against_members(
@@ -646,11 +663,11 @@ class TestListWiseLLMSelection(unittest.TestCase):
         ]
         groups = [{"login": "jdoe_dev", "user_id": 88, "pulls": []}]
 
-        # 1) >=0.80 with >=2 corroborating signals -> ACCEPTED!
+        # 1) >=0.85 with >=2 corroborating signals -> ACCEPTED!
         def accept_multi(model, messages):
             return json.dumps({
                 "discord_id": "500000000000000001",
-                "confidence": 0.82,
+                "confidence": 0.86,
                 "reason": "matches login prefix and full name",
                 "evidence": ["login prefix jdoe matches jdoe99", "name Jordan Doe matches Jordan D"],
             })
@@ -662,36 +679,37 @@ class TestListWiseLLMSelection(unittest.TestCase):
         self.assertEqual(matched[0]["discord_id"], "500000000000000001")
         self.assertEqual(skipped, 0)
 
-        # 2) >=0.80 with only 1 signal (below 0.90 solo threshold) -> REJECTED!
-        def reject_single_below_90(model, messages):
+        # 2) <0.85 even with 2 signals -> REJECTED!
+        def reject_below_85(model, messages):
             return json.dumps({
                 "discord_id": "500000000000000001",
-                "confidence": 0.85,
-                "reason": "only one weak signal",
-                "evidence": ["partial handle match"],
+                "confidence": 0.82,
+                "reason": "confidence below 0.85",
+                "evidence": ["login prefix match", "name match"],
             })
 
         matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
-            groups, cfg, None, members=members, skip_github_enrichment=True, llm_complete=reject_single_below_90
+            groups, cfg, None, members=members, skip_github_enrichment=True, llm_complete=reject_below_85
         )
         self.assertEqual(matched, [])
         self.assertEqual(skipped, 1)
         self.assertEqual(dict(diag.skip_reasons), {"llm_below_threshold": 1})
 
-        # 3) >=0.90 alone (1 signal) -> ACCEPTED!
-        def accept_solo_90(model, messages):
+        # 3) Single signal (even at confidence 0.95) -> REJECTED (no single-signal accepts)!
+        def reject_solo_95(model, messages):
             return json.dumps({
                 "discord_id": "500000000000000002",
-                "confidence": 0.90,
-                "reason": "very distinctive match",
+                "confidence": 0.95,
+                "reason": "single signal only",
                 "evidence": ["unique handle"],
             })
 
-        matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
-            groups, cfg, None, members=members, skip_github_enrichment=True, llm_complete=accept_solo_90
+        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
+            groups, cfg, None, members=members, skip_github_enrichment=True, llm_complete=reject_solo_95
         )
-        self.assertEqual(len(matched), 1)
-        self.assertEqual(matched[0]["discord_id"], "500000000000000002")
+        self.assertEqual(matched, [])
+        self.assertEqual(skipped, 1)
+        self.assertEqual(dict(diag.skip_reasons), {"llm_below_threshold": 1})
 
         # 4) Explicit 'none of these' (discord_id: null) -> REJECTED with llm_none_of_these!
         def choose_none(model, messages):
