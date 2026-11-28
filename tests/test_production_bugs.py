@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import logging
 import sqlite3
 import tempfile
 import threading
@@ -27,7 +26,6 @@ from contributor_bot.review_agent import AgentResult
 from contributor_bot.review_job import (
     handle_channel_message,
     handle_thread_message,
-    perform_review,
     poll_review_channels,
     recover_pending_reviews,
 )
@@ -553,7 +551,7 @@ class GitHubProfileEnrichmentRegressionTests(unittest.TestCase):
             vals = list(variables.values())
             if "poison-user" in vals:
                 err = RuntimeError("api.github.com returned HTTP 422")
-                setattr(err, "github_error_detail", "Unprocessable Entity: invalid login poison-user")
+                err.github_error_detail = "Unprocessable Entity: invalid login poison-user"
                 raise err
             return {
                 "data": {

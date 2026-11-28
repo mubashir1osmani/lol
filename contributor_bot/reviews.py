@@ -6,6 +6,7 @@ Nothing here approves, merges, or comments on GitHub.
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from .poller import extract_pr_numbers
 from .schedule import parse_time
@@ -15,16 +16,179 @@ from .schedule import parse_time
 # greptile-apps[bot] is Greptile, and veria-ai[bot] is Veria.
 DEFAULT_REVIEW_BOTS = ("cursor[bot]", "greptile-apps[bot]", "veria-ai[bot]")
 
+VERDICT_LOOKS_GOOD = "looks good"
+VERDICT_NEEDS_WORK = "needs work"
+VERDICT_BELOW_STANDARDS = "doesn't meet our standards"
+VALID_VERDICTS = (VERDICT_LOOKS_GOOD, VERDICT_NEEDS_WORK, VERDICT_BELOW_STANDARDS)
+
+STANDARDS_PATH = Path(__file__).resolve().parents[1] / "review_standards" / "LITELLM_STANDARDS.md"
+
 DISCORD_MESSAGE_LIMIT = 2000
 MAX_REVIEW_POSTS = 8
+MAX_REVIEW_BULLETS = 5
 MAX_PRS_PER_MESSAGE = 3
 MAX_FINDINGS_PER_BOT = 5
 _STALE_MARKER = "BUGBOT_REVIEW_STALE"
 _ACTIVE_REVIEW = {"COMMENTED", "APPROVED", "CHANGES_REQUESTED"}
 _PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0000FE0E-\U0000FE0F"
+    "\U0000200D"
+    "]+"
+)
+_PRAISE_PREFIX_RE = re.compile(
+    r"(?i)^(?:"
+    r"(?:great|nice|awesome|good|solid|excellent|fantastic|helpful)\s+(?:pr|work|job|catch|fix|change|addition|contribution)!*[\s,.:;-]*"
+    r"|thanks?(?:\s+so\s+much)?\s+for\s+(?:the\s+|this\s+|your\s+)?(?:pr|contribution|work|submitting|opening\s+this)!*[\s,.:;-]*"
+    r"|overall\s+(?:this\s+)?(?:looks\s+)?(?:good|solid|clean|nice)[\s,.:;-]*"
+    r"|lgtm!*[\s,.:;-]*"
+    r")+"
+)
+_HEADING_PREFIX_RE = re.compile(
+    r"(?i)^(?:#+\s*|(?:written\s+review|summary|risks|missing\s+tests|checklist|findings|issues|verdict|review)\s*:\s*)+"
+)
 _ASK = re.compile(
     r"(?i)\b(reviews?|reviewer|ptal|lgtm|take a look|have a look|needs? a look|ready for review)\b"
 )
+
+
+def load_review_standards(path: Path | None = None) -> str:
+    """Load the markdown code-quality standards checked by the review agent."""
+    target = path or STANDARDS_PATH
+    return target.read_text(encoding="utf-8").strip()
+
+
+def normalize_verdict(value: object) -> str | None:
+    """Map model verdict text to one of the three exact Discord verdicts."""
+    if not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"\s+", " ", value.strip().lower()).replace("’", "'").rstrip(".!")
+    if cleaned in {VERDICT_LOOKS_GOOD, "ready", "ready for maintainer"}:
+        return VERDICT_LOOKS_GOOD
+    if cleaned in {VERDICT_NEEDS_WORK, "needs fixes"}:
+        return VERDICT_NEEDS_WORK
+    if cleaned in {
+        VERDICT_BELOW_STANDARDS,
+        "doesnt meet our standards",
+        "does not meet our standards",
+        "below standards",
+    }:
+        return VERDICT_BELOW_STANDARDS
+    return None
+
+
+def clean_review_text(text: str, *, limit: int = 220) -> str:
+    """Strip emojis, em-dashes, markdown headings, and praise padding."""
+    cleaned = discord_safe(text or "")
+    cleaned = _EMOJI_RE.sub("", cleaned)
+    cleaned = cleaned.replace("\u2014", " - ").replace("\u2013", " - ")
+    cleaned = cleaned.replace("\r", " ").replace("\n", " ")
+    cleaned = re.sub(r"^\s*[-*•]+\s*", "", cleaned)
+    for _ in range(4):
+        prev = cleaned
+        cleaned = _HEADING_PREFIX_RE.sub("", cleaned)
+        cleaned = _PRAISE_PREFIX_RE.sub("", cleaned)
+        cleaned = re.sub(r"^\s*[-*•]+\s*", "", cleaned)
+        if cleaned == prev:
+            break
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > limit:
+        return cleaned[: limit - 3].rstrip() + "..."
+    return cleaned
+
+
+def format_finding_bullet(item: object) -> str:
+    """Format one finding dict ({path, line, reason}) or string into a short bullet."""
+    if isinstance(item, dict):
+        raw_path = str(item.get("path") or "").strip()
+        path = plain(raw_path, 90) if raw_path else ""
+        line = item.get("line")
+        if isinstance(line, str) and line.isdigit():
+            line = int(line)
+        where = f"{path}:{line}" if path and isinstance(line, int) and line > 0 else path
+        reason = clean_review_text(str(item.get("reason") or item.get("message") or ""), limit=180)
+        if not reason:
+            return ""
+        if where:
+            return clean_review_text(f"{where} - {reason}", limit=220)
+        return reason
+    if isinstance(item, str):
+        return clean_review_text(item, limit=220)
+    return ""
+
+
+def resolve_verdict(
+    gate: "Gate",
+    *,
+    requested_verdict: object = None,
+    findings: list | tuple | None = None,
+    max_bullets: int = MAX_REVIEW_BULLETS,
+) -> tuple[str, bool, tuple[str, ...]]:
+    """Combine the deterministic PR gate with the agent's standards review.
+
+    Returns ``(verdict, ready, bullets)``. The deterministic gate still blocks
+    ``looks good`` when CI, draft, conflicts, or bots are not green, while the
+    agent can reject non-compliant code with ``doesn't meet our standards`` or
+    ``needs work`` even when CI and bots pass.
+    """
+    requested = normalize_verdict(requested_verdict)
+    agent_bullets: list[str] = []
+    seen: set[str] = set()
+    for item in findings or ():
+        bullet = format_finding_bullet(item)
+        key = bullet.lower()
+        if bullet and key not in seen:
+            seen.add(key)
+            agent_bullets.append(bullet)
+
+    gate_bullets: list[str] = []
+    for reason in gate.reasons:
+        bullet = clean_review_text(reason, limit=220)
+        key = bullet.lower()
+        if bullet and key not in seen:
+            seen.add(key)
+            gate_bullets.append(bullet)
+
+    if requested == VERDICT_BELOW_STANDARDS:
+        bullets = (agent_bullets + gate_bullets)[:max_bullets]
+        if not bullets:
+            bullets = ["diff does not meet litellm code quality standards"]
+        return VERDICT_BELOW_STANDARDS, False, tuple(bullets)
+
+    if not gate.ready or agent_bullets or requested == VERDICT_NEEDS_WORK:
+        bullets = (agent_bullets + gate_bullets)[:max_bullets]
+        if not bullets:
+            bullets = ["needs fixes before a maintainer looks"]
+        return VERDICT_NEEDS_WORK, False, tuple(bullets)
+
+    return VERDICT_LOOKS_GOOD, True, ()
+
+
+def render_review(
+    verdict: str,
+    bullets: list[str] | tuple[str, ...] = (),
+    *,
+    max_bullets: int = MAX_REVIEW_BULLETS,
+) -> str:
+    """Render a direct, single-line (clean) or <=5-bullet Mateo-style review."""
+    normalized = normalize_verdict(verdict) or VERDICT_NEEDS_WORK
+    if normalized == VERDICT_LOOKS_GOOD:
+        return VERDICT_LOOKS_GOOD
+    lines = [normalized]
+    seen: set[str] = set()
+    for raw in bullets:
+        bullet = clean_review_text(str(raw), limit=220)
+        key = bullet.lower()
+        if not bullet or key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {bullet}")
+        if len(lines) - 1 >= max_bullets:
+            break
+    return "\n".join(lines)
 
 
 def asks_for_review(text: str) -> bool:
@@ -457,7 +621,7 @@ def _bot_reasons(bot: BotGate) -> list[str]:
             where = f" on {finding.path}"
             if finding.line:
                 where += f":{finding.line}"
-        reasons.append(f"{bot.login}: unresolved{where} - {finding.summary}. fix: {finding.summary}")
+        reasons.append(f"{bot.login}: unresolved{where} - {finding.summary}")
     extra = len(bot.findings) - len(shown)
     if extra:
         reasons.append(f"{bot.login}: {extra} more unresolved comments")
@@ -530,45 +694,30 @@ def short_sha(sha: str) -> str:
 
 
 def render_status(gate: Gate, *, number: int, title: str, url: str, head_sha: str) -> str:
-    lines = [
-        "ready for maintainer ✅" if gate.ready else "needs work",
-        f"#{number} {plain(title, 180)}",
-        url,
-        f"commit {short_sha(head_sha)}",
-        "",
-    ]
-    if gate.ready:
-        for bot in gate.bots:
-            lines.append(f"- {bot.login}: re-reviewed, no outstanding issues")
-        lines.append("ci: green")
-        lines.append("mergeable, not a draft")
-    else:
-        lines.append("fix these before a maintainer looks:")
-        for reason in gate.reasons:
-            lines.append(f"- {discord_safe(reason)}")
-    return "\n".join(lines)
+    del number, title, url, head_sha
+    verdict = VERDICT_LOOKS_GOOD if gate.ready else VERDICT_NEEDS_WORK
+    return render_review(verdict, gate.reasons)
 
 
 def render_written(review: dict | None, error: str | None = None) -> str:
     if error:
-        return f"written review: {discord_safe(error)}"
+        return clean_review_text(error)
     if not review:
         return ""
-    lines = ["written review:", discord_safe(str(review.get("summary") or "no written summary"))]
-    for label, key in (("risks", "risks"), ("missing tests", "missing_tests"), ("checklist", "checklist")):
-        items = [discord_safe(str(item)).strip() for item in (review.get(key) or []) if str(item).strip()]
-        if not items:
-            continue
-        lines.append("")
-        lines.append(f"{label}:")
-        for item in items[:5]:
-            lines.append(f"- {item}")
-    omitted = [plain(str(name), 80) for name in (review.get("omitted") or []) if str(name).strip()]
-    if omitted:
-        lines.append("")
-        suffix = "" if len(omitted) <= 8 else f" (+{len(omitted) - 8} more)"
-        lines.append("didn't read every file: " + ", ".join(omitted[:8]) + suffix)
-    return "\n".join(lines)
+    verdict = normalize_verdict(review.get("verdict"))
+    findings = review.get("findings")
+    if verdict and isinstance(findings, list):
+        bullets = [format_finding_bullet(item) for item in findings]
+        return render_review(verdict, [item for item in bullets if item])
+    bullets: list[str] = []
+    for key in ("findings", "risks", "missing_tests", "checklist"):
+        for item in review.get(key) or ():
+            bullet = format_finding_bullet(item)
+            if bullet:
+                bullets.append(bullet)
+    if not bullets:
+        return ""
+    return "\n".join(f"- {bullet}" for bullet in bullets[:MAX_REVIEW_BULLETS])
 
 
 def review_chunks(status: str, written: str, *, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:

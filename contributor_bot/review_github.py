@@ -57,6 +57,7 @@ class Snapshot:
     check_runs: list | None = None
     combined_state: str | None = None
     diff: str = ""
+    body: str = ""
 
 
 def _pages(url: str, token: str | None, label: str) -> list:
@@ -184,6 +185,7 @@ def gather_snapshot(repository: str, number: int, token: str | None) -> Snapshot
     base = pull.get("base") if isinstance(pull.get("base"), dict) else {}
     base_sha = base.get("sha") if isinstance(base.get("sha"), str) else ""
     title = pull.get("title") if isinstance(pull.get("title"), str) else ""
+    body = pull.get("body") if isinstance(pull.get("body"), str) else ""
     merged = pull.get("merged") is True
     state = pull.get("state") if pull.get("state") in {"open", "closed"} else "closed"
     draft = pull.get("draft") is True
@@ -200,6 +202,7 @@ def gather_snapshot(repository: str, number: int, token: str | None) -> Snapshot
         author_login=login,
         author_id=author_id,
         base_sha=base_sha if re.fullmatch(r"[0-9a-f]{40}", base_sha) else "",
+        body=body,
     )
     if merged or state != "open":
         return snapshot

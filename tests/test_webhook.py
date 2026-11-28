@@ -7,7 +7,6 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
-from pathlib import Path
 from unittest import mock
 
 from contributor_bot.api import TransientAPIError

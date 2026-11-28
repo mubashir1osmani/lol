@@ -92,7 +92,7 @@ _FREE_EMAIL_DOMAINS = frozenset({
 })
 
 _rest_members_lock = threading.Lock()
-_rest_members_cache: dict[str, tuple[list["DiscordMemberInfo"], float]] = {}
+_rest_members_cache: dict[str, tuple[list[DiscordMemberInfo], float]] = {}
 _recent_posters_lock = threading.Lock()
 _recent_posters: dict[str, dict[str, datetime]] = {}
 
@@ -2245,7 +2245,7 @@ def _excluded_staff_discord_ids(
         low = login.strip().lower()
         if is_discord_id(str(uid)) and (
             low in staff_logins
-            or (is_berri and (low.endswith("-berri") or low.endswith("-berriai") or low == "berriai"))
+            or (is_berri and (low.endswith(("-berri", "-berriai")) or low == "berriai"))
         ):
             excluded.add(str(uid))
 
@@ -2256,7 +2256,7 @@ def _excluded_staff_discord_ids(
                 uid = str(row.get("discord_id") or "")
                 if is_discord_id(uid) and (
                     low in staff_logins
-                    or (is_berri and (low.endswith("-berri") or low.endswith("-berriai") or low == "berriai"))
+                    or (is_berri and (low.endswith(("-berri", "-berriai")) or low == "berriai"))
                 ):
                     excluded.add(uid)
         except Exception:
@@ -2275,9 +2275,7 @@ def _excluded_staff_discord_ids(
                 excluded.add(member.discord_id)
                 break
             if is_berri and (
-                low.endswith("-berri")
-                or low.endswith("-berriai")
-                or low.endswith("_berri")
+                low.endswith(("-berri", "-berriai", "_berri"))
                 or "berriai" in strict
             ):
                 excluded.add(member.discord_id)

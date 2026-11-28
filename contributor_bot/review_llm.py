@@ -7,22 +7,36 @@ roles keep working when the package is not installed.
 import json
 import re
 
+from .reviews import (
+    VERDICT_BELOW_STANDARDS,
+    VERDICT_LOOKS_GOOD,
+    VERDICT_NEEDS_WORK,
+    format_finding_bullet,
+    load_review_standards,
+    normalize_verdict,
+)
 from .tracing import build_trace_metadata, configure_litellm_tracing
 
 DIFF_CHUNK_CHARS = 20_000
 DIFF_MAX_CHUNKS = 3
 
-_SYSTEM = (
-    "You review pull requests for the litellm project. "
+_SYSTEM_BASE = (
+    "You review pull requests for BerriAI/litellm. "
     "Your notes are posted in Discord only. Do not approve, request changes, or sound like a GitHub review. "
-    "Be casual, concise, and constructive. Lowercase is fine. "
+    "Write like a busy senior maintainer on Discord: plain, direct, lowercase is fine. "
+    "No praise padding, no 'Great PR!', no headings, no emojis, no em-dashes, no hedging, and no summary of what the PR does. "
     "Return one JSON object and nothing else, with keys "
-    "summary (one or two sentences on what the pr does), "
-    "risks (up to 5 short strings, likely bugs or risks), "
-    "missing_tests (up to 5 short strings), "
-    "and checklist (up to 5 short strings the contributor can tick off). "
-    "Use empty arrays when there is nothing to say. No markdown fences."
+    f"verdict (one of: '{VERDICT_LOOKS_GOOD}', '{VERDICT_NEEDS_WORK}', '{VERDICT_BELOW_STANDARDS}') "
+    "and findings (0 to 5 short objects {path, line, reason} naming the file/line and specific standard broken; empty array when looks good). "
+    "No markdown fences."
 )
+
+
+def _system_prompt() -> str:
+    return f"{_SYSTEM_BASE}\n\n=== LITELLM CODE QUALITY STANDARDS ===\n{load_review_standards()}"
+
+
+_SYSTEM = _system_prompt()
 
 
 def chunk_diff(diff: str, *, chunk_chars: int = DIFF_CHUNK_CHARS, max_chunks: int = DIFF_MAX_CHUNKS) -> tuple[list[str], list[str]]:
@@ -88,6 +102,8 @@ def parse_review_json(text: str) -> dict:
     if not isinstance(data, dict):
         summary = re.sub(r"\s+", " ", raw).strip()
         return {
+            "verdict": VERDICT_NEEDS_WORK,
+            "findings": [],
             "summary": summary[:800] or "no written summary",
             "risks": [],
             "missing_tests": [],
@@ -109,9 +125,22 @@ def parse_review_json(text: str) -> dict:
                 cleaned.append(item[:240])
         return cleaned[:5]
 
+    raw_findings = data.get("findings")
+    findings: list[str] = []
+    if isinstance(raw_findings, list):
+        for item in raw_findings[:5]:
+            bullet = format_finding_bullet(item)
+            if bullet:
+                findings.append(bullet)
+    verdict = normalize_verdict(data.get("verdict"))
+    if verdict is None:
+        verdict = VERDICT_NEEDS_WORK if findings else VERDICT_LOOKS_GOOD
+
     summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
     summary = re.sub(r"\s+", " ", summary).strip()[:800]
     return {
+        "verdict": verdict,
+        "findings": findings,
         "summary": summary or "no written summary",
         "risks": strings("risks"),
         "missing_tests": strings("missing_tests"),

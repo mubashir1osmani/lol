@@ -1953,7 +1953,6 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
         import tempfile
         from datetime import datetime, timezone
         from pathlib import Path
-        from types import SimpleNamespace
         from contributor_bot.matcher import (
             DiscordMemberInfo,
             GitHubAuthorProfile,
@@ -2127,7 +2126,7 @@ class FridaySchedulerReliabilityTests(unittest.TestCase):
             store = Store(db_path)
         self.addCleanup(store.close)
         self.assertFalse(store.merged_week_posted("BerriAI/litellm", "2026-W48"))
-        self.assertTrue(any("Cleared bogus ephemeral-preview merged_weeks entry" in l for l in boot_logs.output))
+        self.assertTrue(any("Cleared bogus ephemeral-preview merged_weeks entry" in line for line in boot_logs.output))
 
         cfg = Config(
             "tok", "123", "456",

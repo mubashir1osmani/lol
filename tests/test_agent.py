@@ -45,8 +45,6 @@ from contributor_bot.review_agent import (
     run_agent_loop,
     step_cap,
     tool_ping_maintainer,
-    tool_read_file,
-    tool_search_code,
 )
 from contributor_bot.review_job import (
     _finish_recheck,
@@ -56,7 +54,6 @@ from contributor_bot.review_job import (
     recheck_followup_text,
 )
 from contributor_bot.review_github import Snapshot
-from contributor_bot.review_job import handle_thread_message, message_decision
 from contributor_bot.reviews import classify_review_request, with_blocking, assess_gate
 from contributor_bot.store import Store
 

@@ -162,7 +162,7 @@ def _page(text: str) -> bytes:
     return (
         "<!doctype html><meta charset=\"utf-8\"><title>LiteLLM Discord</title>"
         f"<p>{safe}</p>"
-    ).encode("utf-8")
+    ).encode()
 
 
 def start_http_server(config: Config, store: Store | None = None) -> RewardsHTTPServer:

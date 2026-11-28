@@ -20,7 +20,6 @@ from .interactions import (
     MERGED_SLASH_COMMANDS,
     PR_BOARD_SLASH_COMMANDS,
     REVIEW_SLASH_COMMANDS,
-    SLASH_COMMANDS,
     handle_interaction,
     role_slash_commands,
 )

@@ -234,7 +234,7 @@ def _bot_login(login: str, user_type: str) -> bool:
     if (user_type or "").lower() == "bot":
         return True
     lowered = (login or "").lower()
-    return lowered.endswith("[bot]") or lowered.endswith("-bot")
+    return lowered.endswith(("[bot]", "-bot"))
 
 
 def _org_staff_login(login: str, org: str | None) -> bool:
@@ -242,7 +242,7 @@ def _org_staff_login(login: str, org: str | None) -> bool:
     if not org or org.lower() != "berriai":
         return False
     lowered = (login or "").lower()
-    return lowered.endswith("-berri") or lowered.endswith("-berriai") or lowered == "berriai"
+    return lowered.endswith(("-berri", "-berriai")) or lowered == "berriai"
 
 
 def fetch_org_public_members(
