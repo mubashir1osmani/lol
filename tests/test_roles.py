@@ -191,8 +191,14 @@ class RoleConfigTests(unittest.TestCase):
             minimal_cfg = get_config(minimal)
             self.assertTrue(minimal_cfg.contributor_roles_enabled)
             self.assertFalse(minimal_cfg.github_oauth_enabled)
-            self.assertEqual(minimal_cfg.roles_poll_seconds, 600)
+            self.assertEqual(minimal_cfg.roles_schedule, "weekly")
             self.assertFalse(minimal_cfg.roles_backfill_on_boot)
+            self.assertEqual(
+                get_config(minimal | {"ROLES_SCHEDULE": "manual"}).roles_schedule,
+                "manual",
+            )
+            with self.assertRaisesRegex(ValueError, "ROLES_SCHEDULE"):
+                get_config(minimal | {"ROLES_SCHEDULE": "hourly"})
             with self.assertRaisesRegex(ValueError, "distinct"):
                 get_config(env | {"ROLE_PROVIDER_WIZARD_ID": "1001"})
             with self.assertRaisesRegex(ValueError, "DISCORD_INVITE_URL"):

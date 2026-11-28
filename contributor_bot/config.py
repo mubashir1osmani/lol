@@ -127,7 +127,7 @@ class Config:
     pr_board_number: int | None = None
     pr_board_sync_seconds: int = 600
     pr_board_status_field: str = "Status"
-    roles_poll_seconds: int = 600
+    roles_schedule: str = "weekly"
     roles_backfill_on_boot: bool = False
 
     @property
@@ -304,7 +304,7 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         pr_board_number=board_number,
         pr_board_sync_seconds=_bounded_int(values, "PR_BOARD_SYNC_SECONDS", 600, 60, 86400),
         pr_board_status_field=board_status_field,
-        roles_poll_seconds=600 if role_settings is None else role_settings["roles_poll_seconds"],
+        roles_schedule="weekly" if role_settings is None else role_settings["roles_schedule"],
         roles_backfill_on_boot=False if role_settings is None else role_settings["roles_backfill_on_boot"],
     )
 
@@ -651,6 +651,13 @@ def _role_settings(values: dict[str, str]) -> dict:
             "BACKFILL_SINCE",
             values.get("BACKFILL_SINCE", "").strip() or "2023-01-01T00:00:00+00:00",
         ),
-        "roles_poll_seconds": _bounded_int(values, "ROLES_POLL_SECONDS", 600, 60, 86400),
+        "roles_schedule": _roles_schedule(values),
         "roles_backfill_on_boot": _flag(values, "ROLES_BACKFILL_ON_BOOT", False),
     }
+
+
+def _roles_schedule(values: dict[str, str]) -> str:
+    raw = values.get("ROLES_SCHEDULE", "").strip().lower() or "weekly"
+    if raw not in {"weekly", "manual", "off"}:
+        raise ValueError("ROLES_SCHEDULE must be weekly or manual")
+    return "manual" if raw == "off" else raw

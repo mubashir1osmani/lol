@@ -16,8 +16,13 @@ from contributor_bot.interactions import (
 )
 from contributor_bot.matcher import DiscordMemberInfo
 from contributor_bot.roles_sync import (
+    RolesPollResult,
+    log_roles_weekly_boot_status,
     poll_merged_prs_for_roles,
+    reset_roles_weekly_scheduler_state,
+    roles_weekly_schedule_status,
     run_roles_backfill,
+    run_weekly_roles_if_due,
     should_run_boot_backfill,
 )
 from contributor_bot.schedule import UTC
@@ -543,19 +548,22 @@ class AutoRolesBackfillTests(unittest.TestCase):
         self.assertEqual(add_role.call_count, 1)
         self.assertEqual(summary_post.call_count, 1)
 
-    def test_main_run_loop_triggers_roles_poll_and_boot_backfill(self):
+    def test_main_run_loop_runs_weekly_roles_after_summary_and_independently_on_summary_failure(self):
         from contributor_bot.main import _run_loop
 
         stop_event = threading.Event()
-        poll_calls = []
-        boot_calls = []
+        events = []
 
-        def fake_poll(cfg, st, **kwargs):
-            poll_calls.append(kwargs)
+        def failing_weekly(cfg, st, **kwargs):
+            events.append("weekly_summary_failed")
+            raise RuntimeError("summary boom")
+
+        def fake_weekly_roles(cfg, st, **kwargs):
+            events.append("weekly_roles")
             stop_event.set()
 
         def fake_boot(cfg, st, guild=None, loop=None):
-            boot_calls.append((cfg.github_repository, st))
+            events.append("boot_backfill")
 
         def inline_thread(target, args=(), name=None, daemon=None):
             class Started:
@@ -566,16 +574,233 @@ class AutoRolesBackfillTests(unittest.TestCase):
         cfg = get_config(minimal_roles_env(
             self.temp.name,
             ANNOUNCEMENTS_ENABLED="false",
-            MERGED_WEEKLY_ENABLED="false",
+            MERGED_WEEKLY_ENABLED="true",
             ROLES_BACKFILL_ON_BOOT="true",
         ))
-        with mock.patch("contributor_bot.main.poll_merged_prs_for_roles", side_effect=fake_poll), \
+        with mock.patch("contributor_bot.main.log_weekly_boot_status"), \
+             mock.patch("contributor_bot.main.post_weekly_if_due", side_effect=failing_weekly), \
+             mock.patch("contributor_bot.main.run_weekly_roles_if_due", side_effect=fake_weekly_roles), \
              mock.patch("contributor_bot.main._run_boot_backfill", side_effect=fake_boot), \
              mock.patch("contributor_bot.main.threading.Thread", inline_thread):
             _run_loop(cfg, stop_event, store=self.store, gateway=None)
 
+        self.assertEqual(events, ["weekly_summary_failed", "boot_backfill", "weekly_roles"])
+
+
+class WeeklyRolesSchedulerTests(unittest.TestCase):
+    def setUp(self):
+        reset_roles_weekly_scheduler_state()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = get_config(minimal_roles_env(self.temp.name))
+        self.store = Store(self.config.roles_db_path)
+        self.addCleanup(self.store.close)
+
+    def test_weekly_schedule_skips_before_friday_ten_and_runs_at_ten_with_restart_dedupe(self):
+        # Thursday afternoon EST -> skip
+        thursday = datetime(2026, 11, 26, 16, 0, tzinfo=UTC)
+        # Friday 09:59 EST (14:59 UTC) -> skip
+        fri_before = datetime(2026, 11, 27, 14, 59, tzinfo=UTC)
+        # Friday 10:00 EST (15:00 UTC) -> due!
+        fri_ten = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+        # Friday 21:42 EST (2026-11-28 02:42 UTC) -> restart later same Friday, must skip!
+        fri_night = datetime(2026, 11, 28, 2, 42, tzinfo=UTC)
+        # Next Friday 10:00 EST (2026-12-04 15:00 UTC) -> new ISO week (2026-W49), must run!
+        next_fri = datetime(2026, 12, 4, 15, 0, tzinfo=UTC)
+
+        poll_calls = []
+
+        def fake_poll(cfg, st, **kwargs):
+            poll_calls.append(kwargs["now"])
+            return RolesPollResult(
+                discovered=7,
+                stored=5,
+                skipped_existing=1,
+                skipped_excluded=1,
+                authors_evaluated=3,
+                authors_matched=2,
+                roles_granted=3,
+            )
+
+        self.assertIsNone(run_weekly_roles_if_due(self.config, self.store, thursday, poll_fn=fake_poll))
+        self.assertIsNone(run_weekly_roles_if_due(self.config, self.store, fri_before, poll_fn=fake_poll))
+        self.assertEqual(poll_calls, [])
+
+        with self.assertLogs(level="INFO") as logs:
+            res = run_weekly_roles_if_due(self.config, self.store, fri_ten, poll_fn=fake_poll)
+        self.assertIsNotNone(res)
         self.assertEqual(len(poll_calls), 1)
-        self.assertEqual(len(boot_calls), 1)
+        self.assertTrue(
+            any("Contributor roles weekly run for 2026-W48: 5 PRs, 3 new grants" in line for line in logs.output)
+        )
+        info = self.store.roles_week_info("BerriAI/litellm", "2026-W48")
+        self.assertIsNotNone(info)
+        self.assertEqual(info["via"], "scheduler")
+        self.assertEqual(info["roles_granted"], 3)
+
+        # Simulate restart/redeploy: close & reopen SQLite, reset in-memory state.
+        self.store.close()
+        reset_roles_weekly_scheduler_state()
+        reopened = Store(self.config.roles_db_path)
+        self.store = reopened
+
+        with self.assertLogs(level="INFO") as boot_logs:
+            log_roles_weekly_boot_status(self.config, reopened, fri_night)
+        joined = "\n".join(boot_logs.output)
+        self.assertIn(
+            "Contributor roles weekly run 2026-W48 already completed at 2026-11-27T15:00:00+00:00 via scheduler; skipping",
+            joined,
+        )
+        self.assertNotIn("due now", joined)
+
+        with self.assertLogs(level="INFO") as skip_logs:
+            again = run_weekly_roles_if_due(self.config, reopened, fri_night, poll_fn=fake_poll)
+        self.assertIsNone(again)
+        self.assertEqual(len(poll_calls), 1)
+        self.assertTrue(
+            any("Contributor roles weekly run 2026-W48 already completed" in line for line in skip_logs.output)
+        )
+
+        # Next Friday (2026-W49) runs fresh.
+        res_next = run_weekly_roles_if_due(self.config, reopened, next_fri, poll_fn=fake_poll)
+        self.assertIsNotNone(res_next)
+        self.assertEqual(len(poll_calls), 2)
+        self.assertTrue(reopened.roles_week_completed("BerriAI/litellm", "2026-W49"))
+
+    def test_weekly_catch_up_after_downtime_and_rate_limit_retries_without_marking(self):
+        # Bot was down at Friday 10:00 EST and comes online at Friday 16:30 EST (21:30 UTC).
+        fri_late = datetime(2026, 11, 27, 21, 30, tzinfo=UTC)
+        self.assertIn("due now (will catch up)", roles_weekly_schedule_status(self.config, self.store, fri_late))
+
+        # 1) First attempt hits GitHub rate limit -> week must stay unmarked!
+        now_clock = {"t": 100.0}
+        rate_limited_result = RolesPollResult(
+            discovered=0, stored=0, skipped_existing=0, skipped_excluded=0,
+            authors_evaluated=0, authors_matched=0, roles_granted=0, rate_limited=True,
+        )
+        res1 = run_weekly_roles_if_due(
+            self.config,
+            self.store,
+            fri_late,
+            clock=lambda: now_clock["t"],
+            poll_fn=lambda *a, **k: rate_limited_result,
+        )
+        self.assertTrue(res1.rate_limited)
+        self.assertFalse(self.store.roles_week_completed("BerriAI/litellm", "2026-W48"))
+
+        # Within backoff window -> skipped cleanly.
+        self.assertIsNone(
+            run_weekly_roles_if_due(
+                self.config,
+                self.store,
+                fri_late,
+                clock=lambda: now_clock["t"] + 30.0,
+                poll_fn=mock.Mock(side_effect=AssertionError("should respect backoff")),
+            )
+        )
+
+        # After backoff expires -> catches up and marks 2026-W48!
+        now_clock["t"] += 400.0
+        ok_result = RolesPollResult(
+            discovered=2, stored=2, skipped_existing=0, skipped_excluded=0,
+            authors_evaluated=1, authors_matched=1, roles_granted=1,
+        )
+        res2 = run_weekly_roles_if_due(
+            self.config,
+            self.store,
+            fri_late,
+            clock=lambda: now_clock["t"],
+            poll_fn=lambda *a, **k: ok_result,
+        )
+        self.assertEqual(res2.roles_granted, 1)
+        self.assertTrue(self.store.roles_week_completed("BerriAI/litellm", "2026-W48"))
+
+        # Manual schedule disables automatic Friday runs.
+        manual_cfg = get_config(minimal_roles_env(self.temp.name, ROLES_SCHEDULE="manual"))
+        next_fri = datetime(2026, 12, 4, 15, 0, tzinfo=UTC)
+        self.assertIsNone(
+            run_weekly_roles_if_due(
+                manual_cfg,
+                self.store,
+                next_fri,
+                poll_fn=mock.Mock(side_effect=AssertionError("manual schedule must not auto-run")),
+            )
+        )
+
+    def test_weekly_roles_batches_multiple_announcements_and_chunks_when_needed(self):
+        members = [
+            _member("5001", "alice-dev", "Alice Dev"),
+            _member("5002", "bob-dev", "Bob Dev"),
+            _member("5003", "carol-dev", "Carol Dev"),
+        ]
+        pulls = {
+            601: {
+                "number": 601, "merged": True, "merged_at": "2026-11-25T10:00:00Z", "title": "alice pr",
+                "user": {"login": "alice-dev", "id": 801, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+            602: {
+                "number": 602, "merged": True, "merged_at": "2026-11-26T10:00:00Z", "title": "bob agent pr",
+                "user": {"login": "bob-dev", "id": 802, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": ["agents"],
+            },
+            603: {
+                "number": 603, "merged": True, "merged_at": "2026-11-27T10:00:00Z", "title": "carol pr",
+                "user": {"login": "carol-dev", "id": 803, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+        }
+        fri_ten = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+
+        # 1) All 3 contributors fit in ONE batched message instead of 3 separate messages!
+        posted = []
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
+             mock.patch("contributor_bot.rewards.post_message", side_effect=lambda ch, tok, body: (posted.append(body), {"id": "1"})[1]):
+            res = run_weekly_roles_if_due(
+                self.config,
+                self.store,
+                fri_ten,
+                search_merged_fn=lambda repo, start, end, tok: set(pulls.keys()),
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+
+        self.assertEqual(res.stored, 3)
+        self.assertEqual(res.roles_granted, 4)  # alice(1), bob(2: contributor + agent_builder), carol(1)
+        self.assertEqual(add_role.call_count, 4)
+        self.assertEqual(len(posted), 1)
+        lines = posted[0]["content"].splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("<@5001> just became a contributor 🎉", lines)
+        self.assertIn("<@5002> just became a contributor and an agent builder 🎉", lines)
+        self.assertIn("<@5003> just became a contributor 🎉", lines)
+        self.assertEqual(set(posted[0]["allowed_mentions"]["users"]), {"5001", "5002", "5003"})
+        self.assertEqual(self.store.all_unannounced_grants(), [])
+
+        # 2) Verify chunking when combined message exceeds limit.
+        chunk_store = Store(str(Path(self.temp.name) / "chunk.db"))
+        self.addCleanup(chunk_store.close)
+        reset_roles_weekly_scheduler_state()
+        chunked_posts = []
+        with mock.patch("contributor_bot.rewards.add_member_role"), \
+             mock.patch("contributor_bot.rewards.post_message", side_effect=lambda ch, tok, body: (chunked_posts.append(body), {"id": "2"})[1]):
+            run_weekly_roles_if_due(
+                self.config,
+                chunk_store,
+                fri_ten,
+                announcement_chunk_limit=80,
+                search_merged_fn=lambda repo, start, end, tok: set(pulls.keys()),
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+        self.assertEqual(len(chunked_posts), 3)
+        self.assertEqual(chunk_store.all_unannounced_grants(), [])
 
 
 if __name__ == "__main__":

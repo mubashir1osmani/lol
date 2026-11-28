@@ -26,7 +26,12 @@ from .interactions import (
 from .poller import poll_once, preview_roundup
 from .pr_board import sync_pr_board
 from .review_job import poll_review_channels
-from .roles_sync import poll_merged_prs_for_roles, run_roles_backfill, should_run_boot_backfill
+from .roles_sync import (
+    log_roles_weekly_boot_status,
+    run_roles_backfill,
+    run_weekly_roles_if_due,
+    should_run_boot_backfill,
+)
 from .store import Store
 from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
@@ -165,7 +170,7 @@ def main(argv: list[str] | None = None) -> None:
                 if config.pr_board_enabled:
                     sync_pr_board(config, store)
                 if config.contributor_roles_enabled:
-                    poll_merged_prs_for_roles(config, store)
+                    run_weekly_roles_if_due(config, store)
             finally:
                 store.close()
         return
@@ -276,7 +281,12 @@ def start_contributor_roles(config):
 def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
     reviews = bool(config.pr_review_enabled and store is not None)
     weekly_watchdog = bool(config.merged_weekly_enabled and store is not None)
-    roles_poll = bool(config.contributor_roles_enabled and store is not None)
+    roles_weekly = bool(
+        config.contributor_roles_enabled
+        and config.roles_schedule == "weekly"
+        and store is not None
+    )
+    roles_boot_backfill = bool(config.contributor_roles_enabled and store is not None)
     pr_board_sync = False
     if not config.pr_board_enabled:
         logging.info(
@@ -304,17 +314,10 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
         if store is None:
             logging.error(
                 "Contributor roles are enabled but the HTTP server/store did not start, "
-                "so automatic role polling will not run"
+                "so weekly contributor role runs will not execute"
             )
         else:
-            logging.info(
-                "Contributor roles poller active for %s (every %ds, oauth=%s, webhook=%s, backfill_on_boot=%s).",
-                config.github_repository,
-                config.roles_poll_seconds,
-                config.github_oauth_enabled,
-                bool(config.github_webhook_secret),
-                config.roles_backfill_on_boot,
-            )
+            log_roles_weekly_boot_status(config, store)
     if config.merged_weekly_enabled:
         if store is not None:
             log_weekly_boot_status(config, store)
@@ -326,7 +329,9 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             "weekly posts run only via the Friday %s %s summary scheduler.",
             config.merged_time, config.merged_timezone,
         )
-    if not reviews and not weekly_watchdog and not pr_board_sync and not roles_poll:
+    if not reviews and not weekly_watchdog and not pr_board_sync and not roles_weekly and not (
+        roles_boot_backfill and should_run_boot_backfill(config, store)
+    ):
         if not config.announcements_enabled:
             logging.info("Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false).")
         stop_event.wait()
@@ -335,7 +340,6 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
         logging.error("PR pre-review is enabled but the HTTP server did not start, so channel reviews will not run")
     first_tick = True
     next_board_sync = 0.0
-    next_roles_poll = 0.0
     boot_backfill_started = False
     while not stop_event.is_set():
         gateway_live = gateway is not None and gateway.connected.is_set()
@@ -351,14 +355,14 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                 logging.exception("PR review poll failed")
         # Give a freshly started gateway one brief cycle to connect and use its
         # cached guild member list; thereafter run a 60s watchdog regardless so
-        # a dead gateway or stopped tasks.loop can never silence the Friday post.
-        if weekly_watchdog and not (first_tick and gateway is not None and not gateway_live):
-            try:
-                post_weekly_if_due(config, store, guild=guild, loop=loop)
-            except Exception:
-                logging.exception("Weekly merge summary watchdog check failed")
-        if roles_poll and not (first_tick and gateway is not None and not gateway_live):
-            if not boot_backfill_started and should_run_boot_backfill(config, store):
+        # a dead gateway or stopped tasks.loop can never silence the Friday jobs.
+        if not (first_tick and gateway is not None and not gateway_live):
+            if weekly_watchdog:
+                try:
+                    post_weekly_if_due(config, store, guild=guild, loop=loop)
+                except Exception:
+                    logging.exception("Weekly merge summary watchdog check failed")
+            if roles_boot_backfill and not boot_backfill_started and should_run_boot_backfill(config, store):
                 boot_backfill_started = True
                 logging.info("Starting one-time contributor roles backfill on boot (ROLES_BACKFILL_ON_BOOT=true)")
                 threading.Thread(
@@ -367,12 +371,11 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                     name="roles-boot-backfill",
                     daemon=True,
                 ).start()
-            if time.monotonic() >= next_roles_poll:
-                next_roles_poll = time.monotonic() + float(config.roles_poll_seconds)
+            if roles_weekly:
                 try:
-                    poll_merged_prs_for_roles(config, store, guild=guild, loop=loop)
+                    run_weekly_roles_if_due(config, store, guild=guild, loop=loop)
                 except Exception:
-                    logging.exception("Contributor roles poll failed")
+                    logging.exception("Weekly contributor roles watchdog check failed")
         if pr_board_sync and time.monotonic() >= next_board_sync:
             next_board_sync = time.monotonic() + float(config.pr_board_sync_seconds)
             try:
@@ -380,10 +383,8 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             except Exception:
                 logging.exception("Contributor PR board sync failed")
         delay = float(config.poll_interval_seconds)
-        if weekly_watchdog:
+        if weekly_watchdog or roles_weekly:
             delay = min(delay, 60.0)
-        if roles_poll:
-            delay = min(delay, max(1.0, next_roles_poll - time.monotonic()))
         if pr_board_sync:
             delay = min(delay, max(1.0, next_board_sync - time.monotonic()))
         first_tick = False

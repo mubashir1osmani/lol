@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .api import (
     TransientAPIError,
@@ -27,7 +28,13 @@ from .api import (
 )
 from .config import Config
 from .matcher import match_community_contributors_with_diagnostics
-from .rewards import _label_names, _models, apply_roles
+from .rewards import (
+    ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
+    _label_names,
+    _models,
+    announce_pending_role_grants,
+    apply_roles,
+)
 from .roles import _agent_label, qualifies_agent_builder, qualifies_provider_wizard
 from .schedule import UTC, iso, parse_time
 from .store import Store
@@ -35,14 +42,18 @@ from .weekly import (
     EXCLUDED_AUTHOR_ASSOCIATIONS,
     _bot_login,
     _org_staff_login,
+    _weekday_name,
     fetch_org_public_members,
+    week_key,
+    weekly_is_due,
 )
 
-POLL_INITIAL_LOOKBACK_HOURS = 24
+POLL_INITIAL_LOOKBACK_DAYS = 7
 POLL_OVERLAP_MINUTES = 5
-POLL_MAX_LOOKBACK_DAYS = 7
-POLL_DEADLINE_SECONDS = 90.0
-POLL_MAX_PULLS_PER_TICK = 50
+POLL_MAX_LOOKBACK_DAYS = 14
+POLL_DEADLINE_SECONDS = 180.0
+POLL_MAX_PULLS_PER_TICK = 200
+ROLES_WEEKLY_RETRY_SECONDS = 300.0
 
 AUTHOR_COUNT_CACHE_TTL_DAYS = 30
 
@@ -51,6 +62,10 @@ BACKFILL_DEADLINE_SECONDS = 300.0
 BACKFILL_MATCH_RESERVE_SECONDS = 45.0
 
 _roles_poll_lock = threading.Lock()
+_roles_weekly_lock = threading.Lock()
+_roles_weekly_state_lock = threading.Lock()
+_roles_weekly_retry_after: dict[tuple[str, str], float] = {}
+_roles_weekly_last_skip_log: dict[tuple[str, str], str] = {}
 _roles_backfill_lock = threading.Lock()
 
 
@@ -340,6 +355,7 @@ def poll_merged_prs_for_roles(
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
+    announcement_chunk_limit: int = ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
 ) -> RolesPollResult | None:
     """Poll newly merged PRs since the SQLite checkpoint and auto-assign newly earned roles."""
     if not config.contributor_roles_enabled or store is None:
@@ -366,9 +382,9 @@ def poll_merged_prs_for_roles(
                     moment - timedelta(days=POLL_MAX_LOOKBACK_DAYS),
                 )
             except Exception:
-                window_start = moment - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)
+                window_start = moment - timedelta(days=POLL_INITIAL_LOOKBACK_DAYS)
         else:
-            window_start = moment - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)
+            window_start = moment - timedelta(days=POLL_INITIAL_LOOKBACK_DAYS)
         if window_start >= moment:
             window_start = moment - timedelta(minutes=POLL_OVERLAP_MINUTES)
 
@@ -485,7 +501,8 @@ def poll_merged_prs_for_roles(
                     discord_id,
                     uid,
                     shoutout=False,
-                    announce=True,
+                    announce=False,
+                    mark_announced=False,
                     lifetime_merged_count=lifetime_count,
                 )
                 roles_granted += len(granted)
@@ -493,6 +510,17 @@ def poll_merged_prs_for_roles(
                 logging.warning("Role assignment deferred for user %s: %s", discord_id, error)
                 rate_limited = True
                 break
+
+        try:
+            announce_pending_role_grants(
+                config,
+                store,
+                now=moment,
+                limit=announcement_chunk_limit,
+            )
+        except TransientAPIError as error:
+            logging.warning("Batched role announcement deferred due to Discord rate limit: %s", error)
+            rate_limited = True
 
         logging.info(
             "Contributor roles poll for %s complete: discovered=%d stored=%d existing=%d "
@@ -522,6 +550,233 @@ def poll_merged_prs_for_roles(
         )
     finally:
         _roles_poll_lock.release()
+
+
+def reset_roles_weekly_scheduler_state() -> None:
+    """Clear in-memory weekly roles retry backoff and skip-log deduplication (for tests)."""
+    with _roles_weekly_state_lock:
+        _roles_weekly_retry_after.clear()
+        _roles_weekly_last_skip_log.clear()
+
+
+def _log_roles_weekly_skip(
+    repository: str,
+    scope_key: str,
+    reason_code: str,
+    message: str,
+    *args,
+) -> None:
+    cache_key = (repository.lower(), scope_key)
+    with _roles_weekly_state_lock:
+        if _roles_weekly_last_skip_log.get(cache_key) == reason_code:
+            return
+        _roles_weekly_last_skip_log[cache_key] = reason_code
+    logging.info(message, *args)
+
+
+def _clear_roles_weekly_skip(repository: str, scope_key: str) -> None:
+    with _roles_weekly_state_lock:
+        _roles_weekly_last_skip_log.pop((repository.lower(), scope_key), None)
+
+
+def roles_weekly_schedule_status(config: Config, store: Store | None, now: datetime | None = None) -> str:
+    """Human-readable one-line status of the weekly contributor-roles scheduler."""
+    moment = now or datetime.now(UTC)
+    local = moment.astimezone(ZoneInfo(config.merged_timezone))
+    key = week_key(local)
+    day_label = _weekday_name(config.merged_weekday)
+    info = store.roles_week_info(config.github_repository, key) if store is not None else None
+    if not config.contributor_roles_enabled:
+        state = "disabled"
+    elif config.roles_schedule != "weekly":
+        state = f"manual ({config.roles_schedule}; use /roles-backfill)"
+    elif info is not None:
+        completed_at = info.get("completed_at") or "unknown time"
+        via = info.get("via") or "scheduler"
+        state = f"already completed at {completed_at} via {via}"
+    elif weekly_is_due(moment, config.merged_weekday, config.merged_time, config.merged_timezone, None):
+        state = "due now (will catch up)"
+    else:
+        state = f"waiting for {day_label} {config.merged_time} {config.merged_timezone}"
+    return (
+        f"{day_label} {config.merged_time} {config.merged_timezone}, "
+        f"schedule={config.roles_schedule}, now={local.strftime('%Y-%m-%d %H:%M %Z')}, "
+        f"week={key}, status={state}, oauth={config.github_oauth_enabled}, "
+        f"webhook={bool(config.github_webhook_secret)}, backfill_on_boot={config.roles_backfill_on_boot}"
+    )
+
+
+def log_roles_weekly_boot_status(
+    config: Config,
+    store: Store | None,
+    now: datetime | None = None,
+) -> dict | None:
+    """Log clear startup status for the weekly contributor-roles run."""
+    if not config.contributor_roles_enabled:
+        return None
+    moment = now or datetime.now(UTC)
+    local = moment.astimezone(ZoneInfo(config.merged_timezone))
+    key = week_key(local)
+    info = store.roles_week_info(config.github_repository, key) if store is not None else None
+    if config.roles_schedule == "weekly" and info is not None:
+        logging.info(
+            "Contributor roles weekly run %s already completed at %s via %s; skipping",
+            info["week_key"],
+            info.get("completed_at") or "unknown time",
+            info.get("via") or "scheduler",
+        )
+    logging.info("Contributor roles weekly schedule: %s", roles_weekly_schedule_status(config, store, moment))
+    return info
+
+
+def run_weekly_roles_if_due(
+    config: Config,
+    store: Store | None,
+    now: datetime | None = None,
+    *,
+    guild=None,
+    loop=None,
+    force: bool = False,
+    via: str | None = None,
+    clock=time.monotonic,
+    poll_fn=None,
+    **poll_kwargs,
+) -> RolesPollResult | None:
+    """Run the contributor-roles check once per ISO week on Friday at the configured time.
+
+    Uses its own independent SQLite dedupe table (``roles_weekly_runs``) so
+    restarts/redeploys never run or announce the same week twice, while catching
+    up if the bot was down at the scheduled time. Runs independently of whether
+    the weekly merge summary post succeeded, skipped, or failed.
+    """
+    if store is None or not config.contributor_roles_enabled:
+        return None
+    if not force and config.roles_schedule != "weekly":
+        return None
+    if not _roles_weekly_lock.acquire(blocking=False):
+        logging.info("Contributor roles weekly check skipped: another weekly roles run is already in progress")
+        return None
+    try:
+        moment = now or datetime.now(UTC)
+        local = moment.astimezone(ZoneInfo(config.merged_timezone))
+        key = week_key(local)
+        day_scope = local.date().isoformat()
+        repo = config.github_repository
+        day_label = _weekday_name(config.merged_weekday)
+
+        if not force:
+            done_info = store.roles_week_info(repo, key)
+            if done_info is not None:
+                _log_roles_weekly_skip(
+                    repo,
+                    key,
+                    "already_completed",
+                    "Contributor roles weekly run %s already completed at %s via %s; skipping",
+                    key,
+                    done_info.get("completed_at") or "unknown time",
+                    done_info.get("via") or "scheduler",
+                )
+                return None
+            if local.weekday() != config.merged_weekday:
+                _log_roles_weekly_skip(
+                    repo,
+                    day_scope,
+                    f"wrong_weekday:{local.weekday()}",
+                    "Contributor roles weekly run skipped for %s: today is %s (scheduled for %s %s %s)",
+                    key,
+                    _weekday_name(local.weekday()),
+                    day_label,
+                    config.merged_time,
+                    config.merged_timezone,
+                )
+                return None
+            hour, minute = (int(part) for part in config.merged_time.split(":", 1))
+            if (local.hour, local.minute) < (hour, minute):
+                _log_roles_weekly_skip(
+                    repo,
+                    day_scope,
+                    "before_time",
+                    "Contributor roles weekly run waiting for %s: local time %s is before %s %s %s",
+                    key,
+                    local.strftime("%H:%M %Z"),
+                    day_label,
+                    config.merged_time,
+                    config.merged_timezone,
+                )
+                return None
+            if not weekly_is_due(
+                moment, config.merged_weekday, config.merged_time, config.merged_timezone, None,
+            ):
+                return None
+            retry_key = (repo.lower(), key)
+            with _roles_weekly_state_lock:
+                retry_deadline = _roles_weekly_retry_after.get(retry_key, 0.0)
+            if clock() < retry_deadline:
+                remaining = int(max(1.0, retry_deadline - clock()))
+                _log_roles_weekly_skip(
+                    repo,
+                    key,
+                    "rate_limit_backoff",
+                    "Contributor roles weekly run for %s deferred after rate limit; retrying in ~%ds",
+                    key,
+                    remaining,
+                )
+                return None
+
+        _clear_roles_weekly_skip(repo, day_scope)
+        _clear_roles_weekly_skip(repo, key)
+        logging.info(
+            "Contributor roles weekly run %s for %s (local=%s); checking merged PRs",
+            "forced" if force else "due",
+            key,
+            local.strftime("%Y-%m-%d %H:%M %Z"),
+        )
+        runner = poll_fn or poll_merged_prs_for_roles
+        result = runner(
+            config,
+            store,
+            guild=guild,
+            loop=loop,
+            now=moment,
+            **poll_kwargs,
+        )
+        if result is None:
+            return None
+        if result.rate_limited or result.timed_out:
+            if result.rate_limited and not force:
+                with _roles_weekly_state_lock:
+                    _roles_weekly_retry_after[(repo.lower(), key)] = clock() + ROLES_WEEKLY_RETRY_SECONDS
+            logging.warning(
+                "Contributor roles weekly run for %s incomplete (rate_limited=%s, timed_out=%s; "
+                "%d PRs, %d new grants so far); week left unmarked to resume automatically",
+                key,
+                result.rate_limited,
+                result.timed_out,
+                result.stored,
+                result.roles_granted,
+            )
+            return result
+
+        with _roles_weekly_state_lock:
+            _roles_weekly_retry_after.pop((repo.lower(), key), None)
+        mark_via = via or ("manual" if force else "scheduler")
+        store.mark_roles_week(
+            repo,
+            key,
+            iso(moment),
+            via=mark_via,
+            prs_discovered=result.discovered,
+            roles_granted=result.roles_granted,
+        )
+        logging.info(
+            "Contributor roles weekly run for %s: %d PRs, %d new grants",
+            key,
+            result.stored,
+            result.roles_granted,
+        )
+        return result
+    finally:
+        _roles_weekly_lock.release()
 
 
 def _backfill_summary_line(contributors_granted: int, roles_granted: int) -> str:
