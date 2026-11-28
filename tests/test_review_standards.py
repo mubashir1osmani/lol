@@ -14,6 +14,7 @@ from unittest import mock
 from contributor_bot.config import Config
 from contributor_bot.review_agent import (
     SYSTEM_PROMPT,
+    TOOLS,
     ReviewContext,
     build_system_prompt,
     execute_tool,
@@ -35,6 +36,8 @@ from contributor_bot.reviews import (
     discord_length,
     extract_linked_issue_numbers,
     files_from_unified_diff,
+    findings_missing_suggestions,
+    format_finding_bullet,
     load_review_standards,
     normalize_verdict,
     render_review,
@@ -257,6 +260,13 @@ class StandardsDocTests(unittest.TestCase):
         self.assertIn("root-cause analysis", prompt.lower())
         self.assertIn("patches around", prompt.lower())
         self.assertIn("read_file", prompt)
+        self.assertIn('"suggestion"', prompt)
+        self.assertIn("BaseBatchesConfig", prompt)
+
+        submit_tool = next(t for t in TOOLS if t["function"]["name"] == "submit_verdict")
+        finding_schema = submit_tool["function"]["parameters"]["properties"]["findings"]["items"]
+        self.assertIn("suggestion", finding_schema["properties"])
+        self.assertIn("suggestion", finding_schema["required"])
 
 
 class OutputFormatTests(unittest.TestCase):
@@ -329,14 +339,135 @@ class OutputFormatTests(unittest.TestCase):
         payload = json.dumps({
             "verdict": "doesn't meet our standards",
             "findings": [
-                {"path": "litellm/__init__.py", "line": 1694, "reason": "exports provider-specific gnani_batch at top level"},
-                {"path": "litellm/llms/gnani/batches/jobs.py", "line": 11, "reason": "imports private httpx._types"},
+                {
+                    "path": "litellm/__init__.py",
+                    "line": 1694,
+                    "reason": "exports bespoke gnani_batch at top level",
+                    "suggestion": "Drop it and implement a BaseBatchesConfig in litellm/llms/gnani/batches/transformation.py.",
+                },
+                {
+                    "path": "litellm/llms/gnani/batches/jobs.py",
+                    "line": 11,
+                    "reason": "imports private httpx._types",
+                    "suggestion": "Use HTTPHandler from litellm/llms/custom_httpx/http_handler.py instead.",
+                },
             ],
         })
         parsed = parse_review_json(payload)
         self.assertEqual(parsed["verdict"], VERDICT_BELOW_STANDARDS)
         self.assertEqual(len(parsed["findings"]), 2)
-        self.assertIn("litellm/__init__.py:1694", parsed["findings"][0])
+        self.assertEqual(
+            parsed["findings"][0],
+            "litellm/__init__.py:1694: exports bespoke gnani_batch at top level. "
+            "Drop it and implement a BaseBatchesConfig in litellm/llms/gnani/batches/transformation.py.",
+        )
+        self.assertIn("HTTPHandler", parsed["findings"][1])
+
+    def test_format_finding_bullet_combines_problem_and_suggestion(self):
+        bullet = format_finding_bullet({
+            "path": "litellm/__init__.py",
+            "line": 1694,
+            "reason": "exports bespoke gnani_batch at top level",
+            "suggestion": (
+                "Drop it and implement a BaseBatchesConfig in "
+                "litellm/llms/gnani/batches/transformation.py so "
+                'litellm.create_batch(custom_llm_provider="gnani") works.'
+            ),
+        })
+        self.assertEqual(
+            bullet,
+            "litellm/__init__.py:1694: exports bespoke gnani_batch at top level. "
+            "Drop it and implement a BaseBatchesConfig in "
+            "litellm/llms/gnani/batches/transformation.py so "
+            'litellm.create_batch(custom_llm_provider="gnani") works.',
+        )
+        # Existing trailing period does not create double punctuation.
+        punctuated = format_finding_bullet({
+            "path": "litellm/main.py",
+            "line": 10,
+            "reason": "patches around bug in shared code.",
+            "suggestion": "Move the fix into litellm/llms/foo/chat/transformation.py.",
+        })
+        self.assertNotIn("..", punctuated)
+        self.assertIn("litellm/main.py:10: patches around bug in shared code. Move the fix into", punctuated)
+
+    def test_submit_verdict_requires_suggestion_for_non_clean_findings(self):
+        self.assertEqual(findings_missing_suggestions(VERDICT_LOOKS_GOOD, []), [])
+        self.assertEqual(
+            findings_missing_suggestions(
+                VERDICT_NEEDS_WORK,
+                [
+                    {"path": "litellm/a.py", "line": 1, "reason": "bad import"},
+                    {"path": "litellm/b.py", "line": 2, "reason": "bad helper", "suggestion": "Use core_helpers."},
+                    {"path": "litellm/c.py", "line": 3, "reason": "bad route", "suggestion": "   "},
+                ],
+            ),
+            [0, 2],
+        )
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(str(Path(directory.name) / "roles.db"))
+        self.addCleanup(store.close)
+        config = replace(
+            Config("token", "123", "456", github_token="gh"),
+            pr_review_enabled=True,
+            review_channel_ids=("321",),
+            review_model="anthropic/claude-sonnet-4-5",
+            review_bot_logins=BOTS,
+            review_maintainer_role_id="555",
+        )
+        snapshot = Snapshot(
+            number=55200,
+            title="fix something",
+            head_sha=HEAD,
+            base_sha=BASE,
+            draft=False,
+            merged=False,
+            state="open",
+            mergeable=True,
+            mergeable_state="clean",
+            author_login="contrib",
+            author_id=7,
+            reviews=_clean_reviews(),
+            comments=[],
+            threads=[],
+            check_runs=[{"name": "unit-tests", "status": "completed", "conclusion": "success"}],
+            combined_state=None,
+        )
+        ctx = ReviewContext(config=config, store=store, number=55200, thread_id="900")
+        with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=snapshot), \
+                mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "1", "channel_id": "900"}) as post:
+            rejected = json.loads(tool_submit_verdict(ctx, {
+                "verdict": VERDICT_BELOW_STANDARDS,
+                "findings": [
+                    {"path": "litellm/main.py", "line": 12, "reason": "adds provider branch in main.py"},
+                ],
+            }))
+            self.assertIn("error", rejected)
+            self.assertEqual(rejected["missing_suggestion_indices"], [0])
+            self.assertFalse(ctx.verdict_posted)
+            post.assert_not_called()
+
+            accepted = json.loads(tool_submit_verdict(ctx, {
+                "verdict": VERDICT_BELOW_STANDARDS,
+                "findings": [
+                    {
+                        "path": "litellm/main.py",
+                        "line": 12,
+                        "reason": "adds provider branch in main.py",
+                        "suggestion": "Move the branch into litellm/llms/acme/chat/transformation.py.",
+                    },
+                ],
+            }))
+        self.assertEqual(accepted["verdict"], VERDICT_BELOW_STANDARDS)
+        self.assertTrue(ctx.verdict_posted)
+        posted = post.call_args_list[0].args[2]["content"]
+        self.assertIn(
+            "- litellm/main.py:12: adds provider branch in main.py. "
+            "Move the branch into litellm/llms/acme/chat/transformation.py.",
+            posted,
+        )
 
 
 def _inspect_fixture_against_standards(ctx: ReviewContext) -> None:
@@ -353,31 +484,52 @@ def _inspect_fixture_against_standards(ctx: ReviewContext) -> None:
             findings.append({
                 "path": path,
                 "line": 1694,
-                "reason": "exports bespoke top-level gnani_batch/agnani_batch instead of using the standard batch transformation layer",
+                "reason": "exports bespoke gnani_batch/agnani_batch at top level",
+                "suggestion": (
+                    "Drop them from litellm/__init__.py and implement a BaseBatchesConfig in "
+                    "litellm/llms/gnani/batches/transformation.py so "
+                    'litellm.create_batch(custom_llm_provider="gnani") works.'
+                ),
             })
         if "httpx._types" in patch or ".client.send(" in patch:
             findings.append({
                 "path": path,
                 "line": 11,
-                "reason": "imports private httpx._types and bypasses LiteLLM HTTPHandler and exception mapping",
+                "reason": "imports private httpx._types and calls raw .client.send() bypassing LiteLLM HTTP plumbing",
+                "suggestion": (
+                    "Route requests through HTTPHandler/AsyncHTTPHandler from "
+                    "litellm/llms/custom_httpx/http_handler.py and map errors via litellm/llms/base_llm/base_utils.py."
+                ),
             })
         if "/{endpoint:path}" in patch and "dict[str, object]" in patch:
             findings.append({
                 "path": path,
                 "line": 22,
-                "reason": "catch-all regex router with response_model=dict[str, object] and TypeAdapter hack instead of explicit typed FastAPI routes",
+                "reason": "catch-all /{endpoint:path} regex router with response_model=dict[str, object] and TypeAdapter hack",
+                "suggestion": (
+                    "Replace it with explicit FastAPI routes and typed Pydantic request/response models "
+                    "under litellm/proxy/."
+                ),
             })
         if path.endswith("pass_through_endpoints.py") and "upstream_headers_filter" in patch:
             findings.append({
                 "path": path,
                 "line": 1734,
-                "reason": "mutates shared pass_through_request signature and spans Terraform/README/generated schema churn for one provider",
+                "reason": "mutates shared pass_through_request signature and bundles Terraform, README.md, and generated schema churn",
+                "suggestion": (
+                    "Revert pass_through_endpoints.py, deploy/, README.md, and schema.d.ts; "
+                    "scope this PR to Gnani batch transformation and add unit tests."
+                ),
             })
     if "[insert handwritten description here]" in (bundle.get("body_preview") or ""):
         findings.append({
             "path": "litellm/llms/gnani/batches/jobs.py",
             "line": 24,
-            "reason": "hardcodes provider URL with PureWindowsPath/dict-unpacking hacks and leaves unfilled PR template placeholder",
+            "reason": "hardcodes API URL with PureWindowsPath/nested dict-unpacking hacks and leaves unfilled PR template placeholder",
+            "suggestion": (
+                "Read the base URL from litellm/llms/gnani/common_utils.py, use os.path.basename "
+                "with plain dict assignment, and replace the placeholder in the PR body."
+            ),
         })
     tool_submit_verdict(ctx, {
         "verdict": VERDICT_BELOW_STANDARDS if len(findings) >= 2 else VERDICT_LOOKS_GOOD,
@@ -457,12 +609,24 @@ class PR54805UglyCodeFixtureTests(unittest.TestCase):
         self.assertEqual(lines[0], VERDICT_BELOW_STANDARDS)
 
         bullets = lines[1:]
-        self.assertGreaterEqual(len(bullets), 3)
-        self.assertLessEqual(len(bullets), MAX_REVIEW_BULLETS)
+        self.assertEqual(len(bullets), MAX_REVIEW_BULLETS)
         self.assertTrue(all(line.startswith("- ") for line in bullets))
-        self.assertIn("litellm/__init__.py:1694", review_msg)
-        self.assertIn("litellm/llms/gnani/batches/jobs.py:11", review_msg)
-        self.assertIn("litellm/proxy/pass_through_endpoints/gnani_batch.py:22", review_msg)
+        self.assertIn("litellm/__init__.py:1694:", bullets[0])
+        self.assertIn("BaseBatchesConfig", bullets[0])
+        self.assertIn("litellm/llms/gnani/batches/transformation.py", bullets[0])
+        self.assertIn("litellm/llms/gnani/batches/jobs.py:11:", bullets[1])
+        self.assertIn("HTTPHandler/AsyncHTTPHandler", bullets[1])
+        self.assertIn("litellm/proxy/pass_through_endpoints/gnani_batch.py:22:", bullets[2])
+        self.assertIn("explicit FastAPI routes", bullets[2])
+        self.assertIn("litellm/proxy/pass_through_endpoints/pass_through_endpoints.py:1734:", bullets[3])
+        self.assertIn("Revert pass_through_endpoints.py", bullets[3])
+        self.assertIn("litellm/llms/gnani/batches/jobs.py:24:", bullets[4])
+        self.assertIn("litellm/llms/gnani/common_utils.py", bullets[4])
+        # Every bullet must pair the problem with a concrete fix sentence (no truncation).
+        for bullet in bullets:
+            self.assertNotIn("...", bullet)
+            self.assertIn(". ", bullet)
+        self.assertLessEqual(discord_length(review_msg), 2000)
 
         self.assertIsNone(_EMOJI_RE.search(review_msg))
         self.assertNotIn("—", review_msg)
@@ -542,6 +706,7 @@ class StrictRuleChecksTests(unittest.TestCase):
         ]
         md_findings = scan_md_files(files)
         self.assertEqual([item["path"] for item in md_findings], ["NOTES.md", "docs/GUIDE.md"])
+        self.assertTrue(all(item.get("suggestion") for item in md_findings))
 
         ctx = ReviewContext(config=self.config, store=self.store, number=55001, thread_id="900")
         with mock.patch("contributor_bot.review_agent.gather_snapshot", return_value=self._green_snapshot()), \
@@ -620,7 +785,9 @@ class StrictRuleChecksTests(unittest.TestCase):
         code_only = [
             {"filename": "litellm/utils.py", "status": "modified", "patch": "@@ -1 +1 @@\n+x = 1\n"},
         ]
-        self.assertEqual(len(scan_missing_tests(code_only)), 1)
+        missing = scan_missing_tests(code_only)
+        self.assertEqual(len(missing), 1)
+        self.assertTrue(missing[0].get("suggestion"))
         with_tests = code_only + [
             {"filename": "tests/unit/test_utils.py", "status": "modified", "patch": "@@ -1 +1 @@\n+assert True\n"},
         ]
@@ -658,6 +825,7 @@ class StrictRuleChecksTests(unittest.TestCase):
         found = scan_patch_inline_imports("litellm/llms/foo/chat/transformation.py", patch)
         self.assertEqual([item["line"] for item in found], [9, 10])
         self.assertTrue(all("inline import" in item["reason"] for item in found))
+        self.assertTrue(all(item.get("suggestion") for item in found))
 
         # Hunk starting inside an existing TYPE_CHECKING block should stay exempt.
         tc_hunk = (
@@ -704,13 +872,41 @@ class StrictRuleChecksTests(unittest.TestCase):
             combined_state=None,
         )
         agent_findings = [
-            {"path": "NOTES.md", "line": None, "reason": "remove AI-generated markdown file"},
-            {"path": "litellm/foo.py", "line": 14, "reason": "move inline import to top of file"},
+            {
+                "path": "NOTES.md",
+                "line": None,
+                "reason": "no .md files in PRs",
+                "suggestion": "Remove AI-generated markdown file from the PR.",
+            },
+            {
+                "path": "litellm/foo.py",
+                "line": 14,
+                "reason": "inline import inside function",
+                "suggestion": "Move the import to module top level.",
+            },
         ]
         det_findings = [
-            {"path": "NOTES.md", "line": None, "reason": "no .md files in PRs; remove added/changed markdown file", "rule": "no_md_files"},
-            {"path": "litellm/foo.py", "line": 14, "reason": "inline import inside function; move to top-level unless required for circular imports", "rule": "no_inline_imports"},
-            {"path": "litellm/foo.py", "line": None, "reason": "no tests added or updated; add unit and e2e tests covering this change", "rule": "missing_tests"},
+            {
+                "path": "NOTES.md",
+                "line": None,
+                "reason": "no .md files in PRs",
+                "suggestion": "Remove this markdown file from the PR.",
+                "rule": "no_md_files",
+            },
+            {
+                "path": "litellm/foo.py",
+                "line": 14,
+                "reason": "inline import inside function",
+                "suggestion": "Move this import to module top level, or mark it with # circular import if it breaks a cycle.",
+                "rule": "no_inline_imports",
+            },
+            {
+                "path": "litellm/foo.py",
+                "line": None,
+                "reason": "no tests added or updated",
+                "suggestion": "Add unit tests under tests/unit/ (and e2e coverage where applicable) for this change.",
+                "rule": "missing_tests",
+            },
         ]
         verdict, ready, bullets = resolve_verdict(
             gate,
@@ -870,6 +1066,7 @@ class RootCauseAnalysisTests(unittest.TestCase):
                 "path": "litellm/main.py",
                 "line": 412,
                 "reason": "broad except KeyError returns an empty ModelResponse and hides real failures",
+                "suggestion": "Remove the try/except wrapper from litellm/main.py so unexpected errors surface cleanly.",
             })
             if (
                 "custom_llm_provider == 'gemini'" in diff["patch"]
@@ -880,9 +1077,11 @@ class RootCauseAnalysisTests(unittest.TestCase):
                     "path": "litellm/main.py",
                     "line": 410,
                     "root_cause": True,
-                    "reason": (
-                        "patches around the root cause with a gemini branch in litellm/main.py; "
-                        "real fix belongs in litellm/llms/gemini/chat/transformation.py:GoogleAIStudioGeminiConfig.transform_response"
+                    "reason": "patches around the root cause with a gemini branch in litellm/main.py",
+                    "suggestion": (
+                        "Remove the Gemini branch from litellm/main.py and default missing functionCall args "
+                        "with .get('args', {}) in litellm/llms/gemini/chat/transformation.py:"
+                        "GoogleAIStudioGeminiConfig.transform_response."
                     ),
                 })
             tool_submit_verdict(ctx, {
