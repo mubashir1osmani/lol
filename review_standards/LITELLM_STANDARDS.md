@@ -10,6 +10,7 @@ Concrete bar for pull requests to `BerriAI/litellm`. Every rule below is grounde
   - Wrapping a broken call in `try/except` to swallow the error or returning a fallback value instead of fixing why the failure occurs.
   - Symptom-level guards (`if x is None`, defensive `getattr`, post-hoc regex/dict patching) that hide an upstream transformation, parsing, or routing bug.
 - **Name where the real fix belongs**: Whenever a PR patches around the root cause, make that the **first bullet** of the review, state plainly that it patches around the bug, and name the exact file and function where the real fix belongs.
+- **Be constructive on every finding**: Never just point out what is wrong. Every finding must state both the problem and concretely what the PR should do instead (exact file, class/function, or change) in one or two short, blunt sentences.
 
 ## 2. Put Code in the Right Layer and Register Providers Properly
 - **OpenAI-compatible providers**: Register them in `litellm/llms/openai_like/providers.json` (loaded by `litellm/llms/openai_like/json_loader.py` and `litellm/llms/openai_like/dynamic_config.py`, plus `model_prices_and_context_window.json` as required). Do not build a custom Python provider package for a provider that is OpenAI-compatible; a full custom implementation for an OpenAI-like provider is a finding.

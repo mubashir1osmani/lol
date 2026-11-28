@@ -26,6 +26,7 @@ STANDARDS_PATH = Path(__file__).resolve().parents[1] / "review_standards" / "LIT
 DISCORD_MESSAGE_LIMIT = 2000
 MAX_REVIEW_POSTS = 8
 MAX_REVIEW_BULLETS = 5
+MAX_BULLET_CHARS = 340
 MAX_PRS_PER_MESSAGE = 3
 MAX_FINDINGS_PER_BOT = 5
 _STALE_MARKER = "BUGBOT_REVIEW_STALE"
@@ -104,7 +105,7 @@ def normalize_verdict(value: object) -> str | None:
     return None
 
 
-def clean_review_text(text: str, *, limit: int = 220) -> str:
+def clean_review_text(text: str, *, limit: int = MAX_BULLET_CHARS) -> str:
     """Strip emojis, em-dashes, markdown headings, and praise padding."""
     cleaned = discord_safe(text or "")
     cleaned = _EMOJI_RE.sub("", cleaned)
@@ -124,8 +125,35 @@ def clean_review_text(text: str, *, limit: int = 220) -> str:
     return cleaned
 
 
+def _combine_reason_and_suggestion(reason: str, suggestion: str) -> str:
+    if reason and suggestion:
+        if suggestion.lower() in reason.lower():
+            return reason
+        sep = " " if reason[-1] in ".!?" else ". "
+        return f"{reason}{sep}{suggestion}"
+    return reason or suggestion
+
+
+def findings_missing_suggestions(verdict: object, findings: list | tuple | None) -> list[int]:
+    """Return 0-based indices of findings missing a concrete `suggestion` on a non-clean verdict."""
+    normalized = normalize_verdict(verdict)
+    items = list(findings or ())
+    if normalized == VERDICT_LOOKS_GOOD and not items:
+        return []
+    missing: list[int] = []
+    for index, item in enumerate(items):
+        if isinstance(item, dict):
+            reason = clean_review_text(str(item.get("reason") or item.get("message") or ""), limit=180)
+            suggestion = clean_review_text(str(item.get("suggestion") or item.get("fix") or ""), limit=220)
+            if reason and not suggestion:
+                missing.append(index)
+        elif isinstance(item, str) and item.strip():
+            missing.append(index)
+    return missing
+
+
 def format_finding_bullet(item: object) -> str:
-    """Format one finding dict ({path, line, reason}) or string into a short bullet."""
+    """Format one finding dict ({path, line, reason, suggestion}) or string into a short bullet."""
     if isinstance(item, dict):
         raw_path = str(item.get("path") or "").strip()
         path = plain(raw_path, 90) if raw_path else ""
@@ -134,13 +162,15 @@ def format_finding_bullet(item: object) -> str:
             line = int(line)
         where = f"{path}:{line}" if path and isinstance(line, int) and line > 0 else path
         reason = clean_review_text(str(item.get("reason") or item.get("message") or ""), limit=180)
-        if not reason:
+        suggestion = clean_review_text(str(item.get("suggestion") or item.get("fix") or ""), limit=220)
+        body = _combine_reason_and_suggestion(reason, suggestion)
+        if not body:
             return ""
         if where:
-            return clean_review_text(f"{where} - {reason}", limit=220)
-        return reason
+            return clean_review_text(f"{where}: {body}", limit=MAX_BULLET_CHARS)
+        return clean_review_text(body, limit=MAX_BULLET_CHARS)
     if isinstance(item, str):
-        return clean_review_text(item, limit=220)
+        return clean_review_text(item, limit=MAX_BULLET_CHARS)
     return ""
 
 
@@ -223,7 +253,8 @@ def scan_md_files(files: list[dict]) -> list[dict]:
             findings.append({
                 "path": path,
                 "line": None,
-                "reason": "no .md files in PRs; remove added/changed markdown file",
+                "reason": "no .md files in PRs",
+                "suggestion": "Remove this markdown file from the PR.",
                 "rule": "no_md_files",
             })
     return findings
@@ -274,7 +305,8 @@ def scan_patch_inline_imports(path: str, patch: str, *, max_per_file: int = 2) -
             findings.append({
                 "path": path,
                 "line": new_line if new_line > 0 else None,
-                "reason": "inline import inside function; move to top-level unless required for circular imports",
+                "reason": "inline import inside function",
+                "suggestion": "Move this import to module top level, or mark it with # circular import if it breaks a cycle.",
                 "rule": "no_inline_imports",
             })
             if len(findings) >= max_per_file:
@@ -342,7 +374,8 @@ def scan_missing_tests(files: list[dict]) -> list[dict]:
         return [{
             "path": prod_py[0],
             "line": None,
-            "reason": "no tests added or updated; add unit and e2e tests covering this change",
+            "reason": "no tests added or updated",
+            "suggestion": "Add unit tests under tests/unit/ (and e2e coverage where applicable) for this change.",
             "rule": "missing_tests",
         }]
     return []
@@ -529,7 +562,7 @@ def resolve_verdict(
 
     gate_bullets: list[str] = []
     for reason in gate.reasons:
-        bullet = clean_review_text(reason, limit=220)
+        bullet = clean_review_text(reason, limit=MAX_BULLET_CHARS)
         key = bullet.lower()
         if bullet and key not in seen:
             seen.add(key)
@@ -538,13 +571,13 @@ def resolve_verdict(
     if requested == VERDICT_BELOW_STANDARDS:
         bullets = (agent_bullets + det_bullets + gate_bullets)[:max_bullets]
         if not bullets:
-            bullets = ["diff does not meet litellm code quality standards"]
+            bullets = ["diff does not meet litellm code quality standards. Refactor to follow the standard provider/router layer and add unit tests."]
         return VERDICT_BELOW_STANDARDS, False, tuple(bullets)
 
     if not gate.ready or agent_bullets or det_bullets or requested == VERDICT_NEEDS_WORK:
         bullets = (agent_bullets + det_bullets + gate_bullets)[:max_bullets]
         if not bullets:
-            bullets = ["needs fixes before a maintainer looks"]
+            bullets = ["needs fixes before a maintainer looks. Address the blocking issues and push an update."]
         return VERDICT_NEEDS_WORK, False, tuple(bullets)
 
     return VERDICT_LOOKS_GOOD, True, ()
@@ -563,7 +596,7 @@ def render_review(
     lines = [normalized]
     seen: set[str] = set()
     for raw in bullets:
-        bullet = clean_review_text(str(raw), limit=220)
+        bullet = clean_review_text(str(raw), limit=MAX_BULLET_CHARS)
         key = bullet.lower()
         if not bullet or key in seen:
             continue

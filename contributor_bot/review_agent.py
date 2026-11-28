@@ -29,6 +29,7 @@ from .reviews import (
     discord_safe,
     extract_linked_issue_numbers,
     files_from_unified_diff,
+    findings_missing_suggestions,
     load_review_standards,
     plain,
     render_review,
@@ -60,7 +61,7 @@ _BASE_SYSTEM_PROMPT = (
     "(for example: special-casing, try/except swallowing, provider-specific if-branches in shared code like litellm/main.py or litellm/utils.py, "
     "or symptom-level null/fallback guards hiding an upstream bug).\n"
     "4. If the PR patches around the root cause: put that as the VERY FIRST finding in findings_json with \"root_cause\": true, "
-    "saying plainly that it patches around the root cause and naming where the real fix belongs (exact file and function).\n"
+    "stating plainly in reason that it patches around the root cause and naming in suggestion the exact file and function where the real fix belongs and what to do there.\n"
     "5. Also evaluate the diff strictly against the rest of the LiteLLM Code Quality Standards below:\n"
     "   - Code comments: flag added comments in code unless strictly required for a non-obvious invariant (check standards_signals.added_comments).\n"
     "   - No .md files: any added or modified .md file in the PR is a finding (also checked deterministically).\n"
@@ -89,9 +90,15 @@ _BASE_SYSTEM_PROMPT = (
     "and will block looks good if any fail.\n"
     "\n"
     "Style rules (strict):\n"
-    "- Write like a busy senior LiteLLM maintainer on Discord: plain, direct, lowercase is fine.\n"
-    "- At most 3 to 5 short findings in findings_json. Each item is {\"path\": \"file.py\", \"line\": 42, \"reason\": \"specific standard broken\", \"root_cause\": false}. "
+    "- Write like a busy senior LiteLLM maintainer on Discord: plain, direct, constructive, lowercase is fine.\n"
+    "- At most 3 to 5 short findings in findings_json. Each item MUST be "
+    "{\"path\": \"file.py\", \"line\": 42, \"reason\": \"what is wrong\", \"suggestion\": \"what the PR should do instead\", \"root_cause\": false}. "
     "When the PR patches around the root cause, set \"root_cause\": true on that item so it is posted first.\n"
+    "- Constructive fixes are REQUIRED: for every finding on a non-clean verdict (needs work or doesn't meet our standards), "
+    "you MUST include a concrete, non-empty \"suggestion\" naming the exact file, class/function, or change to make instead "
+    "(submit_verdict rejects findings without suggestion). Keep each bullet to one or two short sentences total (problem + fix), for example: "
+    "reason=\"exports bespoke gnani_batch at top level\", "
+    "suggestion=\"Drop it and implement a BaseBatchesConfig in litellm/llms/gnani/batches/transformation.py so litellm.create_batch(custom_llm_provider=\\\"gnani\\\") works.\"\n"
     "- No praise padding, no 'Great PR!', no 'Thanks for contributing!', no headings, no emojis, no em-dashes, "
     "no hedging ('maybe consider', 'you might want to'), and no summary of what the PR does.\n"
     "- If the PR is clean, submit verdict='looks good' with findings_json='[]' so the bot posts one line.\n"
@@ -281,7 +288,9 @@ TOOLS = [
     _tool(
         "submit_verdict",
         "Post the review verdict. verdict must be one of: looks good, needs work, doesn't meet our standards. "
-        "findings is a list of at most 5 {path, line, reason, root_cause?} objects naming the file/line and standard broken. "
+        "findings is a list of at most 5 {path, line, reason, suggestion, root_cause?} objects. "
+        "For non-clean verdicts, every finding MUST include a concrete non-empty suggestion saying what the PR should do instead "
+        "(exact file, class/function, or change, keeping problem + fix to one or two short sentences). "
         "Set root_cause=true on a patch-around finding so it is posted first. "
         "The tool still enforces the CI/bot/mergeability gate.",
         {
@@ -289,7 +298,20 @@ TOOLS = [
                 "type": "string",
                 "enum": [VERDICT_LOOKS_GOOD, VERDICT_NEEDS_WORK, VERDICT_BELOW_STANDARDS],
             },
-            "findings": {"type": "array", "items": {"type": "object"}},
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "line": {"type": ["integer", "null"]},
+                        "reason": {"type": "string"},
+                        "suggestion": {"type": "string"},
+                        "root_cause": {"type": "boolean"},
+                    },
+                    "required": ["path", "reason", "suggestion"],
+                },
+            },
             "blocking": {"type": "array", "items": {"type": "object"}},
         },
         ["verdict"],
@@ -741,6 +763,17 @@ def tool_submit_verdict(ctx: ReviewContext, args: dict) -> str:
         combined_state=pull.combined_state,
     )
     findings = _extract_findings(args)
+    missing_suggestions = findings_missing_suggestions(args.get("verdict"), findings)
+    if missing_suggestions:
+        return _json({
+            "error": (
+                "every finding on a non-clean verdict requires a concrete non-empty 'suggestion' "
+                "saying what the PR should do instead (exact file, class/function, or change). "
+                f"Missing 'suggestion' on finding indices: {missing_suggestions}. "
+                "Resubmit submit_verdict with 'suggestion' populated on each finding."
+            ),
+            "missing_suggestion_indices": missing_suggestions,
+        })
     files_for_checks = ctx.files if ctx.files is not None else files_from_unified_diff(getattr(pull, "diff", "") or "")
     deterministic = analyze_pr_files(files_for_checks)["deterministic_findings"] if files_for_checks else []
     verdict, ready, bullets = resolve_verdict(
@@ -1115,7 +1148,9 @@ def _sdk_tools(sdk) -> list:
             submit_verdict,
             "submit_verdict",
             "Post the verdict. verdict must be one of: looks good, needs work, doesn't meet our standards. "
-            "findings_json is a JSON list of at most 5 {path, line, reason, root_cause?} objects naming the file/line and standard broken. "
+            "findings_json is a JSON list of at most 5 {path, line, reason, suggestion, root_cause?} objects. "
+            "For non-clean verdicts, every finding MUST include a concrete non-empty suggestion saying what the PR should do instead "
+            "(exact file, class/function, or change, keeping problem + fix to one or two short sentences). "
             "Set root_cause=true on a patch-around finding so it is posted first. "
             "The tool still enforces the CI/bot/mergeability gate.",
         ),
@@ -1241,7 +1276,8 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
     task = (
         f"Review pull request #{number} in {config.github_repository}. "
         "Start with root-cause analysis (read linked issues, PR body, diffs, and surrounding code outside the diff to verify it fixes the root cause rather than patching around it), "
-        "check the LiteLLM standards, automated reviewers, and CI, then call submit_verdict."
+        "check the LiteLLM standards, automated reviewers, and CI, then call submit_verdict "
+        "(for any non-clean verdict, include a concrete 'suggestion' on every finding saying what the PR should do instead)."
         if mode == "review"
         else (
             f"The latest Discord question is about pull request #{number} in {config.github_repository}. "
