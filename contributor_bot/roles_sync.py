@@ -760,13 +760,13 @@ def _grant_roles_for_stored_matches(
     return roles_granted, rate_limited
 
 
-def _search_merged_numbers_per_day(
+def _search_merged_rows_per_day(
     repository: str,
     start: datetime,
     end: datetime,
     token: str | None,
-) -> set[int]:
-    """Discover merged PR numbers across per-day ``merged:D..D`` windows (cap 10 pages/day)."""
+) -> list[dict]:
+    """Discover merged PR rows (with author metadata) across per-day ``merged:D..D`` windows."""
     try:
         rows, rate_limited = _search_merged_pages(
             repository,
@@ -782,7 +782,17 @@ def _search_merged_numbers_per_day(
         raise RuntimeError(str(error)) from error
     if rate_limited:
         raise TransientAPIError("GitHub search rate limit hit during per-day merged PR fetch")
-    return {int(row["number"]) for row in rows if isinstance(row.get("number"), int)}
+    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("number"), int)]
+
+
+def _search_merged_numbers_per_day(
+    repository: str,
+    start: datetime,
+    end: datetime,
+    token: str | None,
+) -> set[int]:
+    """Discover merged PR numbers across per-day ``merged:D..D`` windows (cap 10 pages/day)."""
+    return {int(row["number"]) for row in _search_merged_rows_per_day(repository, start, end, token)}
 
 
 def poll_merged_prs_for_roles(
@@ -831,7 +841,7 @@ def poll_merged_prs_for_roles(
     moment_iso = iso(moment)
     org = repo.split("/", 1)[0] if "/" in repo else ""
     token = config.effective_github_token
-    search_fn = search_merged_fn or _search_merged_numbers_per_day
+    search_fn = search_merged_fn or _search_merged_rows_per_day
     try:
         window_start = moment - timedelta(days=DAILY_LOOKBACK_DAYS)
         window_start_iso = iso(window_start)
@@ -876,7 +886,7 @@ def poll_merged_prs_for_roles(
             )
 
         try:
-            numbers = search_fn(repo, window_start, moment, token)
+            raw_discovered = search_fn(repo, window_start, moment, token)
         except TransientAPIError as error:
             if stored_roles_granted:
                 try:
@@ -908,6 +918,16 @@ def poll_merged_prs_for_roles(
                 rate_limited=True,
             )
 
+        rows_by_number: dict[int, dict[str, Any]] = {}
+        numbers: set[int] = set()
+        for entry in raw_discovered or ():
+            if isinstance(entry, dict) and isinstance(entry.get("number"), int):
+                num = int(entry["number"])
+                numbers.add(num)
+                rows_by_number[num] = entry
+            elif isinstance(entry, int):
+                numbers.add(entry)
+
         stored = 0
         skipped_existing = 0
         skipped_excluded = 0
@@ -915,12 +935,29 @@ def poll_merged_prs_for_roles(
         rate_limited = stored_rate_limited
         timed_out = False
         affected_authors: dict[int, dict[str, Any]] = {}
-        fetch_deadline = (deadline - 20.0) if deadline is not None else None
+        if deadline is not None:
+            match_reserve = min(60.0, max(20.0, float(deadline_seconds or POLL_DEADLINE_SECONDS) * 0.35))
+            fetch_deadline = deadline - match_reserve
+        else:
+            fetch_deadline = None
 
         for number in sorted(numbers, reverse=True):
             if store.get_pull(repo, number) is not None:
                 skipped_existing += 1
                 continue
+            search_row = rows_by_number.get(number)
+            if search_row is not None:
+                search_login = str(search_row.get("login") or "").strip()
+                if search_login and _is_excluded_author(
+                    search_login,
+                    str(search_row.get("type") or ""),
+                    str(search_row.get("author_association") or ""),
+                    config.maintainer_logins,
+                    org_members=org_members,
+                    org=org,
+                ):
+                    skipped_excluded += 1
+                    continue
             if stored >= max_pulls or (fetch_deadline is not None and time.monotonic() >= fetch_deadline):
                 timed_out = True
                 break
