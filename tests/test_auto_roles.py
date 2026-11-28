@@ -2,7 +2,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -815,7 +815,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         self.assertEqual(len(chunked_posts), 3)
         self.assertEqual(chunk_store.all_unannounced_grants(), [])
 
-    def test_backfill_processes_newest_first_and_resumes_across_backfill_and_daily_runs(self):
+    def test_backfill_processes_newest_first_and_resumes_only_via_backfill(self):
         # 3 windows: Sep 1..Sep 29, Sep 29..Oct 27, Oct 27..Nov 20 (newest-first!)
         cfg = get_config(minimal_roles_env(self.temp.name, BACKFILL_SINCE="2026-09-01T00:00:00Z"))
         members = [
@@ -903,25 +903,36 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         self.assertEqual([c.args[1] for c in add_role2.call_args_list], ["6002"])
         self.assertIn("2/3 windows done", format_backfill_result(r2))
 
-        # Run 3: Daily run automatically finishes the final pending Sep window until completed=True!
-        seen_windows.clear()
-        stop_after["n"] = 10
+        # A daily run in between MUST NOT touch historical backfill windows (7-day rolling window only).
+        daily_windows = []
         daily_day = datetime(2026, 11, 21, 15, 0, tzinfo=UTC)
-
-        def daily_and_backfill_search(repo, start, end, tok):
-            # Incremental daily check has 24h window -> no new PRs; backfill chunk asks for Sep window.
-            if (end - start).days >= 20:
-                seen_windows.append((start.date().isoformat(), end.date().isoformat()))
-                return {901}
-            return set()
-
-        with mock.patch("contributor_bot.rewards.add_member_role") as add_role3, \
-             mock.patch("contributor_bot.rewards.post_message", return_value={"id": "3"}):
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role_daily, \
+             mock.patch("contributor_bot.rewards.post_message") as post_daily:
             run_daily_roles_if_due(
                 cfg,
                 self.store,
                 daily_day,
-                search_merged_fn=daily_and_backfill_search,
+                search_merged_fn=lambda repo, start, end, tok: (daily_windows.append((start, end)), set())[1],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+        self.assertEqual(len(daily_windows), 1)
+        self.assertEqual(daily_windows[0][1] - daily_windows[0][0], timedelta(days=7))
+        self.assertTrue(has_pending_backfill(cfg, self.store))
+        add_role_daily.assert_not_called()
+        post_daily.assert_not_called()
+
+        # Run 3: Mod runs /roles-backfill again to finish the final Sep window until completed=True!
+        seen_windows.clear()
+        stop_after["n"] = 10
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role3, \
+             mock.patch("contributor_bot.roles_sync.post_message", return_value={"id": "3"}):
+            r3 = run_roles_backfill(
+                cfg,
+                self.store,
+                now=daily_day,
+                search_merged_fn=paged_search,
                 pull_fetcher=lambda repo, num, tok: pulls[num],
                 files_fetcher=lambda repo, num, tok: ["README.md"],
                 count_fetcher=lambda repo, login, tok: 1,
@@ -929,8 +940,77 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 members=members,
             )
         self.assertEqual(seen_windows, [("2026-09-01", "2026-09-29")])
+        self.assertTrue(r3.completed)
+        self.assertEqual(r3.windows_done_total, 3)
         self.assertFalse(has_pending_backfill(cfg, self.store))
         self.assertEqual([c.args[1] for c in add_role3.call_args_list], ["6003"])
+
+    def test_daily_roles_only_considers_rolling_seven_day_window(self):
+        now = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+        members = [
+            _member("7101", "recent-dev", "Recent Dev"),
+            _member("7102", "old-stored-dev", "Old Stored Dev"),
+            _member("7103", "old-search-dev", "Old Search Dev"),
+            _member("7104", "ancient-match-dev", "Ancient Match Dev"),
+            _member("7105", "late-joiner", "Late Joiner"),
+        ]
+        # Pre-store an old PR from 14 days ago (must NOT be matched/graded by daily run).
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=1401, github_user_id=7202,
+            github_login="old-stored-dev", merged_at="2026-11-13T10:00:00+00:00",
+            title="old stored pr", labels=[], files=["README.md"],
+        )
+        # Pre-store an old confirmed match from 20 days ago (must NOT be graded by daily run).
+        self.store.save_confirmed_match(
+            "ancient-match-dev", "7104", method="exact_login", confidence=0.96,
+            matched_at="2026-11-07T10:00:00+00:00", github_user_id=7204,
+        )
+        # Pre-store a PR merged 3 days ago (within 7d) whose author just joined Discord today!
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=1405, github_user_id=7205,
+            github_login="late-joiner", merged_at="2026-11-24T10:00:00+00:00",
+            title="merged 3 days ago", labels=[], files=["README.md"],
+        )
+
+        pulls = {
+            1402: {
+                "number": 1402, "merged": True, "merged_at": "2026-11-25T10:00:00Z", "title": "recent pr",
+                "user": {"login": "recent-dev", "id": 7201, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+            # Even if search returned a PR merged 10 days ago, it's outside the 7-day rolling window!
+            1403: {
+                "number": 1403, "merged": True, "merged_at": "2026-11-17T10:00:00Z", "title": "10d old pr",
+                "user": {"login": "old-search-dev", "id": 7203, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+        }
+        search_windows = []
+
+        def capture_search(repo, start, end, tok):
+            search_windows.append((start, end))
+            return {1402, 1403}
+
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
+             mock.patch("contributor_bot.rewards.post_message", return_value={"id": "99"}):
+            res = run_daily_roles_if_due(
+                self.config,
+                self.store,
+                now,
+                search_merged_fn=capture_search,
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+
+        self.assertEqual(search_windows, [(now - timedelta(days=7), now)])
+        # ONLY recent-dev (merged 2d ago) and late-joiner (merged 3d ago) are evaluated & granted!
+        self.assertEqual(res.authors_evaluated, 2)
+        self.assertEqual(res.authors_matched, 2)
+        granted_users = {call.args[1] for call in add_role.call_args_list}
+        self.assertEqual(granted_users, {"7101", "7105"})
 
     def test_weekly_summary_matches_are_persisted_and_reused_without_llm_by_daily_roles(self):
         from contributor_bot.matcher import MatchDetail
@@ -1070,12 +1150,11 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         self.assertTrue(r2.completed)
         self.assertEqual([c.args[1] for c in add_role2.call_args_list], ["8001"])
 
-    def test_priority_pool_matches_recent_joiners_and_posters_before_full_fallback(self):
+    def test_priority_pool_matches_seven_day_joiners_before_full_fallback(self):
         from types import SimpleNamespace
         from contributor_bot.matcher import (
             match_community_contributors_with_diagnostics,
             member_from_raw,
-            record_recent_poster,
             reset_guild_members_cache,
         )
 
@@ -1083,44 +1162,42 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         self.addCleanup(reset_guild_members_cache)
         now = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
 
-        # Verify member_from_raw parses joined_at from both REST dicts and discord.Member-style objects.
+        # Verify 7-day member.joined_at cutoff from both REST dicts and discord.Member objects.
         recent_john = member_from_raw({
             "user": {"id": "9001", "username": "john_recent", "global_name": "John Smith"},
-            "joined_at": "2026-11-20T12:00:00+00:00",  # 7 days ago -> in recent pool
+            "joined_at": "2026-11-24T12:00:00+00:00",  # 3 days ago -> IN 7-day priority pool
         })
-        old_john = member_from_raw(SimpleNamespace(
+        mid_john = member_from_raw(SimpleNamespace(
             id=9002,
-            name="john_ancient",
+            name="john_older",
             global_name="John Smith",
             nick=None,
             display_name="John Smith",
             bot=False,
-            joined_at=datetime(2024, 1, 10, 12, 0, tzinfo=UTC),  # >30 days ago -> full pool only
+            joined_at=datetime(2026, 11, 12, 12, 0, tzinfo=UTC),  # 15 days ago (>7d) -> full pool only!
         ))
-        active_poster = member_from_raw({
+        recent_mira = member_from_raw({
             "user": {"id": "9003", "username": "mira_codes", "global_name": "Mira K"},
-            "joined_at": "2024-06-01T12:00:00+00:00",  # joined long ago, BUT posted recently!
+            "joined_at": "2026-11-22T12:00:00+00:00",  # 5 days ago -> IN 7-day priority pool
         })
         old_lookalike = member_from_raw({
             "user": {"id": "9004", "username": "mira_coder", "global_name": "Mira L"},
-            "joined_at": "2024-02-01T12:00:00+00:00",  # full pool only
+            "joined_at": "2026-11-05T12:00:00+00:00",  # 22 days ago (>7d) -> full pool only
         })
         veteran = member_from_raw({
             "user": {"id": "9005", "username": "veteran_dev", "global_name": "Veteran Dev"},
             "joined_at": "2023-08-01T12:00:00+00:00",  # full pool only
         })
-        members = [recent_john, old_john, active_poster, old_lookalike, veteran]
+        members = [recent_john, mid_john, recent_mira, old_lookalike, veteran]
 
         cfg = get_config(minimal_roles_env(self.temp.name, TYPESAFE_API_KEY="jev-test-key"))
-        # Mark 9003 as a recent poster in this guild (cheap in-memory tracking).
-        record_recent_poster(cfg.discord_guild_id, "9003", at=datetime(2026, 11, 26, 10, 0, tzinfo=UTC))
 
         groups = [
-            # 1) "John Smith" would be an ambiguous tie in full pool, but uniquely matches recent_john in priority pool (0 LLM calls!).
+            # 1) "John Smith" would be an ambiguous tie in full pool, but uniquely matches recent_john in 7d pool (0 LLM calls!).
             {"login": "gh-jsmith", "user_id": 9101, "pulls": []},
-            # 2) Fuzzy match to recent poster 9003 -> Jev sees ONLY 9003 from recent pool, never calls Jev on full pool!
+            # 2) Fuzzy match to 5-day joiner 9003 -> Jev sees ONLY 9003 from 7d pool, never calls Jev on full pool!
             {"login": "miracode", "user_id": 9102, "pulls": []},
-            # 3) No match in recent pool -> falls back to full pool and matches veteran (9005)!
+            # 3) No match in 7d pool -> falls back to full pool and matches veteran (9005)!
             {"login": "veteran-dev", "user_id": 9103, "pulls": []},
         ]
 
@@ -1163,13 +1240,13 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         self.assertEqual(skipped, 0)
         by_login = {g["login"]: g["discord_id"] for g in matched}
         self.assertEqual(by_login, {
-            "gh-jsmith": "9001",    # matched recent_john uniquely in priority pool!
-            "miracode": "9003",     # matched recent poster via priority-pool Jev!
+            "gh-jsmith": "9001",    # matched recent_john uniquely in 7-day priority pool!
+            "miracode": "9003",     # matched 5-day joiner via priority-pool Jev!
             "veteran-dev": "9005",  # fell back to full member list!
         })
-        # Exact pool-size log emitted!
+        # Exact pool-size log emitted (2 joined within 7d; 15d-old & 22d-old excluded from recent pool)!
         self.assertTrue(any("match pool: recent=2 full=5" in line for line in logs.output))
-        # Jev was called ONLY ONCE (on the recent pool for miracode -> 9003), NEVER on the full pool (9002 or 9004)!
+        # Jev was called ONLY ONCE (on the 7d recent pool for miracode -> 9003), NEVER on the full pool (9002 or 9004)!
         self.assertEqual(jev_calls, [[("miracode", "9003")]])
 
 

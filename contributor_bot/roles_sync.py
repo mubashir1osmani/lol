@@ -45,6 +45,7 @@ from .weekly import (
     fetch_org_public_members,
 )
 
+DAILY_LOOKBACK_DAYS = 7
 POLL_INITIAL_LOOKBACK_HOURS = 24
 POLL_OVERLAP_MINUTES = 5
 POLL_MAX_LOOKBACK_DAYS = 14
@@ -57,7 +58,6 @@ AUTHOR_COUNT_CACHE_TTL_DAYS = 30
 BACKFILL_WINDOW = timedelta(days=28)
 BACKFILL_DEADLINE_SECONDS = 300.0
 BACKFILL_MATCH_RESERVE_SECONDS = 45.0
-DAILY_BACKFILL_CHUNK_SECONDS = 60.0
 
 _roles_poll_lock = threading.Lock()
 _roles_daily_lock = threading.Lock()
@@ -404,12 +404,13 @@ def _grant_roles_for_stored_matches(
     now: datetime,
     org: str,
     org_members: frozenset[str],
+    matched_since: str | None = None,
     count_fetcher=None,
     deadline: float | None = None,
 ) -> tuple[int, bool]:
-    """Ensure every confirmed match in ``github_discord_matches`` (incl. weekly shoutouts) gets earned roles."""
+    """Ensure confirmed matches in ``github_discord_matches`` (incl. weekly shoutouts) get earned roles."""
     repo = config.github_repository
-    stored_matches = store.all_confirmed_matches()
+    stored_matches = store.all_confirmed_matches(matched_since=matched_since)
     if not stored_matches:
         return 0, False
 
@@ -494,7 +495,7 @@ def poll_merged_prs_for_roles(
     rest_searcher=None,
     announcement_chunk_limit: int = ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
 ) -> RolesPollResult | None:
-    """Poll newly merged PRs since the SQLite checkpoint and auto-assign newly earned roles."""
+    """Check PRs merged in the rolling past 7 days and auto-assign newly earned roles."""
     if not config.contributor_roles_enabled or store is None:
         return None
     if not _roles_poll_lock.acquire(blocking=False):
@@ -510,33 +511,22 @@ def poll_merged_prs_for_roles(
     token = config.effective_github_token
     search_fn = search_merged_fn or fetch_merged_numbers
     try:
-        checkpoint_raw = store.get_roles_meta(_checkpoint_key(repo))
-        if checkpoint_raw:
-            try:
-                parsed = parse_time(checkpoint_raw)
-                window_start = max(
-                    parsed - timedelta(minutes=POLL_OVERLAP_MINUTES),
-                    moment - timedelta(days=POLL_MAX_LOOKBACK_DAYS),
-                )
-            except Exception:
-                window_start = moment - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)
-        else:
-            window_start = moment - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)
-        if window_start >= moment:
-            window_start = moment - timedelta(minutes=POLL_OVERLAP_MINUTES)
+        window_start = moment - timedelta(days=DAILY_LOOKBACK_DAYS)
+        window_start_iso = iso(window_start)
 
         if org_members_fetcher is not None:
             org_members = frozenset(m.lower() for m in org_members_fetcher(org, token))
         else:
             org_members = fetch_org_public_members(org, token) if org else frozenset()
 
-        # Grant roles to any already-confirmed matches (including Friday weekly summary shoutouts) first!
+        # Grant roles for recent confirmed matches (such as Friday's weekly summary shoutouts) first.
         stored_roles_granted, stored_rate_limited = _grant_roles_for_stored_matches(
             config,
             store,
             now=moment,
             org=org,
             org_members=org_members,
+            matched_since=window_start_iso,
             count_fetcher=count_fetcher,
             deadline=(deadline - 30.0) if deadline is not None else None,
         )
@@ -578,7 +568,7 @@ def poll_merged_prs_for_roles(
         affected_authors: dict[int, dict[str, Any]] = {}
         fetch_deadline = (deadline - 20.0) if deadline is not None else None
 
-        for number in sorted(numbers):
+        for number in sorted(numbers, reverse=True):
             if store.get_pull(repo, number) is not None:
                 skipped_existing += 1
                 continue
@@ -612,13 +602,32 @@ def poll_merged_prs_for_roles(
             stored += 1
             if not info.get("files_fetched", True):
                 files_skipped += 1
-            uid = info["user_id"]
-            entry = affected_authors.setdefault(
-                uid,
-                {"user_id": uid, "login": info["login"], "pulls": []},
-            )
-            entry["login"] = info["login"]
-            entry["pulls"].append({"number": info["number"], "merged_at": info["merged_at"]})
+            if info["merged_at"] >= window_start_iso:
+                uid = info["user_id"]
+                entry = affected_authors.setdefault(
+                    uid,
+                    {"user_id": uid, "login": info["login"], "pulls": []},
+                )
+                entry["login"] = info["login"]
+                entry["pulls"].append({"number": info["number"], "merged_at": info["merged_at"]})
+
+        # Also evaluate already-stored PR authors from the rolling 7-day window (never older history)
+        # so contributors who joined Discord within a few days of merging still get matched & graded.
+        for row in store.all_pull_authors(repo, merged_since=window_start_iso):
+            uid = row["github_user_id"]
+            if uid in affected_authors:
+                continue
+            login = row["github_login"]
+            if _is_excluded_author(
+                login,
+                "User",
+                "",
+                config.maintainer_logins,
+                org_members=org_members,
+                org=org,
+            ):
+                continue
+            affected_authors[uid] = {"user_id": uid, "login": login, "pulls": []}
 
         if not rate_limited and not timed_out:
             store.set_roles_meta(_checkpoint_key(repo), moment_iso, moment_iso)
@@ -916,37 +925,6 @@ def run_daily_roles_if_due(
             result.stored,
             result.roles_granted,
         )
-        if not force and poll_fn is None and has_pending_backfill(config, store):
-            backfill_kwargs = {
-                k: v for k, v in poll_kwargs.items()
-                if k in {
-                    "search_merged_fn", "pull_fetcher", "files_fetcher",
-                    "count_fetcher", "org_members_fetcher", "members",
-                    "github_getter", "jev_transport", "haiku_complete",
-                    "rest_fetcher", "rest_searcher",
-                }
-            }
-            try:
-                bf = run_roles_backfill(
-                    config,
-                    store,
-                    guild=guild,
-                    loop=loop,
-                    now=moment,
-                    deadline_seconds=DAILY_BACKFILL_CHUNK_SECONDS,
-                    announce_summary=False,
-                    **backfill_kwargs,
-                )
-                if bf is not None:
-                    logging.info(
-                        "Daily run advanced resumable backfill: %d/%d windows done (completed=%s, roles_granted=%d)",
-                        bf.windows_done_total,
-                        bf.total_windows,
-                        bf.completed,
-                        bf.roles_granted,
-                    )
-            except Exception:
-                logging.exception("Daily resumable backfill chunk failed; will continue next run")
         return result
     finally:
         _roles_daily_lock.release()

@@ -166,14 +166,16 @@ Thresholds and path rules are in `contributor_bot/roles.py`. Defaults:
 Bots, `MAINTAINER_GITHUB_LOGINS`, GitHub org members, and BerriAI staff handles
 are ignored. Once a day at `ROLES_DAILY_TIME` (default `10:00`
 `America/Toronto`; on Fridays right after the weekly merge summary, and still
-running independently if the summary fails or skips), the bot checks all PRs
-merged since its SQLite checkpoint, stores their metadata (`number`, author,
-`merged_at`, labels, and changed file paths — fetching file lists only when
-still needed for Agent Builder or Provider Wizard), caches each author's
-lifetime merged PR `total_count` via one GitHub search
+running independently if the summary fails or skips), the bot checks PRs merged
+in the **rolling past 7 days** (not full history), stores their metadata
+(`number`, author, `merged_at`, labels, and changed file paths — fetching file
+lists only when still needed for Agent Builder or Provider Wizard), caches each
+author's lifetime merged PR `total_count` via one GitHub search
 (`repo:BerriAI/litellm is:pr is:merged author:<login>`) with incremental
-updates, resolves community PR authors to Discord members using the same
-automatic matcher as the weekly summary (`exact_login`, TypeSafe Jev,
+updates, resolves only those 7-day community PR authors to Discord members using
+the same automatic matcher as the weekly summary (matching a priority pool of
+members who joined in the past 7 days first, then falling back to the full
+member list only for unmatched authors; `exact_login`, TypeSafe Jev,
 deterministic fallback, cached in SQLite with a 30-day TTL — never assigning on
 ambiguous ties), grants newly earned roles, and **batches all new role
 announcements into a single message** (chunked only if needed, posting nothing
@@ -208,8 +210,9 @@ has that Discord role keeps it.
 4. **Historical backfill**: either set `ROLES_BACKFILL_ON_BOOT=true` for a
    one-time boot run, or have a moderator run `/roles-backfill` in Discord
    (ephemeral, newest-first so recent contributors get roles first, rate-limit
-   aware, time-bounded, and resumable across `/roles-backfill` and daily runs
-   via SQLite `backfill_windows` + cursor until all windows complete). Confirmed
+   aware, time-bounded, and resumable across `/roles-backfill` runs via SQLite
+   `backfill_windows` + cursor until all windows complete — full history is
+   never run by the daily job). Confirmed
    matches from the weekly merge summary (`github_discord_matches`) are reused
    directly without re-running the LLM. Backfill assigns roles silently and
    posts **at most a single summary line** to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`

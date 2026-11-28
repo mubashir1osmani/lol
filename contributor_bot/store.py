@@ -429,30 +429,53 @@ class Store:
             ).fetchall()
         return [_pull_dict(row) for row in rows]
 
-    def all_pull_authors(self, repository: str) -> list[dict]:
+    def all_pull_authors(self, repository: str, *, merged_since: str | None = None) -> list[dict]:
         """Return distinct PR authors stored for ``repository``, with latest login and PR count."""
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT
-                    github_user_id,
-                    (
-                        SELECT p2.github_login
-                        FROM merged_pull_requests p2
-                        WHERE p2.repository = p1.repository
-                          AND p2.github_user_id = p1.github_user_id
-                        ORDER BY p2.merged_at DESC, p2.number DESC
-                        LIMIT 1
-                    ) AS github_login,
-                    COUNT(*) AS pull_count,
-                    MAX(merged_at) AS last_merged_at
-                FROM merged_pull_requests p1
-                WHERE repository = ?
-                GROUP BY github_user_id
-                ORDER BY last_merged_at DESC, github_user_id DESC
-                """,
-                (repository,),
-            ).fetchall()
+            if merged_since:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        github_user_id,
+                        (
+                            SELECT p2.github_login
+                            FROM merged_pull_requests p2
+                            WHERE p2.repository = p1.repository
+                              AND p2.github_user_id = p1.github_user_id
+                            ORDER BY p2.merged_at DESC, p2.number DESC
+                            LIMIT 1
+                        ) AS github_login,
+                        COUNT(*) AS pull_count,
+                        MAX(merged_at) AS last_merged_at
+                    FROM merged_pull_requests p1
+                    WHERE repository = ? AND merged_at >= ?
+                    GROUP BY github_user_id
+                    ORDER BY last_merged_at DESC, github_user_id DESC
+                    """,
+                    (repository, merged_since),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        github_user_id,
+                        (
+                            SELECT p2.github_login
+                            FROM merged_pull_requests p2
+                            WHERE p2.repository = p1.repository
+                              AND p2.github_user_id = p1.github_user_id
+                            ORDER BY p2.merged_at DESC, p2.number DESC
+                            LIMIT 1
+                        ) AS github_login,
+                        COUNT(*) AS pull_count,
+                        MAX(merged_at) AS last_merged_at
+                    FROM merged_pull_requests p1
+                    WHERE repository = ?
+                    GROUP BY github_user_id
+                    ORDER BY last_merged_at DESC, github_user_id DESC
+                    """,
+                    (repository,),
+                ).fetchall()
         return [
             {
                 "github_user_id": int(row["github_user_id"]),
@@ -851,15 +874,26 @@ class Store:
             )
             self._conn.commit()
 
-    def all_confirmed_matches(self) -> list[dict]:
+    def all_confirmed_matches(self, *, matched_since: str | None = None) -> list[dict]:
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
-                FROM github_discord_matches
-                ORDER BY github_login
-                """
-            ).fetchall()
+            if matched_since:
+                rows = self._conn.execute(
+                    """
+                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                    FROM github_discord_matches
+                    WHERE matched_at >= ?
+                    ORDER BY github_login
+                    """,
+                    (matched_since,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT github_login, github_user_id, discord_id, method, confidence, matched_at
+                    FROM github_discord_matches
+                    ORDER BY github_login
+                    """
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def confirmed_match_for_discord(self, discord_id: str) -> dict | None:
