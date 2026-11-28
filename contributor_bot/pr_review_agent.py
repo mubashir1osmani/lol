@@ -91,7 +91,7 @@ def handle_routed_message(
 
 def handle_thread_followup(config: Config, store: Store, message: dict) -> None:
     """Entry point for a follow-up or recheck message inside an existing review thread."""
-    from .review_job import handle_thread_message
+    from .review_job import handle_thread_message, rehydrate_review_thread
 
     channel_id = str(message.get("channel_id") or "")
     author = message.get("author") or {}
@@ -101,7 +101,18 @@ def handle_thread_followup(config: Config, store: Store, message: dict) -> None:
         rec for rec in (store.review_threads_by_discord(channel_id) if is_discord_id(channel_id) else [])
         if rec["repository"].lower() == config.github_repository.lower()
     ]
+    if not records and is_discord_id(channel_id):
+        records = rehydrate_review_thread(
+            config,
+            store,
+            channel_id,
+            parent_id=str(message.get("parent_id") or "") or None,
+        )
     if not records:
+        logging.info(
+            "Skipping message in thread %s: no review_threads record and could not rehydrate from Discord history",
+            channel_id or "unknown",
+        )
         return
     numbers = [int(rec["number"]) for rec in records]
     primary = numbers[0]

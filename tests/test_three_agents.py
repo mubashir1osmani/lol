@@ -1334,5 +1334,247 @@ class LensObservabilityParityTests(unittest.TestCase):
         self.assertIn("support_skipped", dict(_span_events(agent_spans[2])))
 
 
+class PRReviewThreadRehydrationAndRecheckTests(unittest.TestCase):
+    """Tests for post-deploy SQLite wipe resilience: review_threads rehydration
+    in recover_pending_reviews() and handle_thread_message(), @Aria re-review
+    mentions, expanded wants_recheck() phrases, and ROLES_DB_PATH config.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "state.db")
+        self.store = Store(self.db_path)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_recover_pending_reviews_rehydrates_review_threads_when_skipping_existing_bot_review(self) -> None:
+        from contributor_bot import review_job
+
+        config = _base_config(
+            self.db_path,
+            pr_review_enabled=True,
+            review_channel_ids=("1391835163780186154",),
+        )
+        now = datetime(2026, 11, 28, 15, 0, 0, tzinfo=UTC)
+        starter_id = "1576292666428104857"
+        channel_messages = [
+            {
+                "id": starter_id,
+                "timestamp": "2026-11-28T13:10:00+00:00",
+                "author": {"id": "222000000000000001", "bot": False},
+                "content": (
+                    "please review https://github.com/BerriAI/litellm/pull/54805 "
+                    "and https://github.com/BerriAI/litellm/pull/54852"
+                ),
+                "thread": {"id": starter_id},
+            },
+        ]
+        thread_messages = [
+            {
+                "id": "1576293000000000001",
+                "timestamp": "2026-11-28T13:15:00+00:00",
+                "author": {"id": "999999999999999999", "bot": True},
+                "content": "#54805 needs work\n- missing unit test",
+            },
+            {
+                "id": "1576293000000000002",
+                "timestamp": "2026-11-28T13:20:00+00:00",
+                "author": {"id": "999999999999999999", "bot": True},
+                "content": "#54852 looks good",
+            },
+        ]
+
+        def fake_fetch_recent(target_id: str, _token: str, limit: int = 50) -> list[dict]:
+            if target_id == "1391835163780186154":
+                return list(channel_messages)
+            if target_id == starter_id:
+                return list(thread_messages)
+            return []
+
+        with mock.patch.object(review_job, "fetch_recent_messages", side_effect=fake_fetch_recent):
+            queued = review_job.recover_pending_reviews(config, self.store, now=now)
+
+        # Must NOT duplicate reviews that already exist in Discord.
+        self.assertEqual(queued, [])
+        # Both PRs must now be rehydrated in review_threads!
+        rec_54805 = self.store.review_thread("BerriAI/litellm", 54805)
+        rec_54852 = self.store.review_thread("BerriAI/litellm", 54852)
+        self.assertIsNotNone(rec_54805)
+        self.assertIsNotNone(rec_54852)
+        self.assertEqual(rec_54805["thread_id"], starter_id)
+        self.assertEqual(rec_54805["channel_id"], "1391835163780186154")
+        self.assertEqual(rec_54805["message_id"], starter_id)
+        self.assertEqual(rec_54805["last_reviewed_at"], "2026-11-28T13:15:00+00:00")
+        self.assertEqual(rec_54852["thread_id"], starter_id)
+        self.assertEqual(rec_54852["last_reviewed_at"], "2026-11-28T13:20:00+00:00")
+
+    def test_handle_thread_message_rehydrates_from_starter_and_handles_aria_mention(self) -> None:
+        from contributor_bot import review_job
+
+        config = _base_config(
+            self.db_path,
+            pr_review_enabled=True,
+            review_channel_ids=("1391835163780186154",),
+            discord_application_id="999999999999999999",
+        )
+        thread_id = "1576292666428104857"
+        starter_msg = {
+            "id": thread_id,
+            "timestamp": "2026-11-27T10:00:00+00:00",
+            "author": {"id": "222000000000000001", "bot": False},
+            "content": (
+                "please review https://github.com/BerriAI/litellm/pull/54805 "
+                "and https://github.com/BerriAI/litellm/pull/54852"
+            ),
+        }
+        bot_messages = [
+            {
+                "id": "1576293000000000010",
+                "timestamp": "2026-11-27T10:05:00+00:00",
+                "author": {"id": "999999999999999999", "bot": True},
+                "content": "#54805 needs work\n- add a test",
+            },
+        ]
+        reviewed: list[tuple[int, str]] = []
+
+        with (
+            mock.patch.object(
+                review_job,
+                "fetch_channel",
+                return_value={"id": thread_id, "parent_id": "1391835163780186154", "name": "pr #54805 review"},
+            ),
+            mock.patch.object(review_job, "fetch_message", return_value=starter_msg),
+            mock.patch.object(review_job, "fetch_recent_messages", return_value=bot_messages),
+            mock.patch.object(review_job, "acknowledge_message"),
+            mock.patch.object(
+                review_job,
+                "perform_review",
+                side_effect=lambda _cfg, _st, num, **kw: reviewed.append((num, kw.get("source", ""))),
+            ),
+        ):
+            # DB is completely empty (simulating deploy wipe), and user @mentions Aria inside the thread!
+            pr_review_agent.handle_thread_followup(
+                config,
+                self.store,
+                {
+                    "id": "1576300000000000001",
+                    "channel_id": thread_id,
+                    "author": {"id": "222000000000000001", "bot": False},
+                    "content": "<@999999999999999999> can you look at #54805?",
+                    "mentions": [{"id": "999999999999999999", "bot": True, "username": "Aria"}],
+                },
+            )
+
+        # Store rehydrated for BOTH PRs, and @Aria mention triggered re-review for #54805!
+        self.assertEqual([r["number"] for r in self.store.review_threads_by_discord(thread_id)], [54805, 54852])
+        self.assertEqual(reviewed, [(54805, "recheck")])
+
+    def test_handle_thread_message_rehydrates_from_bot_messages_when_starter_unavailable_and_logs_unknown_skip(self) -> None:
+        from contributor_bot import review_job
+
+        config = _base_config(
+            self.db_path,
+            pr_review_enabled=True,
+            review_channel_ids=("1391835163780186154",),
+        )
+        thread_id = "1576292666428104900"
+        bot_only_messages = [
+            {
+                "id": "1576293000000000020",
+                "timestamp": "2026-11-27T11:00:00+00:00",
+                "author": {"id": "999999999999999999", "bot": True},
+                "content": "needs work on #54852 - please add error handling",
+            },
+        ]
+        reviewed: list[tuple[int, str]] = []
+
+        with (
+            mock.patch.object(
+                review_job,
+                "fetch_channel",
+                return_value={"id": thread_id, "parent_id": "1391835163780186154"},
+            ),
+            mock.patch.object(review_job, "fetch_message", side_effect=RuntimeError("HTTP 404")),
+            mock.patch.object(review_job, "fetch_recent_messages", return_value=bot_only_messages),
+            mock.patch.object(review_job, "acknowledge_message"),
+            mock.patch.object(
+                review_job,
+                "perform_review",
+                side_effect=lambda _cfg, _st, num, **kw: reviewed.append((num, kw.get("source", ""))),
+            ),
+        ):
+            review_job.handle_thread_message(
+                config,
+                self.store,
+                {
+                    "id": "1576300000000000002",
+                    "channel_id": thread_id,
+                    "author": {"id": "222000000000000001", "bot": False},
+                    "content": "@Aria review again",
+                },
+            )
+
+        self.assertEqual([r["number"] for r in self.store.review_threads_by_discord(thread_id)], [54852])
+        self.assertEqual(reviewed, [(54852, "recheck")])
+
+        # Completely unrelated thread that cannot be rehydrated: logs INFO skip and does not review.
+        unknown_thread_id = "1576292666428104999"
+        with (
+            mock.patch.object(review_job, "fetch_channel", return_value={"id": unknown_thread_id, "parent_id": "999999"}),
+            mock.patch.object(review_job, "fetch_message", return_value={"id": unknown_thread_id, "content": "random chat"}),
+            mock.patch.object(review_job, "fetch_recent_messages", return_value=[]),
+            mock.patch.object(review_job, "perform_review") as mock_review,
+            self.assertLogs(level="INFO") as cm,
+        ):
+            review_job.handle_thread_message(
+                config,
+                self.store,
+                {
+                    "id": "1576300000000000003",
+                    "channel_id": unknown_thread_id,
+                    "author": {"id": "222000000000000001", "bot": False},
+                    "content": "just chatting",
+                },
+            )
+        mock_review.assert_not_called()
+        self.assertTrue(any(unknown_thread_id in line and "Skipping" in line for line in cm.output))
+
+    def test_wants_recheck_matches_review_again_and_rereview_variants(self) -> None:
+        from contributor_bot.reviews import wants_recheck
+
+        for phrase in (
+            "review again",
+            "review it again",
+            "please review again",
+            "re-review",
+            "rereview",
+            "Can you please review it again?",
+            "pushed updates, re-review when ready",
+            "check again",
+            "recheck",
+            "fixed it",
+        ):
+            self.assertTrue(wants_recheck(phrase), f"Expected wants_recheck({phrase!r}) to be True")
+
+        for non_recheck in (
+            "thanks for the review!",
+            "what does this failure mean?",
+            "sounds good",
+        ):
+            self.assertFalse(wants_recheck(non_recheck), f"Expected wants_recheck({non_recheck!r}) to be False")
+
+    def test_roles_db_path_env_config_and_default(self) -> None:
+        base_env = {
+            "DISCORD_BOT_TOKEN": "tok",
+            "OSS_CONTRIBUTIONS_CHANNEL_ID": "111",
+            "ANNOUNCEMENTS_CHANNEL_ID": "222",
+        }
+        self.assertEqual(get_config(base_env).roles_db_path, ".data/contributor_roles.db")
+        custom = get_config(base_env | {"ROLES_DB_PATH": "/opt/render/project/src/.data/custom.db"})
+        self.assertEqual(custom.roles_db_path, "/opt/render/project/src/.data/custom.db")
+
+
 if __name__ == "__main__":
     unittest.main()

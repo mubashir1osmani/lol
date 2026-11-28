@@ -227,7 +227,8 @@ class Gateway:
             except Exception:
                 logging.exception("Could not record PR link poster from message")
             try:
-                payload = _message_payload(message, loop=self.loop)
+                bot_uid = str(client.user.id) if getattr(client, "user", None) and getattr(client.user, "id", None) else None
+                payload = _message_payload(message, loop=self.loop, bot_user_id=bot_uid)
             except Exception:
                 logging.exception("Could not read a Discord message")
                 return
@@ -595,7 +596,7 @@ def message_is_thread(message, store: Store | None) -> bool:
     return store.review_thread_by_discord(channel_id) is not None
 
 
-def _message_payload(message, *, loop=None) -> dict:
+def _message_payload(message, *, loop=None, bot_user_id: str | None = None) -> dict:
     author = message.author
     payload = {
         "id": str(message.id),
@@ -605,6 +606,25 @@ def _message_payload(message, *, loop=None) -> dict:
         "author": {"id": str(author.id), "bot": bool(author.bot)},
         "channel_id": message_channel_id(message),
     }
+    channel = getattr(message, "channel", None)
+    parent_id = getattr(channel, "parent_id", None) if channel is not None else None
+    if parent_id:
+        payload["parent_id"] = str(parent_id)
+    mentions = []
+    for mentioned in getattr(message, "mentions", None) or ():
+        uid = getattr(mentioned, "id", None)
+        if uid is None:
+            continue
+        mentions.append({
+            "id": str(uid),
+            "bot": bool(getattr(mentioned, "bot", False)),
+            "username": str(getattr(mentioned, "name", "") or ""),
+            "global_name": str(getattr(mentioned, "global_name", "") or ""),
+        })
+    if mentions:
+        payload["mentions"] = mentions
+    if bot_user_id:
+        payload["bot_user_id"] = str(bot_user_id)
     guild = getattr(message, "guild", None)
     if guild is not None:
         guild_id = getattr(guild, "id", None)
