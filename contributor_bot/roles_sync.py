@@ -1292,15 +1292,39 @@ def run_daily_roles_if_due(
             run_date,
             local.strftime("%Y-%m-%d %H:%M %Z"),
         )
+        from contextlib import nullcontext
+        from .tracing import AGENT_ENGAGEMENT, agent_span, current_agent_name
+
         runner = poll_fn or poll_merged_prs_for_roles
-        result = runner(
-            config,
-            store,
-            guild=guild,
-            loop=loop,
-            now=moment,
-            **poll_kwargs,
+        eng_cm = (
+            agent_span(
+                AGENT_ENGAGEMENT,
+                session_id=f"{AGENT_ENGAGEMENT}:daily_roles:{repo}:{run_date}",
+                input_value={"task": "daily_roles", "repository": repo, "run_date": run_date, "force": force},
+                attributes={
+                    "engagement.task": "daily_roles",
+                    "engagement.repository": repo,
+                    "roles.announce_enabled": bool(config.roles_announce_enabled),
+                },
+            )
+            if current_agent_name() is None
+            else nullcontext()
         )
+        with eng_cm as eng_span:
+            result = runner(
+                config,
+                store,
+                guild=guild,
+                loop=loop,
+                now=moment,
+                **poll_kwargs,
+            )
+            if eng_span is not None and result is not None:
+                eng_span.set_output({
+                    "discovered": result.discovered,
+                    "stored": result.stored,
+                    "roles_granted": result.roles_granted,
+                })
         if result is None:
             return None
         if result.rate_limited or result.timed_out:
@@ -2031,12 +2055,32 @@ def revalidate_all_grants_on_boot(
                         reason = "not_in_top5_candidates"
                     elif llm_complete is not None or _has_llm_credentials():
                         try:
-                            llm_res = _select_with_llm(
-                                config,
-                                profile,
-                                candidates,
-                                llm_complete=llm_complete,
+                            from contextlib import nullcontext
+                            from .tracing import AGENT_ENGAGEMENT, OPENINFERENCE_SPAN_KIND_CHAIN, agent_span, child_span, current_agent_name
+
+                            outer_cm = (
+                                agent_span(
+                                    AGENT_ENGAGEMENT,
+                                    session_id=f"{AGENT_ENGAGEMENT}:revalidate_grants:{repo}:{moment.date().isoformat()}",
+                                    input_value={"task": "revalidate_grants", "repository": repo, "github_login": login},
+                                    attributes={"engagement.task": "revalidate_grants", "engagement.repository": repo},
+                                )
+                                if current_agent_name() is None
+                                else nullcontext()
                             )
+                            with outer_cm:
+                                with child_span(
+                                    "role_matcher",
+                                    kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+                                    input_value={"github_login": login, "discord_id": discord_id},
+                                ) as rspan:
+                                    llm_res = _select_with_llm(
+                                        config,
+                                        profile,
+                                        candidates,
+                                        llm_complete=llm_complete,
+                                    )
+                                    rspan.set_output({"selected": llm_res.discord_id, "confidence": llm_res.confidence})
                             if _llm_selection_accepted(llm_res) and llm_res.discord_id == discord_id:
                                 passed = True
                                 reason = f"llm_verified:conf={llm_res.confidence:.2f},signals={len(llm_res.evidence)}"

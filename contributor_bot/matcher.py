@@ -2539,10 +2539,10 @@ def _select_with_llm(
         raw = llm_complete(model, messages)
     else:
         from .review_llm import complete_litellm
-        from .tracing import build_trace_metadata
+        from .tracing import AGENT_ENGAGEMENT, build_trace_metadata
         metadata = build_trace_metadata(
-            "role_matcher",
-            session_id=f"role_matcher:{profile.login}",
+            AGENT_ENGAGEMENT,
+            session_id=f"{AGENT_ENGAGEMENT}:role_matcher:{profile.login}",
             extra={"github_login": profile.login},
         )
         raw = complete_litellm(model, messages, timeout=timeout, metadata=metadata)
@@ -3397,55 +3397,78 @@ def match_community_contributors_with_diagnostics(
     sleep_fn=time.sleep,
 ) -> tuple[list[dict], int, list[MatchDetail], MatchDiagnostics]:
     """Resolve community PR authors to LiteLLM Discord guild members with diagnostics."""
-    from .tracing import agent_span
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_ENGAGEMENT,
+        OPENINFERENCE_SPAN_KIND_CHAIN,
+        agent_span,
+        child_span,
+        current_agent_name,
+    )
 
     moment = now or datetime.now(UTC)
     repo = getattr(config, "github_repository", "") or "repo"
     logins_preview = [str(g.get("login") or "") for g in groups[:50] if g.get("login")]
-    with agent_span(
-        "role_matcher",
-        session_id=f"role_matcher:{repo}:{moment.date().isoformat()}",
-        input_value={
-            "repository": repo,
-            "contributor_count": len(groups),
-            "logins": logins_preview,
-        },
-        attributes={
-            "matcher.repository": repo,
-            "matcher.contributor_count": len(groups),
-        },
-    ) as span:
-        matched_groups, skipped_count, details, diagnostics = _match_community_contributors_with_diagnostics_impl(
-            groups,
-            config,
-            store,
-            guild=guild,
-            loop=loop,
-            now=moment,
-            members=members,
-            github_getter=github_getter,
-            graphql_caller=graphql_caller,
-            llm_complete=llm_complete,
-            jev_transport=jev_transport,
-            haiku_complete=haiku_complete,
-            rest_fetcher=rest_fetcher,
-            rest_searcher=rest_searcher,
-            message_searcher=message_searcher,
-            allow_live_message_search=allow_live_message_search,
-            skip_github_enrichment=skip_github_enrichment,
-            deadline=deadline,
-            recent_poster_ids=recent_poster_ids,
-            org_members=org_members,
-            sleep_fn=sleep_fn,
+    input_payload = {
+        "repository": repo,
+        "contributor_count": len(groups),
+        "logins": logins_preview,
+    }
+    span_attrs = {
+        "matcher.repository": repo,
+        "matcher.contributor_count": len(groups),
+    }
+    outer_cm = (
+        agent_span(
+            AGENT_ENGAGEMENT,
+            session_id=f"{AGENT_ENGAGEMENT}:role_matcher:{repo}:{moment.date().isoformat()}",
+            input_value=input_payload,
+            attributes=span_attrs,
         )
-        span.set_output({
-            "matched": diagnostics.matched_count,
-            "skipped": diagnostics.skipped_count,
-            "methods": dict(diagnostics.method_counts),
-            "skip_reasons": dict(diagnostics.skip_reasons),
-            "llm_source": diagnostics.llm_source,
-        })
-        return matched_groups, skipped_count, details, diagnostics
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        with child_span(
+            "role_matcher",
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=input_payload,
+            attributes=span_attrs,
+        ) as span:
+            matched_groups, skipped_count, details, diagnostics = _match_community_contributors_with_diagnostics_impl(
+                groups,
+                config,
+                store,
+                guild=guild,
+                loop=loop,
+                now=moment,
+                members=members,
+                github_getter=github_getter,
+                graphql_caller=graphql_caller,
+                llm_complete=llm_complete,
+                jev_transport=jev_transport,
+                haiku_complete=haiku_complete,
+                rest_fetcher=rest_fetcher,
+                rest_searcher=rest_searcher,
+                message_searcher=message_searcher,
+                allow_live_message_search=allow_live_message_search,
+                skip_github_enrichment=skip_github_enrichment,
+                deadline=deadline,
+                recent_poster_ids=recent_poster_ids,
+                org_members=org_members,
+                sleep_fn=sleep_fn,
+            )
+            out_payload = {
+                "matched": diagnostics.matched_count,
+                "skipped": diagnostics.skipped_count,
+                "methods": dict(diagnostics.method_counts),
+                "skip_reasons": dict(diagnostics.skip_reasons),
+                "llm_source": diagnostics.llm_source,
+            }
+            span.set_output(out_payload)
+            if outer_span is not None:
+                outer_span.set_output(out_payload)
+            return matched_groups, skipped_count, details, diagnostics
 
 
 def _match_community_contributors_with_diagnostics_impl(

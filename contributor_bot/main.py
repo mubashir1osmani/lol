@@ -220,6 +220,7 @@ def start_contributor_roles(config):
         config.contributor_roles_enabled
         or config.pr_review_enabled
         or config.pr_board_enabled
+        or config.support_agent_enabled
         or (config.merged_weekly_enabled and bool(config.discord_guild_id))
     )
     if not features and not os.environ.get("PORT", "").strip():
@@ -278,6 +279,18 @@ def start_contributor_roles(config):
             "PR review agent is on for %s using %s. It only posts in Discord.",
             ", ".join(config.review_channel_ids), config.review_model,
         )
+    if config.support_agent_enabled:
+        if config.support_agent_channel_ids:
+            logging.info(
+                "Support agent is on for channels %s (KB refresh every %dh).",
+                ", ".join(config.support_agent_channel_ids),
+                config.support_kb_refresh_hours,
+            )
+        else:
+            logging.warning(
+                "SUPPORT_AGENT_ENABLED=true but SUPPORT_AGENT_CHANNEL_IDS is empty; "
+                "support_agent will stay quiet until channels are allowlisted."
+            )
     if config.contributor_roles_enabled:
         if not config.roles_announce_enabled:
             logging.info("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); roles will be granted silently")
@@ -287,7 +300,11 @@ def start_contributor_roles(config):
 
 
 def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> None:
+    from .pr_review_agent import poll_review_thread_lifecycle
+    from .support_agent import refresh_knowledge_base
+
     reviews = bool(config.pr_review_enabled and store is not None)
+    support_kb = bool(config.support_agent_enabled and store is not None)
     weekly_watchdog = bool(config.merged_weekly_enabled and store is not None)
     roles_daily = bool(config.contributor_roles_enabled and store is not None)
     pr_board_sync = False
@@ -332,7 +349,7 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             "weekly posts run only via the Friday %s %s summary scheduler.",
             config.merged_time, config.merged_timezone,
         )
-    if not reviews and not weekly_watchdog and not pr_board_sync and not roles_daily:
+    if not reviews and not support_kb and not weekly_watchdog and not pr_board_sync and not roles_daily:
         if not config.announcements_enabled:
             logging.info("Automatic announcements are paused (ANNOUNCEMENTS_ENABLED=false).")
         stop_event.wait()
@@ -346,6 +363,8 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
             logging.exception("Boot PR review recovery failed")
     first_tick = True
     next_board_sync = 0.0
+    next_lifecycle_poll = 0.0
+    next_kb_refresh = 0.0
     boot_backfill_started = False
     while not stop_event.is_set():
         gateway_live = gateway is not None and gateway.connected.is_set()
@@ -359,6 +378,18 @@ def _run_loop(config, stop_event: threading.Event, store=None, gateway=None) -> 
                 poll_review_channels(config, store)
             except Exception:
                 logging.exception("PR review poll failed")
+        if reviews and time.monotonic() >= next_lifecycle_poll:
+            next_lifecycle_poll = time.monotonic() + float(config.review_lifecycle_poll_seconds)
+            try:
+                poll_review_thread_lifecycle(config, store)
+            except Exception:
+                logging.exception("PR review thread lifecycle poll failed")
+        if support_kb and time.monotonic() >= next_kb_refresh:
+            next_kb_refresh = time.monotonic() + 3600.0
+            try:
+                refresh_knowledge_base(config, store)
+            except Exception:
+                logging.exception("Support KB refresh failed")
         # Give a freshly started gateway one brief cycle to connect and use its
         # cached guild member list; thereafter run a 60s watchdog regardless so
         # a dead gateway or stopped tasks.loop can never silence scheduled jobs.

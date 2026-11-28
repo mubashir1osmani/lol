@@ -131,6 +131,11 @@ class Config:
     pr_board_status_field: str = "Status"
     roles_daily_time: str = "10:00"
     roles_backfill_on_boot: bool = False
+    support_agent_enabled: bool = False
+    support_agent_channel_ids: tuple[str, ...] = ()
+    support_agent_model: str = ""
+    support_kb_refresh_hours: int = 12
+    review_lifecycle_poll_seconds: int = 600
 
     @property
     def github_oauth_enabled(self) -> bool:
@@ -235,6 +240,13 @@ def get_config(env: dict[str, str] | None = None) -> Config:
     match_model = values.get("MATCH_MODEL", "").strip()
     if match_model and not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", match_model):
         raise ValueError("MATCH_MODEL must be a LiteLLM model name, like anthropic/claude-sonnet-4-5")
+    support_enabled = _flag(values, "SUPPORT_AGENT_ENABLED", False)
+    support_channels = _optional_channel_ids(values, "SUPPORT_AGENT_CHANNEL_IDS")
+    support_model = values.get("SUPPORT_AGENT_MODEL", "").strip()
+    if support_model and not re.fullmatch(r"[A-Za-z0-9_./:+-]{1,200}", support_model):
+        raise ValueError("SUPPORT_AGENT_MODEL must be a LiteLLM model name, like anthropic/claude-haiku-4-5")
+    support_kb_refresh_hours = _bounded_int(values, "SUPPORT_KB_REFRESH_HOURS", 12, 1, 168)
+    review_lifecycle_poll_seconds = _bounded_int(values, "REVIEW_LIFECYCLE_POLL_SECONDS", 600, 60, 86400)
 
     return Config(
         discord_token=token,
@@ -313,6 +325,11 @@ def get_config(env: dict[str, str] | None = None) -> Config:
         pr_board_status_field=board_status_field,
         roles_daily_time="10:00" if role_settings is None else role_settings["roles_daily_time"],
         roles_backfill_on_boot=False if role_settings is None else role_settings["roles_backfill_on_boot"],
+        support_agent_enabled=support_enabled,
+        support_agent_channel_ids=support_channels,
+        support_agent_model=support_model,
+        support_kb_refresh_hours=support_kb_refresh_hours,
+        review_lifecycle_poll_seconds=review_lifecycle_poll_seconds,
     )
 
 
@@ -378,6 +395,20 @@ def _optional_discord_id(values: dict[str, str], name: str) -> str | None:
     if not is_discord_id(raw):
         raise ValueError(f"{name} must be a Discord ID")
     return raw
+
+
+def _optional_channel_ids(values: dict[str, str], name: str) -> tuple[str, ...]:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return ()
+    channels = [part.strip() for part in raw.split(",") if part.strip()]
+    if any(not is_discord_id(channel) for channel in channels):
+        raise ValueError(f"{name} must be comma-separated Discord channel IDs")
+    ordered: list[str] = []
+    for channel in channels:
+        if channel not in ordered:
+            ordered.append(channel)
+    return tuple(ordered)
 
 
 def _logins(values: dict[str, str], name: str) -> tuple[str, ...]:

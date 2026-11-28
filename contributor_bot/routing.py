@@ -192,17 +192,23 @@ def decide(config, text: str, *, channel: str = "", context: str = "", transport
         "context": (context or "")[:500],
         "message": (text or "")[:1500],
     })
-    from .tracing import agent_span
+    from contextlib import nullcontext
+    from .tracing import OPENINFERENCE_SPAN_KIND_CHAIN, child_span, current_agent_name
 
     api_key = os.environ.get("TYPESAFE_API_KEY", "").strip() or getattr(config, "typesafe_api_key", None)
     model = getattr(config, "review_decision_model", None) or "jev-latest"
     threshold = float(getattr(config, "decision_reply_threshold", 0.7) or 0.7)
-    with agent_span(
-        "message_router",
-        session_id=f"message_router:{channel or 'unknown'}",
-        input_value={"channel": channel, "message": (text or "")[:800]},
-        attributes={"discord.channel": str(channel)},
-    ) as span:
+    span_cm = (
+        child_span(
+            "message_router",
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value={"channel": channel, "message": (text or "")[:800]},
+            attributes={"discord.channel": str(channel)},
+        )
+        if current_agent_name() is not None
+        else nullcontext()
+    )
+    with span_cm as span:
         if api_key or transport is not None:
             try:
                 payload = call_jev(model, state, api_key or "", transport)
@@ -212,13 +218,14 @@ def decide(config, text: str, *, channel: str = "", context: str = "", transport
                 decision = _haiku_decision(config, text)
         else:
             decision = _haiku_decision(config, text)
-        span.set_output({
-            "reply": decision.reply,
-            "route": decision.route,
-            "tier": decision.tier,
-            "source": decision.source,
-            "reason": decision.reason,
-        })
+        if span is not None:
+            span.set_output({
+                "reply": decision.reply,
+                "route": decision.route,
+                "tier": decision.tier,
+                "source": decision.source,
+                "reason": decision.reason,
+            })
     logging.info(
         "Decision should_reply=%s route=%s model=%s source=%s cost_usd=%.8f",
         decision.reply, decision.route, decision.model_id or model, decision.source, decision.cost_usd,
@@ -235,14 +242,14 @@ def _haiku_decision(config, text: str, complete=None) -> Decision:
     if complete is None:
         try:
             from .review_llm import complete_litellm
-            from .tracing import build_trace_metadata
+            from .tracing import AGENT_SUPPORT, build_trace_metadata, current_agent_name
             raw = complete_litellm(
                 model,
                 [
                     {"role": "system", "content": "Reply with JSON only: {\"reply\": true|false, \"route\": \"simple_qa|pr_review|bug_report|maintainer_only\", \"reason\": \"short\"}"},
                     {"role": "user", "content": (text or "")[:800]},
                 ],
-                metadata=build_trace_metadata("message_router"),
+                metadata=build_trace_metadata(current_agent_name() or AGENT_SUPPORT),
             )
         except Exception as error:
             logging.warning("Haiku decision fallback failed: %s", error)

@@ -179,6 +179,7 @@ def _github_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(check_run + r"/annotations", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/contents(?:/[^/]+)+", path)
         or re.fullmatch(rf"/repos/{_OWNER_REPO}/pulls", path)
+        or re.fullmatch(rf"/repos/{_OWNER_REPO}/releases", path)
         or re.fullmatch(r"/orgs/[A-Za-z0-9._-]+/public_members", path)
         or re.fullmatch(r"/users/[A-Za-z0-9-]+", path)
         or path in {"/search/issues", "/search/code", "/user"}
@@ -241,6 +242,28 @@ def _discord_request_allowed(method: str, path: str) -> bool:
     ) is not None
 
 
+_DOCS_KB_PATHS = frozenset({
+    "/llms.txt",
+    "/blog/rss.xml",
+    "/blog/atom.xml",
+})
+_DOCS_MARKDOWN_PATH = re.compile(r"/docs/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.md")
+
+
+def docs_kb_url_allowed(url: str) -> bool:
+    """Allow read-only LiteLLM documentation KB endpoints on docs.litellm.ai."""
+    parts = urlsplit(url or "")
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "docs.litellm.ai"
+        or parts.query
+        or parts.fragment
+        or any(segment in {".", ".."} for segment in parts.path.split("/"))
+    ):
+        return False
+    return parts.path in _DOCS_KB_PATHS or _DOCS_MARKDOWN_PATH.fullmatch(parts.path) is not None
+
+
 def _validate_request(request: Request) -> None:
     """Defense in depth, not a sandbox against malicious replacement code."""
     url = urlsplit(request.full_url)
@@ -258,8 +281,16 @@ def _validate_request(request: Request) -> None:
         # OAuth code exchange only. The browser, not this bot, opens the authorize page.
         allowed = method == "POST" and url.path == "/login/oauth/access_token" and not url.query
     elif url.netloc == "docs.litellm.ai":
-        allowed = (method == "GET" and not url.query and not request.has_header("Authorization")
-                   and (request.full_url == RELEASE_INDEX or release_url(request.full_url)))
+        allowed = (
+            method == "GET"
+            and not url.query
+            and not request.has_header("Authorization")
+            and (
+                request.full_url == RELEASE_INDEX
+                or release_url(request.full_url)
+                or docs_kb_url_allowed(request.full_url)
+            )
+        )
     elif url.netloc == "discord.com":
         allowed = _discord_request_allowed(method, url.path)
     elif url.netloc == "api.typesafe.ai":
@@ -537,6 +568,29 @@ def fetch_release_prs(url: str, repository: str) -> list[int]:
     if release_url(url) != url:
         raise ValueError("Only official LiteLLM release-note URLs are allowed")
     return parse_new_contributors(conditional_get(url, {}).decode("utf-8"), repository)
+
+
+def fetch_docs_text(url: str) -> str:
+    """Fetch a read-only LiteLLM docs KB resource (llms.txt, blog RSS, or .md doc)."""
+    if not docs_kb_url_allowed(url):
+        raise ValueError("Only approved docs.litellm.ai knowledge-base URLs are allowed")
+    return conditional_get(url, {"User-Agent": "litellm-contributor-discord-bot"}).decode("utf-8", errors="replace")
+
+
+def fetch_recent_releases(
+    repository: str,
+    token: str | None = None,
+    *,
+    limit: int = 10,
+) -> list[dict]:
+    """Fetch recent GitHub releases for ``repository`` (read-only)."""
+    per_page = max(1, min(int(limit), 30))
+    headers = github_headers(token)
+    raw = conditional_get(f"{GITHUB_API}/repos/{repository}/releases?per_page={per_page}", headers)
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
 
 
 def github_headers(token: str | None) -> dict[str, str]:

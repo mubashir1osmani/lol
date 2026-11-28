@@ -25,8 +25,10 @@ from .interactions import (
 )
 from .links_backfill import record_pr_links_from_message
 from .matcher import record_recent_poster
-from .review_job import handle_channel_message, handle_thread_message
+from .message_router import is_review_channel_allowed, route_and_dispatch_message
+from .pr_review_agent import handle_thread_followup
 from .store import Store
+from .support_agent import is_support_channel_allowed
 
 
 DEFAULT_BOT_STATUS_TEXT = "skedaddling 🏃‍♂️"
@@ -238,14 +240,15 @@ class Gateway:
                 if not is_thread:
                     is_thread = await asyncio.to_thread(message_is_thread, message, store)
                 if is_thread:
-                    _start_worker(handle_thread_message, (config, store, payload), "review-followup")
+                    _start_worker(handle_thread_followup, (config, store, payload), "review-followup")
                     return
             if channel_type not in {0, 5}:
                 return
-            in_review_channel = config.review_watch_all_channels or channel_id in config.review_channel_ids
-            if not (config.pr_review_enabled and in_review_channel) and not config.answers_enabled:
+            in_review_channel = is_review_channel_allowed(config, channel_id)
+            in_support_channel = is_support_channel_allowed(config, channel_id)
+            if not in_review_channel and not in_support_channel:
                 return
-            _start_worker(handle_channel_message, (config, store, channel_id, payload), "review-message")
+            _start_worker(route_and_dispatch_message, (config, store, channel_id, payload), "message-router")
 
         @client.event
         async def on_interaction(interaction):
@@ -329,8 +332,9 @@ def _start_weekly_task(discord, client, config, store):
     if store is None or (not config.merged_weekly_enabled and not roles_daily):
         return None
     from discord.ext import tasks
-    from .roles_sync import log_roles_daily_boot_status, run_daily_roles_if_due
-    from .weekly import log_weekly_boot_status, post_weekly_if_due
+    from .engagement_agent import run_daily_roles, run_weekly_summary
+    from .roles_sync import log_roles_daily_boot_status
+    from .weekly import log_weekly_boot_status
 
     @tasks.loop(seconds=60)
     async def merged_weekly_post():
@@ -343,12 +347,12 @@ def _start_weekly_task(discord, client, config, store):
         loop = asyncio.get_running_loop()
         if config.merged_weekly_enabled:
             try:
-                await asyncio.to_thread(post_weekly_if_due, config, store, guild=guild, loop=loop)
+                await asyncio.to_thread(run_weekly_summary, config, store, guild=guild, loop=loop)
             except Exception:
                 logging.exception("Weekly merge summary check failed; will retry on next tick")
         if roles_daily:
             try:
-                await asyncio.to_thread(run_daily_roles_if_due, config, store, guild=guild, loop=loop)
+                await asyncio.to_thread(run_daily_roles, config, store, guild=guild, loop=loop)
             except Exception:
                 logging.exception("Daily contributor roles check failed; will retry on next tick")
 

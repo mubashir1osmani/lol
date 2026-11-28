@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta
 
 from .ack import acknowledge_message
-from .routing import decide, explicit_review
+from .routing import explicit_review
 from .triggers import apply_triggers
 from .api import (
     TransientAPIError,
@@ -64,11 +64,18 @@ def _message_lock(channel_id: str, message_id: str) -> threading.Lock:
 
 
 def _spawn(target) -> None:
+    import contextvars
+    from .tracing import flush_tracing
+
+    ctx = contextvars.copy_context()
+
     def _runner() -> None:
         try:
-            target()
+            ctx.run(target)
         except Exception:
             logging.exception("Review worker failed")
+        finally:
+            flush_tracing()
 
     threading.Thread(target=_runner, name="pr-review", daemon=True).start()
 
@@ -506,7 +513,7 @@ def schedule_webhook_recheck(config: Config, store: Store, event: str, payload: 
 
 
 def _classify_complete(config: Config, system: str, text: str, *, session_id: str | None = None) -> str:
-    from .tracing import build_trace_metadata
+    from .tracing import AGENT_PR_REVIEW, build_trace_metadata
     model = config.review_classifier_model or config.review_model
     return complete_litellm(
         model,
@@ -514,7 +521,7 @@ def _classify_complete(config: Config, system: str, text: str, *, session_id: st
             {"role": "system", "content": system},
             {"role": "user", "content": text},
         ],
-        metadata=build_trace_metadata("pr_review_classifier", session_id=session_id),
+        metadata=build_trace_metadata(AGENT_PR_REVIEW, session_id=session_id),
     )
 
 
@@ -523,25 +530,46 @@ def message_decision(config: Config, message: dict) -> tuple[bool, list[int]]:
     if not config.review_classify:
         numbers = should_review_message(message, config.github_repository, require_ask=config.review_require_ask)
         return bool(numbers), numbers
-    from .tracing import agent_span
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_PR_REVIEW,
+        OPENINFERENCE_SPAN_KIND_CHAIN,
+        agent_span,
+        child_span,
+        current_agent_name,
+    )
 
     text = message.get("content") or ""
     channel_id = message.get("channel_id") or message.get("id") or ""
-    session_id = f"pr_review_classifier:{channel_id}" if channel_id else None
-    with agent_span(
-        "pr_review_classifier",
-        session_id=session_id,
-        input_value=text[:800],
-        attributes={"discord.channel_id": str(channel_id)},
-    ) as span:
-        asked = classify_review_request(
-            text,
-            config.github_repository,
-            complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
+    session_id = f"{AGENT_PR_REVIEW}:classifier:{channel_id}" if channel_id else None
+    outer_cm = (
+        agent_span(
+            AGENT_PR_REVIEW,
+            session_id=session_id,
+            input_value=text[:800],
+            attributes={"discord.channel_id": str(channel_id)},
         )
-        numbers = should_review_message(message, config.github_repository, require_ask=False) if asked else []
-        span.set_output({"asked": asked, "numbers": numbers})
-        return asked, numbers
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        with child_span(
+            "pr_review_classifier",
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=text[:800],
+            attributes={"discord.channel_id": str(channel_id)},
+        ) as span:
+            asked = classify_review_request(
+                text,
+                config.github_repository,
+                complete=lambda system, body: _classify_complete(config, system, body, session_id=session_id),
+            )
+            numbers = should_review_message(message, config.github_repository, require_ask=False) if asked else []
+            out = {"asked": asked, "numbers": numbers}
+            span.set_output(out)
+            if outer_span is not None:
+                outer_span.set_output(out)
+            return asked, numbers
 
 
 def _mentioned_numbers_in_thread(text: str, repository: str, records: list[dict]) -> list[dict]:
@@ -612,22 +640,14 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
     store.mark_followup(config.github_repository, number, iso(datetime.now(UTC)))
 
 
-def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
+def handle_review_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> dict:
+    """Process a Discord channel message already routed to ``pr_review_agent``."""
     message_id = str(message.get("id") or "")
-    if channel_id in config.review_channel_ids and is_discord_id(message_id):
-        try:
-            store.advance_review_cursor(channel_id, message_id)
-        except Exception:
-            logging.warning("Could not advance review cursor for channel %s", channel_id)
-    text = message.get("content") or ""
-    if not explicit_review(text, config.github_repository):
-        _answer_if_decided(config, channel_id, message)
-        return
     asked, numbers = message_decision(config, message)
     if asked and not numbers:
         _ack(config, channel_id, message_id, message)
         _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
-        return
+        return {"asked": True, "numbers": [], "prompted_for_url": True}
     planned = []
     for number in numbers:
         record = store.review_thread(config.github_repository, number)
@@ -638,7 +658,7 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
                 continue
         planned.append((number, record))
     if not planned:
-        return
+        return {"asked": asked, "numbers": numbers, "planned": []}
     now_iso = iso(datetime.now(UTC))
     if is_discord_id(channel_id) and is_discord_id(message_id):
         for number, record in planned:
@@ -670,37 +690,32 @@ def handle_channel_message(config: Config, store: Store, channel_id: str, messag
                 config, store, number, channel_id=channel_id, message_id=message_id, source="new",
             ),
         )
+    return {"asked": asked, "numbers": numbers, "planned": [n for n, _ in planned]}
+
+
+def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:
+    """Route a channel message through the single message router (PR review or support)."""
+    from .message_router import route_and_dispatch_message
+
+    route_and_dispatch_message(config, store, channel_id, message)
 
 
 def _answer_if_decided(config: Config, channel_id: str, message: dict) -> None:
-    """Jev (or Haiku) decides. Silence leaves the message for a maintainer."""
-    if not config.answers_enabled:
-        return
-    author = message.get("author") or {}
-    if author.get("bot") or message.get("webhook_id"):
-        return
-    decision = decide(
-        config,
-        message.get("content") or "",
-        channel=str(message.get("channel_name") or channel_id),
-    )
-    if not decision.reply:
-        return
-    _ack(config, channel_id, message.get("id"), message)
-    from .questions import answer_question
-    answer_question(
-        config, channel_id, message.get("content") or "",
-        complete=_routed_complete(config, decision.tier, session_id=channel_id),
-    )
+    """Delegate support Q&A to ``support_agent`` when enabled and allowlisted."""
+    from .support_agent import handle_routed_message as handle_support
+
+    handle_support(config, None, channel_id, message)
 
 
 def _routed_complete(config, tier, *, session_id):
     def complete(system, body):
         from .routing import complete_auto
+        from .tracing import AGENT_SUPPORT
+
         return complete_auto(config, [
             {"role": "system", "content": system},
             {"role": "user", "content": body},
-        ], session_id=session_id, tier=tier, agent="discord_qa")
+        ], session_id=session_id, tier=tier, agent=AGENT_SUPPORT)
     return complete
 
 

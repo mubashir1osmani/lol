@@ -837,16 +837,29 @@ _HANDLERS = {
 
 
 def execute_tool(ctx: ReviewContext, name: str, arguments: dict) -> str:
+    from .tracing import tool_span
+
     handler = _HANDLERS.get(name)
     if handler is None:
         return _json({"error": "unknown tool"})
-    try:
-        return handler(ctx, arguments or {})
-    except ValueError as error:
-        return _json({"error": str(error)})
-    except Exception as error:
-        logging.warning("Review tool %s failed for #%s: %s", name, ctx.number, error)
-        return _json({"error": "that tool failed. try another one or submit what you have."})
+    with tool_span(
+        name,
+        input_value=arguments or {},
+        attributes={"pr.number": int(ctx.number)},
+    ) as span:
+        try:
+            out = handler(ctx, arguments or {})
+            span.set_output(out[:1000] if isinstance(out, str) else out)
+            return out
+        except ValueError as error:
+            out = _json({"error": str(error)})
+            span.set_output(out)
+            return out
+        except Exception as error:
+            logging.warning("Review tool %s failed for #%s: %s", name, ctx.number, error)
+            out = _json({"error": "that tool failed. try another one or submit what you have."})
+            span.set_output(out)
+            return out
 
 
 def _is_context_error(error: BaseException) -> bool:
@@ -1176,14 +1189,14 @@ def _capable_model(config) -> str:
 
 def _run_sdk_session(ctx: ReviewContext, prompt: str, config) -> AgentResult:
     """One Agents SDK run. The model is the Autorouter's capable tier."""
-    from .tracing import build_sdk_trace_metadata, configure_litellm_tracing
+    from .tracing import AGENT_PR_REVIEW, build_sdk_trace_metadata, configure_litellm_tracing
     configure_litellm_tracing()
     sdk = _load_sdk()
     _configure_tracing(sdk, config)
     repo = getattr(config, "github_repository", "") or "BerriAI/litellm"
     trace_metadata = build_sdk_trace_metadata(
-        "pr_review",
-        session_id=f"pr_review:{repo}#{ctx.number}",
+        AGENT_PR_REVIEW,
+        session_id=f"{AGENT_PR_REVIEW}:{repo}#{ctx.number}",
         extra={"repository": repo, "pr_number": ctx.number, "thread_id": ctx.thread_id},
     )
     agent = sdk.Agent(
@@ -1270,7 +1283,14 @@ def _stamp(result: AgentResult, ctx: ReviewContext) -> AgentResult:
 
 def run_review_session(config, store, number: int, thread_id: str, *, mode: str, history: str = "") -> AgentResult:
     """Run the agent for one review or one follow-up question."""
-    from .tracing import agent_span
+    from contextlib import nullcontext
+    from .tracing import (
+        AGENT_PR_REVIEW,
+        OPENINFERENCE_SPAN_KIND_CHAIN,
+        agent_span,
+        child_span,
+        current_agent_name,
+    )
 
     ctx = ReviewContext(config=config, store=store, number=number, thread_id=thread_id)
     task = (
@@ -1286,53 +1306,69 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
     )
     if history.strip():
         task += "\n\nuntrusted discord history:\n" + _clip(history, 4000)
-    span_name = "pr_review" if mode == "review" else "pr_review_followup"
-    with agent_span(
-        span_name,
-        session_id=f"pr_review:{config.github_repository}#{number}",
-        input_value={
-            "repository": config.github_repository,
-            "pr_number": number,
-            "thread_id": str(thread_id),
-            "mode": mode,
-        },
-        attributes={
-            "pr.repository": config.github_repository,
-            "pr.number": int(number),
-            "discord.thread_id": str(thread_id),
-            "review.mode": mode,
-        },
-    ) as span:
-        try:
-            result = _run_sdk_session(ctx, task, config)
-        except RuntimeError as error:
-            if "not installed" not in str(error):
-                raise
-            result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
-        result.verdict_posted = ctx.verdict_posted
-        result.ready = ctx.verdict_ready if ctx.verdict_posted else None
-        result.verdict = ctx.verdict
-        if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
-            result.head_sha = ctx.snapshot.head_sha
-        if not ctx.verdict_posted and not ctx.posted_ids:
-            note = result.text or "i didn't finish a verdict. try /recheck."
-            lowered = note.lower()
-            if mode == "review" and not result.exhausted and ("ready for maintainer" in lowered or lowered.startswith("looks good")):
-                note = "i didn't file a verdict, so this isn't ready for a maintainer. try /recheck."
-            if mode == "followup" or result.exhausted or mode == "review":
-                try:
-                    _post_text(ctx, note)
-                except Exception:
-                    logging.exception("Could not post the agent note for #%s", number)
-        span.set_output({
-            "verdict_posted": result.verdict_posted,
-            "verdict": result.verdict,
-            "ready": result.ready,
-            "exhausted": result.exhausted,
-            "steps": result.steps,
-            "text": (result.text or "")[:1000],
-        })
-        return result
+    child_name = "pr_review_session" if mode == "review" else "pr_review_followup"
+    input_payload = {
+        "repository": config.github_repository,
+        "pr_number": number,
+        "thread_id": str(thread_id),
+        "mode": mode,
+    }
+    span_attrs = {
+        "pr.repository": config.github_repository,
+        "pr.number": int(number),
+        "discord.thread_id": str(thread_id),
+        "review.mode": mode,
+    }
+    outer_cm = (
+        agent_span(
+            AGENT_PR_REVIEW,
+            session_id=f"{AGENT_PR_REVIEW}:{config.github_repository}#{number}",
+            input_value=input_payload,
+            attributes=span_attrs,
+        )
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        with child_span(
+            child_name,
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=input_payload,
+            attributes=span_attrs,
+        ) as span:
+            try:
+                result = _run_sdk_session(ctx, task, config)
+            except RuntimeError as error:
+                if "not installed" not in str(error):
+                    raise
+                result = AgentResult("the review agent isn't installed on this bot, so it did not run.", exhausted="error")
+            result.verdict_posted = ctx.verdict_posted
+            result.ready = ctx.verdict_ready if ctx.verdict_posted else None
+            result.verdict = ctx.verdict
+            if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
+                result.head_sha = ctx.snapshot.head_sha
+            if not ctx.verdict_posted and not ctx.posted_ids:
+                note = result.text or "i didn't finish a verdict. try /recheck."
+                lowered = note.lower()
+                if mode == "review" and not result.exhausted and ("ready for maintainer" in lowered or lowered.startswith("looks good")):
+                    note = "i didn't file a verdict, so this isn't ready for a maintainer. try /recheck."
+                if mode == "followup" or result.exhausted or mode == "review":
+                    try:
+                        _post_text(ctx, note)
+                    except Exception:
+                        logging.exception("Could not post the agent note for #%s", number)
+            output_payload = {
+                "verdict_posted": result.verdict_posted,
+                "verdict": result.verdict,
+                "ready": result.ready,
+                "exhausted": result.exhausted,
+                "steps": result.steps,
+                "text": (result.text or "")[:1000],
+            }
+            span.set_output(output_payload)
+            if outer_span is not None:
+                outer_span.set_output(output_payload)
+            return result
 
 
 def history_text(messages: list[dict]) -> str:

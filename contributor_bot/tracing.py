@@ -2,14 +2,23 @@
 
 Tracing stays completely off (zero third-party imports, no-op spans) unless
 ``OTEL_ENDPOINT`` or ``OTEL_EXPORTER_OTLP_ENDPOINT`` (or
-``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``) is set in the environment.
+``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``) is set in the environment (or a
+TracerProvider is installed explicitly in tests).
 
-When configured, builds an OpenTelemetry ``TracerProvider`` backed by an OTLP
-HTTP span exporter and instruments LiteLLM via
+When configured, builds an OpenTelemetry ``TracerProvider`` backed by a
+gzip-compressed OTLP HTTP span exporter and instruments LiteLLM via
 ``openinference.instrumentation.litellm.LiteLLMInstrumentor`` (without adding
 ``"otel"`` to ``litellm.callbacks``, which Lens v0.6.0 hides from its run list).
-Logical bot tasks are wrapped in OpenInference ``AGENT`` spans via
-:func:`agent_span` so Lens displays one run per task with nested LLM calls.
+
+Every LLM call in the Aria bot runs inside exactly one of three top-level
+OpenInference ``AGENT`` spans:
+  - ``pr_review_agent``
+  - ``support_agent``
+  - ``engagement_agent``
+
+Sub-tasks (message routing, classification, KB retrieval, tool calls,
+role matching, weekly summary) are emitted as child spans (``CHAIN`` / ``TOOL``
+/ ``RETRIEVER``) without ``agent.name`` so Lens displays exactly three agents.
 """
 
 from __future__ import annotations
@@ -27,21 +36,43 @@ from urllib.parse import urlsplit, urlunsplit
 
 OPENINFERENCE_SPAN_KIND_ATTR = "openinference.span.kind"
 OPENINFERENCE_SPAN_KIND_AGENT = "AGENT"
+OPENINFERENCE_SPAN_KIND_CHAIN = "CHAIN"
+OPENINFERENCE_SPAN_KIND_TOOL = "TOOL"
+OPENINFERENCE_SPAN_KIND_RETRIEVER = "RETRIEVER"
 OPENINFERENCE_AGENT_NAME_ATTR = "agent.name"
+OPENINFERENCE_TOOL_NAME_ATTR = "tool.name"
 OPENINFERENCE_SESSION_ID_ATTR = "session.id"
 OPENINFERENCE_INPUT_VALUE_ATTR = "input.value"
 OPENINFERENCE_INPUT_MIME_ATTR = "input.mime_type"
 OPENINFERENCE_OUTPUT_VALUE_ATTR = "output.value"
 OPENINFERENCE_OUTPUT_MIME_ATTR = "output.mime_type"
 
+AGENT_PR_REVIEW = "pr_review_agent"
+AGENT_SUPPORT = "support_agent"
+AGENT_ENGAGEMENT = "engagement_agent"
+TOP_LEVEL_AGENTS = frozenset({AGENT_PR_REVIEW, AGENT_SUPPORT, AGENT_ENGAGEMENT})
+
 _MAX_SPAN_VALUE_CHARS = 4000
-_DEFAULT_SERVICE_NAME = "litellm-contributor-bot"
+_DEFAULT_SERVICE_NAME = "aria-litellm-discord"
+_OTLP_EXPORT_TIMEOUT_SECONDS = 30
+_OTLP_BATCH_MAX_SIZE = 16
+_OTLP_EXPORT_TIMEOUT_MS = 30_000
+_AGENT_FLUSH_TIMEOUT_MS = 5_000
 
 _guard = threading.Lock()
 _configured = False
 _tracer_provider = None
 _tracer = None
 _atexit_registered = False
+
+_ACTIVE_AGENT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "contributor_bot_active_agent", default=None
+)
+
+
+def current_agent_name() -> str | None:
+    """Return the active top-level agent name in the current context, if any."""
+    return _ACTIVE_AGENT.get()
 
 
 def _endpoint_with_source(env: Mapping[str, str] | None = None) -> tuple[str, str]:
@@ -117,6 +148,25 @@ def _safe_endpoint_for_log(endpoint: str) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
+def flush_tracing(timeout_millis: int = _AGENT_FLUSH_TIMEOUT_MS) -> bool:
+    """Flush buffered spans to the exporter without shutting down the provider."""
+    provider = _tracer_provider
+    if provider is None:
+        return False
+    force_flush = getattr(provider, "force_flush", None)
+    if not callable(force_flush):
+        return False
+    try:
+        try:
+            result = force_flush(timeout_millis=timeout_millis)
+        except TypeError:
+            result = force_flush()
+        return True if result is None else bool(result)
+    except Exception:
+        logging.debug("Tracing force_flush failed", exc_info=True)
+        return False
+
+
 def shutdown_tracing() -> None:
     """Flush and shut down the active TracerProvider, if tracing was configured."""
     global _configured, _tracer_provider, _tracer
@@ -153,6 +203,69 @@ def _reset_tracing_state() -> None:
 def get_tracer():
     """Return the active OTel tracer when tracing is configured, else ``None``."""
     return _tracer
+
+
+def _build_otlp_exporter(OTLPSpanExporter, endpoint: str, headers: dict[str, str]):
+    """Build an OTLP HTTP exporter with gzip compression and 30s timeout when supported."""
+    kwargs: dict[str, object] = {
+        "endpoint": endpoint,
+        "headers": headers or None,
+    }
+    compression = None
+    try:
+        from opentelemetry.exporter.otlp.proto.http import Compression
+        compression = Compression.Gzip
+    except Exception:
+        compression = None
+    if compression is not None:
+        kwargs["compression"] = compression
+    kwargs["timeout"] = _OTLP_EXPORT_TIMEOUT_SECONDS
+    try:
+        return OTLPSpanExporter(**kwargs)
+    except TypeError:
+        return OTLPSpanExporter(endpoint=endpoint, headers=headers or None)
+
+
+def _build_batch_processor(BatchSpanProcessor, exporter):
+    """Build a BatchSpanProcessor sized for multi-turn agent traces."""
+    try:
+        return BatchSpanProcessor(
+            exporter,
+            max_export_batch_size=_OTLP_BATCH_MAX_SIZE,
+            export_timeout_millis=_OTLP_EXPORT_TIMEOUT_MS,
+        )
+    except TypeError:
+        return BatchSpanProcessor(exporter)
+
+
+def _instrument_litellm(LiteLLMInstrumentor, provider) -> None:
+    """Instrument LiteLLM with TraceConfig that drops duplicate invocation_parameters bloat."""
+    trace_config = None
+    try:
+        from openinference.instrumentation import TraceConfig
+        trace_config = TraceConfig(hide_llm_invocation_parameters=True)
+    except Exception:
+        trace_config = None
+    instrumentor = LiteLLMInstrumentor()
+    if trace_config is not None:
+        try:
+            instrumentor.instrument(tracer_provider=provider, config=trace_config)
+            return
+        except TypeError:
+            pass
+    instrumentor.instrument(tracer_provider=provider)
+
+
+def install_tracer_provider(provider, *, instrument_litellm: bool = False) -> None:
+    """Install a custom TracerProvider (e.g. with InMemorySpanExporter in tests)."""
+    global _configured, _tracer_provider, _tracer
+    with _guard:
+        if instrument_litellm:
+            from openinference.instrumentation.litellm import LiteLLMInstrumentor
+            _instrument_litellm(LiteLLMInstrumentor, provider)
+        _tracer_provider = provider
+        _tracer = provider.get_tracer("contributor_bot")
+        _configured = True
 
 
 def configure_litellm_tracing(env: Mapping[str, str] | None = None) -> bool:
@@ -195,10 +308,10 @@ def configure_litellm_tracing(env: Mapping[str, str] | None = None) -> bool:
 
         resource = Resource.create({"service.name": service_name})
         provider = TracerProvider(resource=resource)
-        exporter = OTLPSpanExporter(endpoint=otlp_endpoint, headers=headers or None)
-        provider.add_span_processor(BatchSpanProcessor(exporter))
+        exporter = _build_otlp_exporter(OTLPSpanExporter, otlp_endpoint, headers)
+        provider.add_span_processor(_build_batch_processor(BatchSpanProcessor, exporter))
         trace.set_tracer_provider(provider)
-        LiteLLMInstrumentor().instrument(tracer_provider=provider)
+        _instrument_litellm(LiteLLMInstrumentor, provider)
 
         _tracer_provider = provider
         _tracer = provider.get_tracer("contributor_bot")
@@ -299,6 +412,78 @@ def _set_span_status(span, *, ok: bool, description: str = "") -> None:
         pass
 
 
+def _resolve_tracer():
+    tracer = _tracer
+    if tracer is not None:
+        return tracer
+    if not tracing_endpoint():
+        return None
+    configure_litellm_tracing()
+    return _tracer
+
+
+@contextmanager
+def child_span(
+    name: str,
+    *,
+    kind: str = OPENINFERENCE_SPAN_KIND_CHAIN,
+    input_value: object = None,
+    attributes: Mapping[str, object] | None = None,
+) -> Iterator[_SpanHandle]:
+    """Open a child span (``CHAIN``, ``TOOL``, ``RETRIEVER``) without setting ``agent.name``.
+
+    Completely a zero-import no-op when tracing is not configured.
+    """
+    tracer = _resolve_tracer()
+    if tracer is None:
+        yield _NOOP_SPAN
+        return
+
+    span_name = (name or "step").strip() or "step"
+    span_kind = (kind or OPENINFERENCE_SPAN_KIND_CHAIN).strip() or OPENINFERENCE_SPAN_KIND_CHAIN
+    with tracer.start_as_current_span(span_name) as span:
+        handle = _SpanHandle(span, "")
+        span.set_attribute(OPENINFERENCE_SPAN_KIND_ATTR, span_kind)
+        if input_value is not None:
+            handle.set_input(input_value)
+        if attributes:
+            for key, value in attributes.items():
+                handle.set_attribute(str(key), value)
+        try:
+            yield handle
+        except Exception as exc:
+            record_exc = getattr(span, "record_exception", None)
+            if callable(record_exc):
+                try:
+                    record_exc(exc)
+                except Exception:
+                    pass
+            _set_span_status(span, ok=False, description=str(exc))
+            raise
+        else:
+            _set_span_status(span, ok=True)
+
+
+@contextmanager
+def tool_span(
+    name: str,
+    *,
+    input_value: object = None,
+    attributes: Mapping[str, object] | None = None,
+) -> Iterator[_SpanHandle]:
+    """Open an OpenInference ``TOOL`` child span for a tool invocation."""
+    merged: dict[str, object] = {OPENINFERENCE_TOOL_NAME_ATTR: (name or "tool").strip() or "tool"}
+    if attributes:
+        merged.update(attributes)
+    with child_span(
+        name,
+        kind=OPENINFERENCE_SPAN_KIND_TOOL,
+        input_value=input_value,
+        attributes=merged,
+    ) as handle:
+        yield handle
+
+
 @contextmanager
 def agent_span(
     name: str,
@@ -307,50 +492,60 @@ def agent_span(
     input_value: object = None,
     attributes: Mapping[str, object] | None = None,
 ) -> Iterator[_SpanHandle]:
-    """Wrap one logical bot task in an OpenInference ``AGENT`` span.
+    """Wrap one logical bot agent run in a top-level OpenInference ``AGENT`` span.
 
     Completely a zero-import no-op when tracing is not configured.
-    When tracing is active, sets ``openinference.span.kind="AGENT"``,
-    ``agent.name``, ``session.id``, and optional ``input.value`` / ``output.value``
-    so LiteLLM Lens shows one top-level run per task with nested LLM spans.
+    When called while already inside an active ``AGENT`` span, opens a ``CHAIN``
+    child span (without ``agent.name``) so Lens always shows only the top-level
+    agent. Flushes the active TracerProvider when a root ``AGENT`` span exits so
+    multi-turn runs are not dropped on batch delay or shutdown.
     """
-    tracer = _tracer
+    tracer = _resolve_tracer()
     if tracer is None:
-        if not tracing_endpoint():
-            yield _NOOP_SPAN
-            return
-        configure_litellm_tracing()
-        tracer = _tracer
-        if tracer is None:
-            yield _NOOP_SPAN
-            return
+        yield _NOOP_SPAN
+        return
 
     agent_name = (name or "bot").strip() or "bot"
+    if _ACTIVE_AGENT.get() is not None:
+        with child_span(
+            agent_name,
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value=input_value,
+            attributes=attributes,
+        ) as handle:
+            yield handle
+        return
+
     sid = (str(session_id).strip() if session_id is not None else "") or f"{agent_name}:{uuid.uuid4().hex[:12]}"
-    with tracer.start_as_current_span(agent_name) as span:
-        handle = _SpanHandle(span, sid)
-        span.set_attribute(OPENINFERENCE_SPAN_KIND_ATTR, OPENINFERENCE_SPAN_KIND_AGENT)
-        span.set_attribute(OPENINFERENCE_AGENT_NAME_ATTR, agent_name)
-        span.set_attribute(OPENINFERENCE_SESSION_ID_ATTR, sid)
-        if input_value is not None:
-            handle.set_input(input_value)
-        if attributes:
-            for key, value in attributes.items():
-                handle.set_attribute(str(key), value)
-        with _using_session_cm(sid):
-            try:
-                yield handle
-            except Exception as exc:
-                record_exc = getattr(span, "record_exception", None)
-                if callable(record_exc):
-                    try:
-                        record_exc(exc)
-                    except Exception:
-                        pass
-                _set_span_status(span, ok=False, description=str(exc))
-                raise
-            else:
-                _set_span_status(span, ok=True)
+    token = _ACTIVE_AGENT.set(agent_name)
+    try:
+        with tracer.start_as_current_span(agent_name) as span:
+            handle = _SpanHandle(span, sid)
+            span.set_attribute(OPENINFERENCE_SPAN_KIND_ATTR, OPENINFERENCE_SPAN_KIND_AGENT)
+            span.set_attribute(OPENINFERENCE_AGENT_NAME_ATTR, agent_name)
+            span.set_attribute(OPENINFERENCE_SESSION_ID_ATTR, sid)
+            if input_value is not None:
+                handle.set_input(input_value)
+            if attributes:
+                for key, value in attributes.items():
+                    handle.set_attribute(str(key), value)
+            with _using_session_cm(sid):
+                try:
+                    yield handle
+                except Exception as exc:
+                    record_exc = getattr(span, "record_exception", None)
+                    if callable(record_exc):
+                        try:
+                            record_exc(exc)
+                        except Exception:
+                            pass
+                    _set_span_status(span, ok=False, description=str(exc))
+                    raise
+                else:
+                    _set_span_status(span, ok=True)
+    finally:
+        _ACTIVE_AGENT.reset(token)
+        flush_tracing()
 
 
 def submit_with_context(pool, fn, *args, **kwargs):
@@ -365,8 +560,8 @@ def build_trace_metadata(
     session_id: str | None = None,
     extra: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build LiteLLM ``metadata`` dict for grouping traces by feature and session."""
-    feature = (agent or "bot").strip() or "bot"
+    """Build LiteLLM ``metadata`` dict for grouping traces by agent and session."""
+    feature = (agent or current_agent_name() or "bot").strip() or "bot"
     sid = (str(session_id).strip() if session_id is not None else "") or f"{feature}:{uuid.uuid4().hex[:12]}"
     requester: dict[str, str] = {
         "agent_name": feature,
@@ -395,7 +590,7 @@ def build_sdk_trace_metadata(
     extra: Mapping[str, object] | None = None,
 ) -> dict[str, str]:
     """Flat string-only metadata dict for OpenAI Agents SDK ``ModelSettings.metadata``."""
-    feature = (agent or "bot").strip() or "bot"
+    feature = (agent or current_agent_name() or "bot").strip() or "bot"
     sid = (str(session_id).strip() if session_id is not None else "") or f"{feature}:{uuid.uuid4().hex[:12]}"
     metadata: dict[str, str] = {
         "generation_name": feature,
