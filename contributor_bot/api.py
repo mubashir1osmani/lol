@@ -162,6 +162,7 @@ def _graphql_query_allowed(request: Request) -> bool:
 
 def _github_request_allowed(method: str, path: str) -> bool:
     pull = rf"/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}"
+    issue = rf"/repos/{_OWNER_REPO}/issues/{_PR_NUMBER}"
     commit = rf"/repos/{_OWNER_REPO}/commits/[0-9a-fA-F]{{40}}"
     check_run = rf"/repos/{_OWNER_REPO}/check-runs/{_PR_NUMBER}"
     if method == "GET" and (
@@ -170,6 +171,8 @@ def _github_request_allowed(method: str, path: str) -> bool:
         or re.fullmatch(pull + r"/commits", path)
         or re.fullmatch(pull + r"/reviews", path)
         or re.fullmatch(pull + r"/comments", path)
+        or re.fullmatch(issue, path)
+        or re.fullmatch(issue + r"/comments", path)
         or re.fullmatch(commit + r"/check-runs", path)
         or re.fullmatch(commit + r"/status", path)
         or re.fullmatch(check_run, path)

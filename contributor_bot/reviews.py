@@ -424,6 +424,50 @@ def analyze_pr_files(files: list[dict]) -> dict:
     }
 
 
+def extract_linked_issue_numbers(
+    text: str,
+    repository: str,
+    *,
+    exclude_number: int | None = None,
+    limit: int = 5,
+) -> list[int]:
+    """Extract linked GitHub issue numbers from PR title/body text."""
+    body = text or ""
+    if not body.strip():
+        return []
+    found: list[int] = []
+    seen: set[int] = set()
+
+    def _add(raw: str) -> None:
+        if len(found) >= limit or not raw.isdigit():
+            return
+        number = int(raw)
+        if number <= 0 or number == exclude_number or number in seen:
+            return
+        seen.add(number)
+        found.append(number)
+
+    escaped_repo = re.escape(repository.strip()) if repository else r"[^/\s]+/[^/\s]+"
+    for match in re.finditer(rf"(?i)https?://github\.com/{escaped_repo}/issues/(\d+)\b", body):
+        _add(match.group(1))
+    for match in re.finditer(
+        r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|refs?|related\s+to)\s*:?\s*#(\d+)\b",
+        body,
+    ):
+        _add(match.group(1))
+    for match in re.finditer(r"(?<![A-Za-z0-9_/])#(\d{2,7})\b", body):
+        _add(match.group(1))
+    return found
+
+
+def _is_root_cause_finding(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("root_cause") is True:
+        return True
+    return str(item.get("category") or "").strip().lower() == "root_cause"
+
+
 def _already_covered(item: dict, existing_bullets: list[str]) -> bool:
     """Avoid duplicating a deterministic finding already covered by an agent bullet."""
     rule = item.get("rule")
@@ -459,14 +503,19 @@ def resolve_verdict(
     when CI and bots pass.
     """
     requested = normalize_verdict(requested_verdict)
-    agent_bullets: list[str] = []
+    root_cause_bullets: list[str] = []
+    other_agent_bullets: list[str] = []
     seen: set[str] = set()
     for item in findings or ():
         bullet = format_finding_bullet(item)
         key = bullet.lower()
         if bullet and key not in seen:
             seen.add(key)
-            agent_bullets.append(bullet)
+            if _is_root_cause_finding(item):
+                root_cause_bullets.append(bullet)
+            else:
+                other_agent_bullets.append(bullet)
+    agent_bullets = root_cause_bullets + other_agent_bullets
 
     det_bullets: list[str] = []
     for item in deterministic_findings or ():
