@@ -55,12 +55,16 @@ class _FakeSpan:
         self.name = name
         self.parent = parent
         self.attributes: dict[str, object] = {}
+        self.events: list[tuple[str, dict[str, object]]] = []
         self.exceptions: list[Exception] = []
         self.status = None
         self.oi_session_at_start = _ACTIVE_OI_SESSION.get()
 
     def set_attribute(self, key: str, value: object) -> None:
         self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict | None = None) -> None:
+        self.events.append((name, dict(attributes or {})))
 
     def record_exception(self, exc: Exception) -> None:
         self.exceptions.append(exc)
@@ -517,16 +521,24 @@ class AgentSpanWrappingTests(unittest.TestCase):
         self.assertEqual(root.attributes[OPENINFERENCE_SESSION_ID_ATTR], "engagement_agent:role_matcher:BerriAI/litellm:2026-11-28")
         self.assertIn("alex-builds", str(root.attributes.get(OPENINFERENCE_INPUT_VALUE_ATTR)))
         self.assertIn("matched", str(root.attributes.get(OPENINFERENCE_OUTPUT_VALUE_ATTR)))
-        # role_matcher is a CHAIN child span of engagement_agent (NOT a separate top-level AGENT).
-        self.assertEqual(len(chain_spans), 1)
-        rm_span = chain_spans[0]
-        self.assertEqual(rm_span.name, "role_matcher")
+        # role_matcher is a CHAIN child span of engagement_agent (NOT a separate top-level AGENT),
+        # and each contributor gets a match_contributor CHAIN child span under role_matcher.
+        rm_spans = [s for s in chain_spans if s.name == "role_matcher"]
+        contrib_spans = [s for s in chain_spans if s.name == "match_contributor"]
+        self.assertEqual(len(rm_spans), 1)
+        rm_span = rm_spans[0]
         self.assertIs(rm_span.parent, root)
         self.assertNotIn(OPENINFERENCE_AGENT_NAME_ATTR, rm_span.attributes)
-        # Every parallel LLM span created in ThreadPoolExecutor nested under role_matcher -> engagement_agent!
+        self.assertEqual(len(contrib_spans), 2)
+        for cspan in contrib_spans:
+            self.assertIs(cspan.parent, rm_span)
+            self.assertNotIn(OPENINFERENCE_AGENT_NAME_ATTR, cspan.attributes)
+        # Every parallel LLM span created in ThreadPoolExecutor nested under its contributor's
+        # match_contributor -> role_matcher -> engagement_agent!
         self.assertGreaterEqual(len(llm_spans), 2)
         for child in llm_spans:
-            self.assertIs(child.parent, rm_span)
+            self.assertIn(child.parent, contrib_spans)
+            self.assertIs(child.parent.parent, rm_span)
             self.assertEqual(child.attributes["session.id"], "engagement_agent:role_matcher:BerriAI/litellm:2026-11-28")
         # Root AGENT span exit flushed the TracerProvider.
         self.assertGreaterEqual(state["providers"][0].flush_called, 1)

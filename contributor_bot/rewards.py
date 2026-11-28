@@ -205,13 +205,22 @@ def apply_roles(
 
     Returns the list of role keys newly granted during this call.
     """
+    from .tracing import log_decision, record_span_event, tool_span
+
     if not config.contributor_roles_enabled:
         return []
     if present_member_ids is not None and discord_id not in present_member_ids:
-        logging.warning(
+        log_decision(
+            "role_grant_skipped",
             "Skipping role grant for discord_id=%s github_login=%s: member is not currently in the guild",
             discord_id,
             github_login or "unknown",
+            attributes={
+                "grant.discord_id": str(discord_id),
+                "grant.github_login": str(github_login or "unknown"),
+                "grant.skip_reason": "member_not_in_guild",
+            },
+            level=logging.WARNING,
         )
         return []
     rows = store.pulls_for_author(config.github_repository, github_user_id)
@@ -233,6 +242,7 @@ def apply_roles(
         match_confidence=match_confidence,
         match_evidence=match_evidence,
     )
+    evidence_list = [part.strip() for part in (log_evidence or "").split(";") if part.strip()]
     # A role Discord refused to add is left unannounced. Skipping the merge
     # shoutout too lets the next attempt post one combined message.
     assignment_blocked = False
@@ -240,20 +250,75 @@ def apply_roles(
     for key in earned:
         if key in already:
             continue
-        if not assign_role(
-            config,
-            discord_id,
-            key,
-            github_login=log_login,
-            match_method=log_method,
-            match_confidence=log_confidence,
-            match_evidence=log_evidence,
-        ):
-            assignment_blocked = True
-            continue
         name = config.role_names.get(key) or DEFAULT_ROLE_NAMES[key]
-        if store.record_grant(discord_id, key, name, now):
-            newly_granted.append(key)
+        role_id = config.role_ids.get(key, "")
+        with tool_span(
+            "grant_role",
+            input_value={
+                "discord_id": str(discord_id),
+                "github_login": str(log_login or "unknown"),
+                "role_key": key,
+                "role_name": name,
+                "role_id": role_id,
+                "method": str(log_method or "unknown"),
+                "confidence": round(float(log_confidence), 4) if isinstance(log_confidence, (int, float)) else None,
+                "evidence": evidence_list,
+            },
+            attributes={
+                "grant.discord_id": str(discord_id),
+                "grant.github_login": str(log_login or "unknown"),
+                "grant.role_key": key,
+                "grant.role_name": name,
+                "grant.role_id": role_id,
+                "grant.method": str(log_method or "unknown"),
+                "grant.confidence": round(float(log_confidence), 4) if isinstance(log_confidence, (int, float)) else None,
+                "grant.evidence": evidence_list,
+                "grant.announce_enabled": bool(config.roles_announce_enabled),
+            },
+        ) as gspan:
+            if not assign_role(
+                config,
+                discord_id,
+                key,
+                github_login=log_login,
+                match_method=log_method,
+                match_confidence=log_confidence,
+                match_evidence=log_evidence,
+            ):
+                assignment_blocked = True
+                gspan.set_attribute("grant.outcome", "blocked")
+                gspan.set_output({"granted": False, "reason": "discord_assignment_blocked"})
+                continue
+            recorded_ok = store.record_grant(discord_id, key, name, now)
+            if recorded_ok:
+                newly_granted.append(key)
+            grant_event_attrs = {
+                "grant.discord_id": str(discord_id),
+                "grant.github_login": str(log_login or "unknown"),
+                "grant.role_key": key,
+                "grant.role_name": name,
+                "grant.role_id": role_id,
+                "grant.method": str(log_method or "unknown"),
+                "grant.confidence": round(float(log_confidence), 4) if isinstance(log_confidence, (int, float)) else None,
+                "grant.evidence": evidence_list,
+            }
+            if recorded_ok:
+                gspan.add_event("role_granted", grant_event_attrs)
+            gspan.set_attribute("grant.outcome", "granted" if recorded_ok else "already_recorded")
+            gspan.set_output({
+                "granted": bool(recorded_ok),
+                "discord_id": str(discord_id),
+                "github_login": str(log_login or "unknown"),
+                "role_key": key,
+                "role_name": name,
+                "role_id": role_id,
+                "method": str(log_method or "unknown"),
+                "confidence": round(float(log_confidence), 4) if isinstance(log_confidence, (int, float)) else None,
+                "evidence": evidence_list,
+                "announce_enabled": bool(config.roles_announce_enabled),
+            })
+        if recorded_ok:
+            record_span_event("role_granted", grant_event_attrs)
     if not config.roles_announce_enabled:
         pending_keys = [grant["role_key"] for grant in store.unannounced_grants(discord_id)]
         to_mark = list(dict.fromkeys([*newly_granted, *pending_keys]))

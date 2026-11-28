@@ -75,9 +75,13 @@ def run_role_matching(
         diagnostics = result[3]
         span.set_output(
             {
+                "contributors": diagnostics.contributor_count,
+                "members": diagnostics.member_count,
+                "candidates": diagnostics.candidate_pair_count,
                 "matched": diagnostics.matched_count,
                 "skipped": diagnostics.skipped_count,
                 "methods": dict(diagnostics.method_counts),
+                "skip_reasons": dict(diagnostics.skip_reasons),
             }
         )
         return result

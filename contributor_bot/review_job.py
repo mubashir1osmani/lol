@@ -192,24 +192,72 @@ def perform_review(
     source: str = "message",
 ) -> dict:
     """Run one pre-review. Returns a small status dict for the caller."""
+    from contextlib import nullcontext
+    from .tracing import AGENT_PR_REVIEW, agent_span, current_agent_name, current_span, log_decision
+
     repository = config.github_repository
-    if not _try_lock(repository, number):
-        return {"status": "busy", "thread_id": None, "detail": "already checking that pr."}
-    try:
-        return _perform_review(
-            config, store, number, channel_id=channel_id, message_id=message_id, source=source,
+    outer_cm = (
+        agent_span(
+            AGENT_PR_REVIEW,
+            session_id=f"{AGENT_PR_REVIEW}:{repository}#{number}",
+            input_value={
+                "repository": repository,
+                "pr_number": int(number),
+                "channel_id": str(channel_id or ""),
+                "message_id": str(message_id or ""),
+                "source": source,
+            },
+            attributes={
+                "pr.repository": repository,
+                "pr.number": int(number),
+                "review.source": source,
+            },
         )
-    except Exception as error:
-        logging.exception("Unexpected error during PR review for #%s (%s)", number, source)
-        _record_request_outcome(
-            store, repository, number, message_id, status="failed", error=str(error), increment_attempts=True,
-        )
-        return {"status": "error", "thread_id": None, "detail": "the reviewer hit an error. try /recheck in a bit."}
-    finally:
-        _unlock(repository, number)
+        if current_agent_name() is None
+        else nullcontext()
+    )
+    with outer_cm as outer_span:
+        if not _try_lock(repository, number):
+            log_decision(
+                "review_skipped",
+                "PR review for #%s skipped (%s); already in progress",
+                number,
+                source,
+                attributes={
+                    "pr.number": int(number),
+                    "review.source": source,
+                    "review.skip_reason": "in_flight_dedupe",
+                },
+            )
+            outcome = {"status": "busy", "thread_id": None, "detail": "already checking that pr.", "skip_reason": "in_flight_dedupe"}
+            target_span = outer_span if outer_span is not None else current_span()
+            target_span.set_attributes({"review.status": "busy", "review.skip_reason": "in_flight_dedupe"})
+            target_span.set_output(outcome)
+            return outcome
+        try:
+            outcome = _perform_review(
+                config, store, number, channel_id=channel_id, message_id=message_id, source=source,
+            )
+            if outer_span is not None:
+                outer_span.set_output(outcome)
+            return outcome
+        except Exception as error:
+            logging.exception("Unexpected error during PR review for #%s (%s)", number, source)
+            _record_request_outcome(
+                store, repository, number, message_id, status="failed", error=str(error), increment_attempts=True,
+            )
+            outcome = {"status": "error", "thread_id": None, "detail": "the reviewer hit an error. try /recheck in a bit."}
+            if outer_span is not None:
+                outer_span.set_attributes({"review.status": "error"})
+                outer_span.set_output(outcome)
+            return outcome
+        finally:
+            _unlock(repository, number)
 
 
 def _perform_review(config, store, number, *, channel_id, message_id, source) -> dict:
+    from .tracing import current_span, log_decision
+
     repository = config.github_repository
     record = store.review_thread(repository, number)
     request_message_id = message_id if is_discord_id(message_id) else (record["message_id"] if record else None)
@@ -219,7 +267,24 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         detail = f"checked recently. try again in {minutes}m."
         if record:
             detail = f"checked recently. see <#{record['thread_id']}>. try again in {minutes}m."
-        logging.info("PR review for #%s skipped (%s); cooldown %ss", number, source, remaining)
+        log_decision(
+            "review_skipped",
+            "PR review for #%s skipped (%s); cooldown %ss",
+            number,
+            source,
+            remaining,
+            attributes={
+                "pr.number": int(number),
+                "review.source": source,
+                "review.skip_reason": "cooldown",
+                "review.cooldown_remaining_seconds": int(remaining),
+            },
+        )
+        current_span().set_attributes({
+            "review.status": "cooldown",
+            "review.skip_reason": "cooldown",
+            "review.cooldown_remaining_seconds": int(remaining),
+        })
         if record and record.get("last_reviewed_at"):
             _record_request_outcome(store, repository, number, request_message_id, status="done")
         if source == "recheck" and record:
@@ -227,10 +292,31 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
                 _post(record["thread_id"], config.discord_token, detail)
             except Exception:
                 logging.warning("Could not post the cooldown note for #%s", number)
-        return {"status": "cooldown", "thread_id": record["thread_id"] if record else None, "detail": detail}
+        return {
+            "status": "cooldown",
+            "thread_id": record["thread_id"] if record else None,
+            "detail": detail,
+            "skip_reason": "cooldown",
+            "pr_number": int(number),
+        }
     day = datetime.now(UTC).date().isoformat()
     if not store.claim_daily_run(day, config.review_daily_run_budget):
         detail = "ran out of budget for today. try again tomorrow."
+        log_decision(
+            "review_skipped",
+            "PR review for #%s skipped (%s); daily run budget exhausted",
+            number,
+            source,
+            attributes={
+                "pr.number": int(number),
+                "review.source": source,
+                "review.skip_reason": "daily_budget",
+            },
+        )
+        current_span().set_attributes({
+            "review.status": "budget",
+            "review.skip_reason": "daily_budget",
+        })
         _record_request_outcome(
             store, repository, number, request_message_id, status="failed", error=detail, increment_attempts=True,
         )
@@ -239,8 +325,20 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
                 _post(record["thread_id"], config.discord_token, detail)
             except Exception:
                 logging.exception("Could not post the daily budget note for #%s", number)
-        return {"status": "budget", "thread_id": record["thread_id"] if record else None, "detail": detail}
-    logging.info("Reviewing #%s (%s)", number, source)
+        return {
+            "status": "budget",
+            "thread_id": record["thread_id"] if record else None,
+            "detail": detail,
+            "skip_reason": "daily_budget",
+            "pr_number": int(number),
+        }
+    log_decision(
+        "review_started",
+        "Reviewing #%s (%s)",
+        number,
+        source,
+        attributes={"pr.number": int(number), "review.source": source},
+    )
     thread_channel = channel_id or (record["channel_id"] if record else None)
     thread_message = message_id or (record["message_id"] if record else None)
     try:
@@ -249,7 +347,7 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         _record_request_outcome(
             store, repository, number, request_message_id, status="failed", error=str(error), increment_attempts=True,
         )
-        return {"status": "error", "thread_id": None, "detail": str(error)}
+        return {"status": "error", "thread_id": None, "detail": str(error), "pr_number": int(number)}
     try:
         history = ""
         try:
@@ -264,17 +362,64 @@ def _perform_review(config, store, number, *, channel_id, message_id, source) ->
         _record_request_outcome(
             store, repository, number, request_message_id, status="failed", error=str(error), increment_attempts=True,
         )
-        return {"status": "error", "thread_id": thread_id, "detail": "the reviewer hit an error. try /recheck in a bit."}
+        return {"status": "error", "thread_id": thread_id, "detail": "the reviewer hit an error. try /recheck in a bit.", "pr_number": int(number)}
     store.mark_review_done(repository, number, iso(datetime.now(UTC)), result.head_sha or "")
     _record_request_outcome(store, repository, number, request_message_id, status="done", increment_attempts=True)
+    posted_ids = list(getattr(result, "posted_message_ids", ()) or ())
+    primary_msg_id = posted_ids[0] if posted_ids else ""
+    findings = list(getattr(result, "findings", ()) or ())
     if result.verdict_posted:
-        logging.info(
+        log_decision(
+            "review_verdict_posted",
             "Posted a %s review for #%s in thread %s",
-            "ready" if result.ready else "needs-work", number, thread_id,
+            "ready" if result.ready else "needs-work",
+            number,
+            thread_id,
+            attributes={
+                "pr.number": int(number),
+                "discord.thread_id": str(thread_id),
+                "review.verdict": result.verdict or ("ready" if result.ready else "needs_changes"),
+                "review.ready": bool(result.ready),
+                "review.findings_count": len(findings),
+                "review.posted_message_id": primary_msg_id,
+                "review.posted_message_ids": posted_ids,
+            },
         )
     elif result.exhausted:
-        logging.info("Review for #%s ran out of budget (%s)", number, result.exhausted)
-    return {"status": "posted", "thread_id": thread_id, "detail": result.text}
+        log_decision(
+            "review_exhausted",
+            "Review for #%s ran out of budget (%s)",
+            number,
+            result.exhausted,
+            attributes={
+                "pr.number": int(number),
+                "discord.thread_id": str(thread_id),
+                "review.exhausted": str(result.exhausted),
+            },
+        )
+    current_span().set_attributes({
+        "pr.number": int(number),
+        "discord.thread_id": str(thread_id),
+        "review.status": "posted",
+        "review.verdict": result.verdict or "",
+        "review.verdict_posted": bool(result.verdict_posted),
+        "review.findings_count": len(findings),
+        "review.findings": findings[:10],
+        "review.posted_message_id": primary_msg_id,
+        "review.posted_message_ids": posted_ids,
+    })
+    return {
+        "status": "posted",
+        "pr_number": int(number),
+        "thread_id": thread_id,
+        "verdict": result.verdict,
+        "ready": result.ready,
+        "findings_count": len(findings),
+        "findings": findings[:10],
+        "posted_message_id": primary_msg_id,
+        "posted_message_ids": posted_ids,
+        "detail": result.text,
+    }
 
 
 def _ephemeral(content: str) -> dict:
@@ -642,23 +787,53 @@ def handle_thread_message(config: Config, store: Store, message: dict) -> None:
 
 def handle_review_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> dict:
     """Process a Discord channel message already routed to ``pr_review_agent``."""
+    from .tracing import current_span, log_decision
+
     message_id = str(message.get("id") or "")
     asked, numbers = message_decision(config, message)
     if asked and not numbers:
         _ack(config, channel_id, message_id, message)
         _post(channel_id, config.discord_token, "drop the berriai/litellm pull url and i'll open a review thread.")
-        return {"asked": True, "numbers": [], "prompted_for_url": True}
+        outcome = {"asked": True, "numbers": [], "planned": [], "skipped": [], "prompted_for_url": True}
+        current_span().set_attributes({
+            "review.request_detected": True,
+            "review.pr_numbers": [],
+            "review.skip_reason": "missing_pr_url",
+        })
+        return outcome
     planned = []
+    skipped = []
     for number in numbers:
         record = store.review_thread(config.github_repository, number)
         if record:
             remaining = cooldown_remaining(record, config.review_cooldown_seconds, datetime.now(UTC))
             if remaining:
-                logging.info("Skipping #%s in channel %s; cooldown has %ss left", number, channel_id, remaining)
+                log_decision(
+                    "review_skipped",
+                    "Skipping #%s in channel %s; cooldown has %ss left",
+                    number,
+                    channel_id,
+                    remaining,
+                    attributes={
+                        "pr.number": int(number),
+                        "discord.channel_id": str(channel_id),
+                        "review.skip_reason": "cooldown",
+                        "review.cooldown_remaining_seconds": int(remaining),
+                    },
+                )
+                skipped.append({"pr_number": int(number), "reason": "cooldown", "remaining_seconds": int(remaining)})
                 continue
         planned.append((number, record))
     if not planned:
-        return {"asked": asked, "numbers": numbers, "planned": []}
+        skip_reason = skipped[0]["reason"] if skipped else ("not_a_review_request" if not asked else "no_prs_planned")
+        current_span().set_attributes({
+            "review.request_detected": bool(asked),
+            "review.pr_numbers": list(numbers),
+            "review.planned_prs": [],
+            "review.skipped_prs": skipped,
+            "review.skip_reason": skip_reason,
+        })
+        return {"asked": asked, "numbers": numbers, "planned": [], "skipped": skipped, "skip_reason": skip_reason}
     now_iso = iso(datetime.now(UTC))
     if is_discord_id(channel_id) and is_discord_id(message_id):
         for number, record in planned:
@@ -690,7 +865,14 @@ def handle_review_channel_message(config: Config, store: Store, channel_id: str,
                 config, store, number, channel_id=channel_id, message_id=message_id, source="new",
             ),
         )
-    return {"asked": asked, "numbers": numbers, "planned": [n for n, _ in planned]}
+    planned_nums = [int(n) for n, _ in planned]
+    current_span().set_attributes({
+        "review.request_detected": bool(asked),
+        "review.pr_numbers": list(numbers),
+        "review.planned_prs": planned_nums,
+        "review.skipped_prs": skipped,
+    })
+    return {"asked": asked, "numbers": numbers, "planned": planned_nums, "skipped": skipped}
 
 
 def handle_channel_message(config: Config, store: Store, channel_id: str, message: dict) -> None:

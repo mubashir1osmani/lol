@@ -53,16 +53,26 @@ from contributor_bot.tracing import (
 _FALLBACK_ACTIVE_SPAN: contextvars.ContextVar = contextvars.ContextVar("_inmem_active_span", default=None)
 
 
+class _StdlibRecordedEvent:
+    def __init__(self, name: str, attributes: dict | None = None) -> None:
+        self.name = name
+        self.attributes: dict[str, object] = dict(attributes or {})
+
+
 class _StdlibRecordedSpan:
     def __init__(self, name: str, parent=None) -> None:
         self.name = name
         self.parent = parent
         self.attributes: dict[str, object] = {}
+        self.events: list[_StdlibRecordedEvent] = []
         self.status = None
         self.exceptions: list[Exception] = []
 
     def set_attribute(self, key: str, value: object) -> None:
         self.attributes[key] = value
+
+    def add_event(self, name: str, attributes: dict | None = None) -> None:
+        self.events.append(_StdlibRecordedEvent(name, attributes))
 
     def record_exception(self, exc: Exception) -> None:
         self.exceptions.append(exc)
@@ -138,21 +148,32 @@ def _span_attrs(span) -> dict:
     return dict(getattr(span, "attributes", None) or {})
 
 
-def _span_parent_name(span, all_spans) -> str | None:
+def _span_parent_obj(span, all_spans):
     parent = getattr(span, "parent", None)
     if parent is None:
         return None
     if isinstance(parent, _StdlibRecordedSpan):
-        return parent.name
-    # Real OTel SpanContext parent: match by span_id.
+        return parent
     parent_id = getattr(parent, "span_id", None)
     if parent_id is None:
         return None
     for candidate in all_spans:
         ctx = getattr(candidate, "context", None)
         if ctx is not None and getattr(ctx, "span_id", None) == parent_id:
-            return candidate.name
+            return candidate
     return None
+
+
+def _span_parent_name(span, all_spans) -> str | None:
+    parent = _span_parent_obj(span, all_spans)
+    return parent.name if parent is not None else None
+
+
+def _span_events(span) -> list[tuple[str, dict]]:
+    return [
+        (ev.name, dict(getattr(ev, "attributes", None) or {}))
+        for ev in (getattr(span, "events", None) or ())
+    ]
 
 
 MOCK_LLMS_TXT = """# LiteLLM Docs
@@ -763,6 +784,554 @@ class PRReviewLifecycleTrackingTests(unittest.TestCase):
 
         # Tick 5: Thread is fully complete -> zero remaining active lifecycle threads.
         self.assertEqual(self.store.active_lifecycle_review_threads("BerriAI/litellm"), [])
+
+
+class LensObservabilityParityTests(unittest.TestCase):
+    """Verify full log -> span observability parity across all three agents
+    using an in-memory span exporter (real OTel SDK when available, stdlib otherwise).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "state.db")
+        self.store = Store(self.db_path)
+        _reset_tracing_state()
+        reset_support_cooldowns()
+        self.exporter, self.provider, self.using_real_otel = _install_in_memory_exporter()
+
+    def tearDown(self) -> None:
+        _reset_tracing_state()
+        reset_support_cooldowns()
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_engagement_agent_role_match_and_grant_spans_attributes_events_and_nested_llm(self) -> None:
+        from contributor_bot.matcher import _compute_attempt_signature, score_author_against_members, GitHubAuthorProfile
+        from contributor_bot.roles_sync import poll_merged_prs_for_roles
+        from contributor_bot.tracing import OPENINFERENCE_INPUT_VALUE_ATTR, OPENINFERENCE_OUTPUT_VALUE_ATTR, child_span
+
+        config = _base_config(
+            self.db_path,
+            contributor_roles_enabled=True,
+            roles_announce_enabled=False,
+            discord_guild_id="999000111222333444",
+            role_ids={"contributor": "555000111222333444"},
+            match_model="claude-sonnet-4-5",
+        )
+        now = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
+        members = [
+            DiscordMemberInfo(discord_id="100000000000000001", username="alex_rivera_dev", display_name="Alex Rivera"),
+            DiscordMemberInfo(discord_id="100000000000000002", username="jordan_lin", display_name="Jordan Lin"),
+            DiscordMemberInfo(discord_id="100000000000000003", username="sam_k", display_name="Sam K"),
+        ]
+
+        # Seed 1 already-existing PR in SQLite (outside the 7d match window) so prs_existing=1 is exercised.
+        self.store.upsert_pull(
+            repository="BerriAI/litellm",
+            number=900,
+            github_login="prior-dev",
+            github_user_id=900,
+            merged_at="2026-10-01T01:00:00+00:00",
+            title="Already ingested PR",
+            labels=[],
+            files=["litellm/utils.py"],
+        )
+
+        # Seed a fresh negative cache entry for "cached-neg-user" so skip_reason="cached_negative" runs.
+        cached_prof = GitHubAuthorProfile(login="cached-neg-user", name="Sam K", bio="rust dev")
+        _s, cached_cands = score_author_against_members(cached_prof, members)
+        cached_sig = _compute_attempt_signature(cached_prof, cached_cands, [], [])
+        self.store.save_match_attempt(
+            "cached-neg-user",
+            attempted_at="2026-11-27T12:00:00+00:00",
+            signature=cached_sig,
+            outcome="no_match",
+        )
+
+        # 5 PRs discovered in the poll window:
+        # #900 existing, #901 excluded bot, #902 alex-builds (LLM matched),
+        # #903 jordan-other (LLM none_of_these), #904 cached-neg-user (cached_negative),
+        # #905 zzz-unmatched (no_signal_match), #906 broken-enrich (enrichment_failed).
+        prs = {
+            900: {
+                "number": 900,
+                "title": "Already ingested PR",
+                "merged": True,
+                "merged_at": "2026-10-01T01:00:00+00:00",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "prior-dev", "id": 900, "type": "User"},
+            },
+            901: {
+                "number": 901,
+                "title": "Bump deps",
+                "merged": True,
+                "merged_at": "2026-11-28T01:00:00+00:00",
+                "author_association": "NONE",
+                "user": {"login": "dependabot[bot]", "id": 901, "type": "Bot"},
+            },
+            902: {
+                "number": 902,
+                "title": "Add provider fallback",
+                "merged": True,
+                "merged_at": "2026-11-28T02:00:00+00:00",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "alex-builds", "id": 902, "type": "User"},
+            },
+            903: {
+                "number": 903,
+                "title": "Fix streaming parser",
+                "merged": True,
+                "merged_at": "2026-11-28T03:00:00+00:00",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "jordan-other", "id": 903, "type": "User"},
+            },
+            904: {
+                "number": 904,
+                "title": "Docs typo",
+                "merged": True,
+                "merged_at": "2026-11-28T04:00:00+00:00",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "cached-neg-user", "id": 904, "type": "User"},
+            },
+            905: {
+                "number": 905,
+                "title": "Unrelated tweak",
+                "merged": True,
+                "merged_at": "2026-11-28T05:00:00+00:00",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "zzz-unmatched", "id": 905, "type": "User"},
+            },
+            906: {
+                "number": 906,
+                "title": "Enrichment fail case",
+                "merged": True,
+                "merged_at": "2026-11-28T06:00:00+00:00",
+                "author_association": "CONTRIBUTOR",
+                "user": {"login": "broken-enrich", "id": 906, "type": "User"},
+            },
+        }
+
+        profiles = {
+            "alex-builds": {"login": "alex-builds", "name": "Alex Rivera", "bio": "building litellm adapters", "company": "", "twitterUsername": None, "websiteUrl": None, "location": None, "email": None, "socialAccounts": {"nodes": []}, "readme": None},
+            "jordan-other": {"login": "jordan-other", "name": "Jordan Lin", "bio": "backend engineer", "company": "", "twitterUsername": None, "websiteUrl": None, "location": None, "email": None, "socialAccounts": {"nodes": []}, "readme": None},
+            "cached-neg-user": {"login": "cached-neg-user", "name": "Sam K", "bio": "rust dev", "company": "", "twitterUsername": None, "websiteUrl": None, "location": None, "email": None, "socialAccounts": {"nodes": []}, "readme": None},
+            "zzz-unmatched": {"login": "zzz-unmatched", "name": "Qux Bar", "bio": "something else", "company": "", "twitterUsername": None, "websiteUrl": None, "location": None, "email": None, "socialAccounts": {"nodes": []}, "readme": None},
+        }
+
+        def fake_graphql(_token, query, variables):
+            if "BatchProfiles" not in query:
+                return {"data": {}}
+            nodes = {}
+            errors = []
+            for k, login in (variables or {}).items():
+                idx = k[1:]
+                if login == "broken-enrich":
+                    nodes[f"u{idx}"] = None
+                    errors.append({"path": [f"u{idx}"], "type": "INTERNAL", "message": "transient error"})
+                else:
+                    nodes[f"u{idx}"] = profiles.get(login)
+            result = {"data": nodes}
+            if errors:
+                result["errors"] = errors
+            return result
+
+        def fake_rest_github(url, _token):
+            if "broken-enrich" in url:
+                raise RuntimeError("transient rest error")
+            for login, node in profiles.items():
+                if url.endswith(f"/users/{login}"):
+                    return {"login": login, "name": node["name"], "bio": node["bio"]}
+            return []
+
+        def fake_llm_complete(model, messages):
+            user_prompt = str(messages[-1]["content"]) if messages else ""
+            # Simulate LiteLLMInstrumentor creating an LLM completion span inside _select_with_llm.
+            with child_span(
+                "litellm.completion",
+                kind="LLM",
+                input_value={"model": model},
+                attributes={"llm.model_name": model},
+            ) as llm_span:
+                if "alex-builds" in user_prompt:
+                    reply = json.dumps({
+                        "discord_id": "100000000000000001",
+                        "confidence": 0.94,
+                        "reason": "Full name Alex Rivera matches alex_rivera_dev and bio confirms LiteLLM work.",
+                        "evidence": ["full_name:Alex Rivera", "handle_token:alex"],
+                    })
+                else:
+                    reply = json.dumps({
+                        "discord_id": None,
+                        "confidence": 0.15,
+                        "reason": "Common name Jordan Lin with no corroborating handle or bio signal.",
+                        "evidence": [],
+                    })
+                llm_span.set_output(reply)
+                return reply
+
+        role_api_calls: list[tuple[str, str]] = []
+
+        with mock.patch("contributor_bot.rewards.add_member_role", side_effect=lambda _g, uid, rid, _t, **_kw: role_api_calls.append((uid, rid))):
+            summary = poll_merged_prs_for_roles(
+                config,
+                self.store,
+                now=now,
+                search_merged_fn=lambda _r, _s, _e, _t, **_kw: list(prs.values()),
+                pull_fetcher=lambda _r, num, _t: prs[num],
+                files_fetcher=lambda _r, _num, _t: ["litellm/proxy/proxy_server.py"],
+                org_members_fetcher=lambda _org, _t: frozenset(),
+                members=members,
+                github_getter=fake_rest_github,
+                graphql_caller=fake_graphql,
+                haiku_complete=fake_llm_complete,
+                sleep_fn=lambda _s: None,
+            )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary.roles_granted, 1)
+        spans = self.exporter.get_finished_spans()
+        agent_spans = [s for s in spans if _span_attrs(s).get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT]
+        self.assertEqual(len(agent_spans), 1)
+        root = agent_spans[0]
+        self.assertEqual(root.name, AGENT_ENGAGEMENT)
+        root_attrs = _span_attrs(root)
+
+        # Run summary attributes on engagement_agent AGENT span.
+        self.assertEqual(root_attrs["engagement.contributors"], 5)
+        self.assertEqual(root_attrs["engagement.members"], 3)
+        self.assertGreaterEqual(root_attrs["engagement.candidates"], 1)
+        self.assertEqual(root_attrs["engagement.matched"], 1)
+        self.assertEqual(root_attrs["engagement.skipped"], 4)
+        skip_reasons = json.loads(root_attrs["engagement.skip_reasons"])
+        self.assertEqual(skip_reasons.get("llm_none_of_these"), 1)
+        self.assertEqual(skip_reasons.get("cached_negative"), 1)
+        self.assertEqual(skip_reasons.get("no_signal_match"), 1)
+        self.assertEqual(skip_reasons.get("enrichment_failed"), 1)
+        methods = json.loads(root_attrs["engagement.methods"])
+        self.assertEqual(methods.get("llm"), 1)
+        self.assertEqual(root_attrs["engagement.roles_granted"], 1)
+        self.assertEqual(root_attrs["engagement.prs_discovered"], 7)
+        self.assertEqual(root_attrs["engagement.prs_stored"], 5)
+        self.assertEqual(root_attrs["engagement.prs_existing"], 1)
+        self.assertEqual(root_attrs["engagement.prs_excluded"], 1)
+        self.assertIn("engagement.duration_seconds", root_attrs)
+        self.assertIs(root_attrs["engagement.announce_enabled"], False)
+        self.assertIn(OPENINFERENCE_INPUT_VALUE_ATTR, root_attrs)
+        self.assertIn(OPENINFERENCE_OUTPUT_VALUE_ATTR, root_attrs)
+
+        # Per-contributor match_contributor spans under role_matcher -> engagement_agent.
+        rm_spans = [s for s in spans if s.name == "role_matcher"]
+        self.assertEqual(len(rm_spans), 1)
+        self.assertIs(_span_parent_obj(rm_spans[0], spans), root)
+
+        contrib_spans = {
+            _span_attrs(s)["contributor.github_login"]: s
+            for s in spans
+            if s.name == "match_contributor"
+        }
+        self.assertEqual(
+            set(contrib_spans.keys()),
+            {"alex-builds", "jordan-other", "cached-neg-user", "zzz-unmatched", "broken-enrich"},
+        )
+        for cspan in contrib_spans.values():
+            self.assertIs(_span_parent_obj(cspan, spans), rm_spans[0])
+            attrs = _span_attrs(cspan)
+            self.assertIn("contributor.candidate_count", attrs)
+            self.assertIn("contributor.top_score", attrs)
+            self.assertIn("contributor.method", attrs)
+            self.assertIn("contributor.outcome", attrs)
+            self.assertIn(OPENINFERENCE_INPUT_VALUE_ATTR, attrs)
+            self.assertIn(OPENINFERENCE_OUTPUT_VALUE_ATTR, attrs)
+
+        alex_attrs = _span_attrs(contrib_spans["alex-builds"])
+        self.assertEqual(alex_attrs["contributor.outcome"], "matched")
+        self.assertEqual(alex_attrs["contributor.method"], "llm")
+        self.assertEqual(alex_attrs["contributor.discord_id"], "100000000000000001")
+        self.assertIn("Full name Alex Rivera matches alex_rivera_dev", alex_attrs[OPENINFERENCE_OUTPUT_VALUE_ATTR])
+
+        jordan_attrs = _span_attrs(contrib_spans["jordan-other"])
+        self.assertEqual(jordan_attrs["contributor.outcome"], "skipped")
+        self.assertEqual(jordan_attrs["contributor.skip_reason"], "llm_none_of_these")
+        self.assertIn("Common name Jordan Lin", jordan_attrs[OPENINFERENCE_OUTPUT_VALUE_ATTR])
+
+        self.assertEqual(_span_attrs(contrib_spans["cached-neg-user"])["contributor.skip_reason"], "cached_negative")
+        self.assertEqual(_span_attrs(contrib_spans["zzz-unmatched"])["contributor.skip_reason"], "no_signal_match")
+        self.assertEqual(_span_attrs(contrib_spans["broken-enrich"])["contributor.skip_reason"], "enrichment_failed")
+
+        # LLM completions MUST nest directly under their own contributor's match_contributor span (no orphans!).
+        llm_spans = [s for s in spans if _span_attrs(s).get(OPENINFERENCE_SPAN_KIND_ATTR) == "LLM"]
+        self.assertEqual(len(llm_spans), 2)
+        llm_parents = {_span_attrs(_span_parent_obj(ls, spans))["contributor.github_login"] for ls in llm_spans}
+        self.assertEqual(llm_parents, {"alex-builds", "jordan-other"})
+
+        # Role grant span + role_granted event with full metadata & evidence list.
+        grant_spans = [s for s in spans if s.name == "grant_role"]
+        self.assertEqual(len(grant_spans), 1)
+        gspan = grant_spans[0]
+        self.assertIs(_span_parent_obj(gspan, spans), root)
+        gattrs = _span_attrs(gspan)
+        self.assertEqual(gattrs[OPENINFERENCE_SPAN_KIND_ATTR], OPENINFERENCE_SPAN_KIND_TOOL)
+        self.assertEqual(gattrs["grant.discord_id"], "100000000000000001")
+        self.assertEqual(gattrs["grant.github_login"], "alex-builds")
+        self.assertEqual(gattrs["grant.role_id"], "555000111222333444")
+        self.assertTrue(gattrs["grant.role_name"])
+        self.assertEqual(gattrs["grant.method"], "llm")
+        self.assertGreaterEqual(float(gattrs["grant.confidence"]), 0.9)
+        grant_evidence = json.loads(gattrs["grant.evidence"])
+        self.assertIsInstance(grant_evidence, list)
+        self.assertGreaterEqual(len(grant_evidence), 1)
+        grant_events = dict(_span_events(gspan))
+        self.assertIn("role_granted", grant_events)
+        self.assertEqual(grant_events["role_granted"]["grant.discord_id"], "100000000000000001")
+
+        # Log -> span event parity for match_skipped, match_summary, roles_poll_complete, roles_granted_silent.
+        rm_event_names = [name for name, _ in _span_events(rm_spans[0])]
+        self.assertIn("match_skipped", rm_event_names)
+        self.assertIn("match_summary", rm_event_names)
+        root_event_names = [name for name, _ in _span_events(root)]
+        self.assertIn("roles_poll_complete", root_event_names)
+        self.assertIn("roles_granted_silent", root_event_names)
+
+    def test_pr_review_agent_observability_decision_verdict_findings_and_skips(self) -> None:
+        from contributor_bot import review_job
+        from contributor_bot.review_agent import AgentResult, ReviewContext, tool_submit_verdict
+        from contributor_bot.tracing import OPENINFERENCE_INPUT_VALUE_ATTR, OPENINFERENCE_OUTPUT_VALUE_ATTR
+
+        config = _base_config(
+            self.db_path,
+            pr_review_enabled=True,
+            review_channel_ids=("333333333333333333",),
+            review_cooldown_seconds=3600,
+            review_daily_run_budget=1,
+        )
+        now_iso = datetime.now(UTC).isoformat()
+
+        # 1. Request detection + cooldown skip in handle_routed_message.
+        self.store.save_review_thread(
+            repository="BerriAI/litellm",
+            number=7701,
+            channel_id="333333333333333333",
+            message_id="600000000000000010",
+            thread_id="700000000000000010",
+            created_at=now_iso,
+        )
+        self.store.mark_review_done("BerriAI/litellm", 7701, now_iso, "deadbeef")
+        msg = {
+            "id": "600000000000000011",
+            "content": "please review https://github.com/BerriAI/litellm/pull/7701",
+            "author": {"id": "111", "bot": False},
+        }
+        pr_review_agent.handle_routed_message(
+            config,
+            self.store,
+            "333333333333333333",
+            msg,
+            route_info={"target": AGENT_PR_REVIEW, "reason": "pr_review_request", "pr_numbers": [7701]},
+        )
+
+        # 2. Full review posting a verdict with findings + posted message id.
+        def fake_run_sdk(ctx: ReviewContext, _task: str, _cfg: Config) -> AgentResult:
+            ctx.snapshot = types.SimpleNamespace(
+                number=7702,
+                title="Add router retry",
+                body="",
+                author="dev",
+                author_id=12345,
+                state="open",
+                draft=False,
+                merged=False,
+                head_sha="abc1234",
+                mergeable=True,
+                mergeable_state="clean",
+                reviews=[],
+                comments=[],
+                threads=[],
+                check_runs=[],
+                combined_state="success",
+                diff="",
+            )
+            ctx.files = []
+            with mock.patch("contributor_bot.review_agent.post_message", return_value={"id": "999888777"}):
+                tool_submit_verdict(
+                    ctx,
+                    {
+                        "verdict": "needs_changes",
+                        "findings": [
+                            {
+                                "issue": "missing unit test in tests/test_router.py",
+                                "suggestion": "add a pytest case covering fallback retry exhaustion in tests/test_router.py",
+                                "file": "tests/test_router.py",
+                            },
+                            {
+                                "issue": "unused import in proxy_server.py",
+                                "suggestion": "remove the unused os import at top of litellm/proxy/proxy_server.py",
+                                "file": "litellm/proxy/proxy_server.py",
+                            },
+                        ],
+                    },
+                )
+            return AgentResult("posted verdict", steps=2)
+
+        with mock.patch("contributor_bot.review_job._ensure_thread", return_value="700000000000000012"):
+            with mock.patch("contributor_bot.review_job.fetch_recent_messages", return_value=[]):
+                with mock.patch("contributor_bot.review_agent._run_sdk_session", side_effect=fake_run_sdk):
+                    res_ok = review_job.perform_review(
+                        config,
+                        self.store,
+                        7702,
+                        channel_id="333333333333333333",
+                        message_id="600000000000000012",
+                        source="new",
+                    )
+        self.assertEqual(res_ok["status"], "posted")
+        self.assertEqual(res_ok["posted_message_id"], "999888777")
+
+        # 3. Daily budget skip on a second PR (#7703).
+        res_budget = review_job.perform_review(
+            config,
+            self.store,
+            7703,
+            channel_id="333333333333333333",
+            message_id="600000000000000013",
+            source="new",
+        )
+        self.assertEqual(res_budget["status"], "budget")
+
+        # 4. In-flight dedupe skip when lock is already held.
+        self.assertTrue(review_job._try_lock("BerriAI/litellm", 7704))
+        try:
+            res_busy = review_job.perform_review(config, self.store, 7704, source="new")
+        finally:
+            review_job._unlock("BerriAI/litellm", 7704)
+        self.assertEqual(res_busy["status"], "busy")
+
+        spans = self.exporter.get_finished_spans()
+        agent_spans = [s for s in spans if _span_attrs(s).get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT]
+        self.assertEqual(len(agent_spans), 4)
+        self.assertTrue(all(s.name == AGENT_PR_REVIEW for s in agent_spans))
+
+        # Verify cooldown skip span (run 1).
+        cd_attrs = _span_attrs(agent_spans[0])
+        self.assertIs(cd_attrs["review.request_detected"], True)
+        self.assertEqual(json.loads(cd_attrs["review.pr_numbers"]), [7701])
+        self.assertEqual(cd_attrs["review.skip_reason"], "cooldown")
+        self.assertIn("review_skipped", dict(_span_events(agent_spans[0])))
+        self.assertIn(OPENINFERENCE_INPUT_VALUE_ATTR, cd_attrs)
+        self.assertIn(OPENINFERENCE_OUTPUT_VALUE_ATTR, cd_attrs)
+
+        # Verify posted verdict span (run 2).
+        ok_attrs = _span_attrs(agent_spans[1])
+        self.assertEqual(ok_attrs["pr.number"], 7702)
+        self.assertEqual(ok_attrs["review.verdict"], "needs work")
+        self.assertEqual(ok_attrs["review.findings_count"], 2)
+        self.assertEqual(len(json.loads(ok_attrs["review.findings"])), 2)
+        self.assertEqual(ok_attrs["review.posted_message_id"], "999888777")
+        self.assertIn(OPENINFERENCE_OUTPUT_VALUE_ATTR, ok_attrs)
+        ok_events = dict(_span_events(agent_spans[1]))
+        self.assertIn("review_started", ok_events)
+        self.assertIn("review_verdict_posted", ok_events)
+        session_spans = [s for s in spans if s.name == "pr_review_session"]
+        self.assertEqual(len(session_spans), 1)
+        self.assertIn("review_verdict_submitted", dict(_span_events(session_spans[0])))
+
+        # Verify daily budget skip (run 3) and in-flight dedupe skip (run 4).
+        self.assertEqual(_span_attrs(agent_spans[2])["review.skip_reason"], "daily_budget")
+        self.assertIn("review_skipped", dict(_span_events(agent_spans[2])))
+        self.assertEqual(_span_attrs(agent_spans[3])["review.skip_reason"], "in_flight_dedupe")
+        self.assertIn("review_skipped", dict(_span_events(agent_spans[3])))
+
+    def test_support_agent_observability_detection_kb_retrieval_answer_and_skips(self) -> None:
+        from contributor_bot.tracing import OPENINFERENCE_INPUT_VALUE_ATTR, OPENINFERENCE_OUTPUT_VALUE_ATTR
+
+        config = _base_config(
+            self.db_path,
+            support_agent_enabled=True,
+            support_agent_channel_ids=("444444444444444444",),
+        )
+        kb = _make_mock_kb(store=self.store)
+        kb.refresh()
+
+        # 1. Answered question with KB retrieval and returned Discord message ID.
+        ans = answer_support_question(
+            config,
+            "444444444444444444",
+            "How do I configure router fallbacks and num_retries in LiteLLM proxy?",
+            store=self.store,
+            kb=kb,
+            complete=lambda _s, _u: json.dumps({
+                "action": "reply",
+                "confidence": 0.92,
+                "reply": "set `num_retries` and `fallbacks` under `router_settings` in config.yaml.",
+                "citations": ["https://docs.litellm.ai/docs/proxy/reliability"],
+            }),
+            poster=lambda _c, _text: {"id": "8880001"},
+            route_info={"target": AGENT_SUPPORT, "reason": "support_question"},
+        )
+        self.assertEqual(ans.action, "reply")
+        self.assertEqual(ans.posted_message_id, "8880001")
+
+        # 2. Second message in same channel hits channel_cooldown (still recorded on a span!).
+        cooled = answer_support_question(
+            config,
+            "444444444444444444",
+            "How do I create virtual keys with max_budget in LiteLLM?",
+            store=self.store,
+            kb=kb,
+            route_info={"target": AGENT_SUPPORT, "reason": "support_question"},
+        )
+        self.assertEqual(cooled.action, "skipped")
+        self.assertEqual(cooled.reason, "channel_cooldown")
+
+        # 3. Low-confidence skip (bypass_cooldown=True).
+        low = answer_support_question(
+            config,
+            "444444444444444444",
+            "How do I configure router fallbacks in LiteLLM?",
+            store=self.store,
+            kb=kb,
+            bypass_cooldown=True,
+            complete=lambda _s, _u: json.dumps({
+                "action": "reply",
+                "confidence": 0.25,
+                "reply": "maybe try something",
+                "citations": [],
+            }),
+            poster=lambda _c, _text: {"id": "never"},
+        )
+        self.assertEqual(low.action, "silent")
+        self.assertEqual(low.reason, "low_confidence")
+
+        spans = self.exporter.get_finished_spans()
+        agent_spans = [s for s in spans if _span_attrs(s).get(OPENINFERENCE_SPAN_KIND_ATTR) == OPENINFERENCE_SPAN_KIND_AGENT]
+        self.assertEqual(len(agent_spans), 3)
+        self.assertTrue(all(s.name == AGENT_SUPPORT for s in agent_spans))
+
+        # Run 1 assertions: answered.
+        a1 = _span_attrs(agent_spans[0])
+        self.assertIs(a1["support.question_detected"], True)
+        self.assertGreaterEqual(int(a1["support.kb_hits_count"]), 1)
+        self.assertIn("https://docs.litellm.ai/docs/proxy/reliability", json.loads(a1["support.kb_urls"]))
+        self.assertEqual(a1["support.outcome"], "reply")
+        self.assertIs(a1["support.posted"], True)
+        self.assertEqual(a1["support.posted_message_id"], "8880001")
+        self.assertIn(OPENINFERENCE_INPUT_VALUE_ATTR, a1)
+        self.assertIn(OPENINFERENCE_OUTPUT_VALUE_ATTR, a1)
+        e1 = dict(_span_events(agent_spans[0]))
+        self.assertIn("support_kb_retrieved", e1)
+        self.assertIn("support_answered", e1)
+
+        # Run 2 assertions: channel_cooldown skip.
+        a2 = _span_attrs(agent_spans[1])
+        self.assertIs(a2["support.question_detected"], True)
+        self.assertEqual(a2["support.outcome"], "skipped")
+        self.assertEqual(a2["support.skip_reason"], "channel_cooldown")
+        self.assertIn("support_skipped", dict(_span_events(agent_spans[1])))
+
+        # Run 3 assertions: low_confidence skip.
+        a3 = _span_attrs(agent_spans[2])
+        self.assertEqual(a3["support.outcome"], "silent")
+        self.assertEqual(a3["support.skip_reason"], "low_confidence")
+        self.assertIn("support_skipped", dict(_span_events(agent_spans[2])))
 
 
 if __name__ == "__main__":

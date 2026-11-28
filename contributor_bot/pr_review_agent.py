@@ -78,7 +78,11 @@ def handle_routed_message(
                 "message_router",
                 kind=OPENINFERENCE_SPAN_KIND_CHAIN,
                 input_value={"channel_id": str(channel_id), "content": text[:500]},
-                attributes={"router.target": AGENT_NAME},
+                attributes={
+                    "router.target": AGENT_NAME,
+                    "router.reason": str(route_info.get("reason") or ""),
+                    "router.pr_numbers": list(route_info.get("pr_numbers") or ()),
+                },
             ) as router_span:
                 router_span.set_output(route_info)
         outcome = handle_review_channel_message(config, store, channel_id, message)

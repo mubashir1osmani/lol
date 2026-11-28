@@ -174,6 +174,9 @@ class AgentResult:
     output_tokens: int = 0
     tool_calls: int = 0
     step_seconds: list = field(default_factory=list)
+    findings: list = field(default_factory=list)
+    bullets: list = field(default_factory=list)
+    posted_message_ids: list = field(default_factory=list)
 
 
 def _attr(obj, key):
@@ -333,6 +336,8 @@ class ReviewContext:
     posts_left: int = 6
     verdict_ready: bool = False
     verdict: str = ""
+    verdict_findings: list = field(default_factory=list)
+    verdict_bullets: list = field(default_factory=list)
     pinged: bool = False
     verdict_posted: bool = False
     steps: int = 0
@@ -801,8 +806,21 @@ def tool_submit_verdict(ctx: ReviewContext, args: dict) -> str:
     ctx.verdict_posted = True
     ctx.verdict_ready = ready
     ctx.verdict = verdict
+    ctx.verdict_findings = list(findings)
+    ctx.verdict_bullets = list(bullets)
     ctx.pinged = bool(ready and role_id)
-    return _json({"verdict": verdict, "ready": ready, "reasons": list(bullets)})
+    from .tracing import record_span_event
+    record_span_event(
+        "review_verdict_submitted",
+        {
+            "pr.number": int(ctx.number),
+            "review.verdict": verdict,
+            "review.ready": bool(ready),
+            "review.findings_count": len(findings),
+            "review.posted_message_ids": list(ctx.posted_ids),
+        },
+    )
+    return _json({"verdict": verdict, "ready": ready, "reasons": list(bullets), "posted_message_ids": list(ctx.posted_ids)})
 
 
 def tool_ping_maintainer(ctx: ReviewContext, _args: dict) -> str:
@@ -1345,6 +1363,9 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
             result.verdict_posted = ctx.verdict_posted
             result.ready = ctx.verdict_ready if ctx.verdict_posted else None
             result.verdict = ctx.verdict
+            result.findings = list(ctx.verdict_findings)
+            result.bullets = list(ctx.verdict_bullets)
+            result.posted_message_ids = list(ctx.posted_ids)
             if ctx.snapshot is not None and isinstance(getattr(ctx.snapshot, "head_sha", ""), str):
                 result.head_sha = ctx.snapshot.head_sha
             if not ctx.verdict_posted and not ctx.posted_ids:
@@ -1355,19 +1376,48 @@ def run_review_session(config, store, number: int, thread_id: str, *, mode: str,
                 if mode == "followup" or result.exhausted or mode == "review":
                     try:
                         _post_text(ctx, note)
+                        result.posted_message_ids = list(ctx.posted_ids)
                     except Exception:
                         logging.exception("Could not post the agent note for #%s", number)
+            primary_msg_id = result.posted_message_ids[0] if result.posted_message_ids else ""
+            result_attrs = {
+                "pr.number": int(number),
+                "review.verdict": result.verdict or ("followup" if mode == "followup" else "none"),
+                "review.verdict_posted": bool(result.verdict_posted),
+                "review.findings_count": len(result.findings),
+                "review.findings": result.findings[:10],
+                "review.bullets": result.bullets[:10],
+                "review.posted_message_ids": result.posted_message_ids,
+                "review.posted_message_id": primary_msg_id,
+                "review.steps": int(result.steps),
+            }
+            if result.ready is not None:
+                result_attrs["review.ready"] = bool(result.ready)
+            if result.exhausted:
+                result_attrs["review.exhausted"] = str(result.exhausted)
             output_payload = {
+                "pr_number": int(number),
+                "mode": mode,
                 "verdict_posted": result.verdict_posted,
                 "verdict": result.verdict,
                 "ready": result.ready,
+                "findings_count": len(result.findings),
+                "findings": result.findings[:10],
+                "bullets": result.bullets[:10],
+                "posted_message_ids": result.posted_message_ids,
+                "posted_message_id": primary_msg_id,
                 "exhausted": result.exhausted,
                 "steps": result.steps,
                 "text": (result.text or "")[:1000],
             }
+            span.set_attributes(result_attrs)
             span.set_output(output_payload)
-            if outer_span is not None:
-                outer_span.set_output(output_payload)
+            from .tracing import current_agent_span
+            target_agent = outer_span if outer_span is not None else current_agent_span()
+            if target_agent is not None and target_agent.active:
+                target_agent.set_attributes(result_attrs)
+                if outer_span is not None:
+                    outer_span.set_output(output_payload)
             return result
 
 

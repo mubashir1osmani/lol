@@ -68,11 +68,29 @@ _atexit_registered = False
 _ACTIVE_AGENT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "contributor_bot_active_agent", default=None
 )
+_ACTIVE_AGENT_SPAN_HANDLE: contextvars.ContextVar[_SpanHandle | None] = contextvars.ContextVar(
+    "contributor_bot_active_agent_span_handle", default=None
+)
+_ACTIVE_SPAN_HANDLE: contextvars.ContextVar[_SpanHandle | None] = contextvars.ContextVar(
+    "contributor_bot_active_span_handle", default=None
+)
 
 
 def current_agent_name() -> str | None:
     """Return the active top-level agent name in the current context, if any."""
     return _ACTIVE_AGENT.get()
+
+
+def current_agent_span() -> _SpanHandle:
+    """Return the active top-level AGENT span handle, or a no-op handle."""
+    handle = _ACTIVE_AGENT_SPAN_HANDLE.get()
+    return handle if handle is not None else _NOOP_SPAN
+
+
+def current_span() -> _SpanHandle:
+    """Return the innermost active span handle, or a no-op handle when tracing is off."""
+    handle = _ACTIVE_SPAN_HANDLE.get()
+    return handle if handle is not None else _NOOP_SPAN
 
 
 def _endpoint_with_source(env: Mapping[str, str] | None = None) -> tuple[str, str]:
@@ -344,14 +362,47 @@ def _serialize_span_value(value: object) -> tuple[str, str]:
 def _set_safe_attribute(span, key: str, value: object) -> None:
     if span is None or value is None:
         return
-    if isinstance(value, (bool, int, float, str)):
-        if isinstance(value, str) and not value:
-            return
+    if isinstance(value, (bool, int, float)):
         span.set_attribute(key, value)
+    elif isinstance(value, str):
+        if value:
+            span.set_attribute(key, value[:_MAX_SPAN_VALUE_CHARS])
+    elif isinstance(value, (dict, list, tuple)):
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            encoded = str(value)
+        span.set_attribute(key, encoded[:_MAX_SPAN_VALUE_CHARS])
     else:
         text = str(value).strip()
         if text:
             span.set_attribute(key, text[:_MAX_SPAN_VALUE_CHARS])
+
+
+def _sanitize_event_attributes(attributes: Mapping[str, object] | None) -> dict[str, object]:
+    if not attributes:
+        return {}
+    clean: dict[str, object] = {}
+    for raw_key, value in attributes.items():
+        if value is None:
+            continue
+        key = str(raw_key)
+        if isinstance(value, (bool, int, float)):
+            clean[key] = value
+        elif isinstance(value, str):
+            if value:
+                clean[key] = value[:_MAX_SPAN_VALUE_CHARS]
+        elif isinstance(value, (dict, list, tuple)):
+            try:
+                encoded = json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                encoded = str(value)
+            clean[key] = encoded[:_MAX_SPAN_VALUE_CHARS]
+        else:
+            text = str(value).strip()
+            if text:
+                clean[key] = text[:_MAX_SPAN_VALUE_CHARS]
+    return clean
 
 
 class _SpanHandle:
@@ -369,6 +420,36 @@ class _SpanHandle:
 
     def set_attribute(self, key: str, value: object) -> None:
         _set_safe_attribute(self._span, key, value)
+
+    def set_attributes(self, attributes: Mapping[str, object] | None) -> None:
+        if self._span is None or not attributes:
+            return
+        for key, value in attributes.items():
+            if isinstance(value, (dict, list, tuple)):
+                try:
+                    encoded = json.dumps(value, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    encoded = str(value)
+                _set_safe_attribute(self._span, str(key), encoded)
+            else:
+                _set_safe_attribute(self._span, str(key), value)
+
+    def add_event(self, name: str, attributes: Mapping[str, object] | None = None) -> None:
+        if self._span is None or not name:
+            return
+        add_event_fn = getattr(self._span, "add_event", None)
+        if not callable(add_event_fn):
+            return
+        clean = _sanitize_event_attributes(attributes)
+        try:
+            add_event_fn(str(name), attributes=clean)
+        except TypeError:
+            try:
+                add_event_fn(str(name), clean)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def set_input(self, value: object) -> None:
         if self._span is None or value is None:
@@ -388,6 +469,38 @@ class _SpanHandle:
 
 
 _NOOP_SPAN = _SpanHandle(None, "")
+
+
+def record_span_event(name: str, attributes: Mapping[str, object] | None = None) -> None:
+    """Attach a structured event to the innermost active span (no-op when tracing is off)."""
+    handle = _ACTIVE_SPAN_HANDLE.get()
+    if handle is not None and handle.active:
+        handle.add_event(name, attributes)
+
+
+def log_decision(
+    event_name: str,
+    message: str,
+    *args,
+    attributes: Mapping[str, object] | None = None,
+    level: int = logging.INFO,
+) -> None:
+    """Log a decision AND mirror it onto the active OTel span (log -> span parity)."""
+    logging.log(level, message, *args)
+    handle = _ACTIVE_SPAN_HANDLE.get()
+    if handle is None or not handle.active:
+        return
+    try:
+        rendered = (message % args) if args else message
+    except Exception:
+        rendered = message
+    payload: dict[str, object] = {
+        "log.level": logging.getLevelName(level),
+        "log.message": rendered[:_MAX_SPAN_VALUE_CHARS],
+    }
+    if attributes:
+        payload.update(attributes)
+    handle.add_event(event_name, payload)
 
 
 def _using_session_cm(session_id: str):
@@ -443,12 +556,12 @@ def child_span(
     span_kind = (kind or OPENINFERENCE_SPAN_KIND_CHAIN).strip() or OPENINFERENCE_SPAN_KIND_CHAIN
     with tracer.start_as_current_span(span_name) as span:
         handle = _SpanHandle(span, "")
+        handle_token = _ACTIVE_SPAN_HANDLE.set(handle)
         span.set_attribute(OPENINFERENCE_SPAN_KIND_ATTR, span_kind)
         if input_value is not None:
             handle.set_input(input_value)
         if attributes:
-            for key, value in attributes.items():
-                handle.set_attribute(str(key), value)
+            handle.set_attributes(attributes)
         try:
             yield handle
         except Exception as exc:
@@ -462,6 +575,8 @@ def child_span(
             raise
         else:
             _set_span_status(span, ok=True)
+        finally:
+            _ACTIVE_SPAN_HANDLE.reset(handle_token)
 
 
 @contextmanager
@@ -521,14 +636,15 @@ def agent_span(
     try:
         with tracer.start_as_current_span(agent_name) as span:
             handle = _SpanHandle(span, sid)
+            agent_handle_token = _ACTIVE_AGENT_SPAN_HANDLE.set(handle)
+            handle_token = _ACTIVE_SPAN_HANDLE.set(handle)
             span.set_attribute(OPENINFERENCE_SPAN_KIND_ATTR, OPENINFERENCE_SPAN_KIND_AGENT)
             span.set_attribute(OPENINFERENCE_AGENT_NAME_ATTR, agent_name)
             span.set_attribute(OPENINFERENCE_SESSION_ID_ATTR, sid)
             if input_value is not None:
                 handle.set_input(input_value)
             if attributes:
-                for key, value in attributes.items():
-                    handle.set_attribute(str(key), value)
+                handle.set_attributes(attributes)
             with _using_session_cm(sid):
                 try:
                     yield handle
@@ -543,6 +659,9 @@ def agent_span(
                     raise
                 else:
                     _set_span_status(span, ok=True)
+                finally:
+                    _ACTIVE_SPAN_HANDLE.reset(handle_token)
+                    _ACTIVE_AGENT_SPAN_HANDLE.reset(agent_handle_token)
     finally:
         _ACTIVE_AGENT.reset(token)
         flush_tracing()

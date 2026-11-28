@@ -49,6 +49,7 @@ from .tracing import (
     agent_span,
     build_trace_metadata,
     child_span,
+    log_decision,
     tool_span,
 )
 
@@ -155,6 +156,7 @@ class SupportOutcome:
     confidence: float = 0.0
     citations: tuple[str, ...] = ()
     posted: bool = False
+    posted_message_id: str = ""
     reason: str = ""
 
 
@@ -618,6 +620,14 @@ class LiteLLMKnowledgeBase:
 
             scored.sort(key=lambda h: (-h.score, h.doc.doc_id))
             top = scored[: max(1, limit)]
+            top_urls = [h.doc.url for h in top]
+            top_titles = [h.doc.title for h in top]
+            span.set_attributes({
+                "kb.hits_count": len(top),
+                "kb.top_score": round(top[0].score, 2) if top else 0.0,
+                "kb.urls": top_urls,
+                "kb.titles": top_titles,
+            })
             span.set_output(
                 {
                     "hits": len(top),
@@ -705,17 +715,55 @@ def answer_support_question(
     route_info: dict | None = None,
 ) -> SupportOutcome:
     """Answer one LiteLLM support question inside the ``support_agent`` AGENT span."""
-    if not bypass_cooldown:
-        now = time.monotonic()
-        if now - _recent_channel_reply.get(str(channel_id), 0.0) < _CHANNEL_COOLDOWN_SECONDS:
-            return SupportOutcome(action="skipped", reason="channel_cooldown")
-        _recent_channel_reply[str(channel_id)] = now
-
     safe_question = discord_safe(text or "")[:1500].strip()
     if not safe_question:
         return SupportOutcome(action="silent", reason="empty_question")
 
     session_id = f"{AGENT_NAME}:{channel_id}"
+    question_detected = bool(
+        (route_info or {}).get("reason") == "support_question"
+        or is_support_question(safe_question, getattr(config, "github_repository", "BerriAI/litellm"))
+    )
+
+    if not bypass_cooldown:
+        now = time.monotonic()
+        if now - _recent_channel_reply.get(str(channel_id), 0.0) < _CHANNEL_COOLDOWN_SECONDS:
+            with agent_span(
+                AGENT_NAME,
+                session_id=session_id,
+                input_value={"channel_id": str(channel_id), "question": safe_question},
+                attributes={
+                    "discord.channel_id": str(channel_id),
+                    "support.question_detected": question_detected,
+                    "support.outcome": "skipped",
+                    "support.skip_reason": "channel_cooldown",
+                },
+            ) as span:
+                if route_info is not None:
+                    with child_span(
+                        "message_router",
+                        kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+                        input_value={"channel_id": str(channel_id), "content": safe_question[:500]},
+                        attributes={
+                            "router.target": AGENT_NAME,
+                            "router.reason": str(route_info.get("reason") or ""),
+                        },
+                    ) as router_span:
+                        router_span.set_output(route_info)
+                log_decision(
+                    "support_skipped",
+                    "Support question in channel %s skipped: channel_cooldown",
+                    channel_id,
+                    attributes={
+                        "discord.channel_id": str(channel_id),
+                        "support.question_detected": question_detected,
+                        "support.skip_reason": "channel_cooldown",
+                    },
+                )
+                span.set_output({"action": "skipped", "reason": "channel_cooldown"})
+            return SupportOutcome(action="skipped", reason="channel_cooldown")
+        _recent_channel_reply[str(channel_id)] = now
+
     active_kb = kb or LiteLLMKnowledgeBase(
         store=store,
         repository=getattr(config, "github_repository", "BerriAI/litellm"),
@@ -727,24 +775,62 @@ def answer_support_question(
         AGENT_NAME,
         session_id=session_id,
         input_value={"channel_id": str(channel_id), "question": safe_question},
-        attributes={"discord.channel_id": str(channel_id)},
+        attributes={
+            "discord.channel_id": str(channel_id),
+            "support.question_detected": question_detected,
+        },
     ) as span:
         if route_info is not None:
             with child_span(
                 "message_router",
                 kind=OPENINFERENCE_SPAN_KIND_CHAIN,
                 input_value={"channel_id": str(channel_id), "content": safe_question[:500]},
-                attributes={"router.target": AGENT_NAME},
+                attributes={
+                    "router.target": AGENT_NAME,
+                    "router.reason": str(route_info.get("reason") or ""),
+                },
             ) as router_span:
                 router_span.set_output(route_info)
 
         hits = active_kb.search(safe_question, limit=4, refresh_if_needed=(kb is None))
         strong_hits = [h for h in hits if h.score >= MIN_KB_SCORE]
+        kb_urls = [h.doc.url for h in strong_hits]
+        kb_titles = [h.doc.title for h in strong_hits]
+        span.set_attributes({
+            "support.kb_hits_count": len(hits),
+            "support.kb_strong_hits_count": len(strong_hits),
+            "support.kb_urls": kb_urls,
+            "support.kb_titles": kb_titles,
+        })
+        log_decision(
+            "support_kb_retrieved",
+            "Support KB retrieved %d hits (%d strong) for channel %s",
+            len(hits),
+            len(strong_hits),
+            channel_id,
+            attributes={
+                "support.kb_hits_count": len(hits),
+                "support.kb_strong_hits_count": len(strong_hits),
+                "support.kb_urls": kb_urls,
+            },
+        )
 
         # If we have a real KB configured (or mocked) and nothing matched at all, stay silent rather than hallucinating.
         if not strong_hits and complete is None:
             outcome = SupportOutcome(action="silent", reason="no_kb_match")
-            span.set_output({"action": outcome.action, "reason": outcome.reason})
+            span.set_attributes({
+                "support.outcome": outcome.action,
+                "support.skip_reason": outcome.reason,
+                "support.posted": False,
+            })
+            log_decision(
+                "support_skipped",
+                "Support question in channel %s skipped: %s",
+                channel_id,
+                outcome.reason,
+                attributes={"support.outcome": outcome.action, "support.skip_reason": outcome.reason},
+            )
+            span.set_output({"action": outcome.action, "reason": outcome.reason, "kb_hits": len(hits)})
             return outcome
 
         kb_context = _build_kb_context(active_kb, strong_hits, fetch_pages=fetch_pages) if strong_hits else "(no matching LiteLLM KB excerpts found)"
@@ -780,6 +866,19 @@ def answer_support_question(
         except Exception as error:
             logging.warning("Support agent LLM call failed: %s", error)
             outcome = SupportOutcome(action="silent", reason="llm_error")
+            span.set_attributes({
+                "support.outcome": outcome.action,
+                "support.skip_reason": outcome.reason,
+                "support.posted": False,
+            })
+            log_decision(
+                "support_skipped",
+                "Support question in channel %s skipped: %s",
+                channel_id,
+                outcome.reason,
+                attributes={"support.outcome": outcome.action, "support.skip_reason": outcome.reason},
+                level=logging.WARNING,
+            )
             span.set_output({"action": outcome.action, "reason": outcome.reason})
             return outcome
 
@@ -800,12 +899,48 @@ def answer_support_question(
                 citations = [strong_hits[0].doc.url]
             if action == "silent":
                 outcome = SupportOutcome(action="silent", confidence=confidence, reason="model_silent")
-                span.set_output({"action": outcome.action, "confidence": confidence})
+                span.set_attributes({
+                    "support.outcome": outcome.action,
+                    "support.skip_reason": outcome.reason,
+                    "support.confidence": confidence,
+                    "support.posted": False,
+                })
+                log_decision(
+                    "support_skipped",
+                    "Support question in channel %s skipped: %s (confidence=%.2f)",
+                    channel_id,
+                    outcome.reason,
+                    confidence,
+                    attributes={
+                        "support.outcome": outcome.action,
+                        "support.skip_reason": outcome.reason,
+                        "support.confidence": confidence,
+                    },
+                )
+                span.set_output({"action": outcome.action, "confidence": confidence, "reason": outcome.reason})
                 return outcome
             if action == "flag_maintainer" or (action == "reply" and confidence < MIN_CONFIDENCE_TO_REPLY):
                 if action == "reply" and confidence < MIN_CONFIDENCE_TO_REPLY:
                     # Low confidence: stay silent rather than risking invented config.
                     outcome = SupportOutcome(action="silent", confidence=confidence, reason="low_confidence")
+                    span.set_attributes({
+                        "support.outcome": outcome.action,
+                        "support.skip_reason": outcome.reason,
+                        "support.confidence": confidence,
+                        "support.posted": False,
+                    })
+                    log_decision(
+                        "support_skipped",
+                        "Support question in channel %s skipped: %s (confidence=%.2f)",
+                        channel_id,
+                        outcome.reason,
+                        confidence,
+                        attributes={
+                            "support.outcome": outcome.action,
+                            "support.skip_reason": outcome.reason,
+                            "support.confidence": confidence,
+                        },
+                    )
                     span.set_output({"action": outcome.action, "confidence": confidence, "reason": outcome.reason})
                     return outcome
                 reply_text = format_support_reply(
@@ -815,6 +950,19 @@ def answer_support_question(
             else:
                 if not strong_hits:
                     outcome = SupportOutcome(action="silent", confidence=confidence, reason="ungrounded")
+                    span.set_attributes({
+                        "support.outcome": outcome.action,
+                        "support.skip_reason": outcome.reason,
+                        "support.confidence": confidence,
+                        "support.posted": False,
+                    })
+                    log_decision(
+                        "support_skipped",
+                        "Support question in channel %s skipped: %s",
+                        channel_id,
+                        outcome.reason,
+                        attributes={"support.outcome": outcome.action, "support.skip_reason": outcome.reason},
+                    )
                     span.set_output({"action": outcome.action, "reason": outcome.reason})
                     return outcome
                 reply_text = format_support_reply(str(parsed.get("reply") or ""), cited_urls=citations)
@@ -828,16 +976,30 @@ def answer_support_question(
 
         if not reply_text:
             outcome = SupportOutcome(action="silent", confidence=confidence, reason="empty_reply")
+            span.set_attributes({
+                "support.outcome": outcome.action,
+                "support.skip_reason": outcome.reason,
+                "support.confidence": confidence,
+                "support.posted": False,
+            })
+            log_decision(
+                "support_skipped",
+                "Support question in channel %s skipped: %s",
+                channel_id,
+                outcome.reason,
+                attributes={"support.outcome": outcome.action, "support.skip_reason": outcome.reason},
+            )
             span.set_output({"action": outcome.action, "reason": outcome.reason})
             return outcome
 
         posted = False
+        posted_message_id = ""
         with tool_span("post_support_reply", input_value={"channel_id": str(channel_id), "chars": len(reply_text)}) as tspan:
             try:
                 if poster is not None:
-                    poster(channel_id, reply_text)
+                    post_res = poster(channel_id, reply_text)
                 else:
-                    post_message(
+                    post_res = post_message(
                         channel_id,
                         config.discord_token,
                         {
@@ -845,8 +1007,17 @@ def answer_support_question(
                             "allowed_mentions": {"parse": []},
                         },
                     )
+                if isinstance(post_res, dict) and post_res.get("id"):
+                    posted_message_id = str(post_res["id"])
+                elif isinstance(post_res, str) and post_res.strip():
+                    posted_message_id = post_res.strip()
                 posted = True
-                tspan.set_output({"posted": True})
+                tspan.set_attributes({
+                    "discord.channel_id": str(channel_id),
+                    "discord.message_id": posted_message_id,
+                    "support.posted": True,
+                })
+                tspan.set_output({"posted": True, "message_id": posted_message_id})
             except Exception as error:
                 logging.warning("Could not post support reply to %s: %s", channel_id, error)
                 tspan.set_output({"posted": False, "error": str(error)[:200]})
@@ -857,6 +1028,33 @@ def answer_support_question(
             confidence=confidence,
             citations=tuple(citations),
             posted=posted,
+            posted_message_id=posted_message_id,
+        )
+        span.set_attributes({
+            "support.outcome": outcome.action,
+            "support.skip_reason": "",
+            "support.confidence": outcome.confidence,
+            "support.citations": list(outcome.citations),
+            "support.posted": outcome.posted,
+            "support.posted_message_id": posted_message_id,
+        })
+        event_name = "support_flagged_maintainer" if outcome.action == "flag_maintainer" else "support_answered"
+        log_decision(
+            event_name,
+            "Support agent %s in channel %s (confidence=%.2f posted=%s citations=%d)",
+            outcome.action,
+            channel_id,
+            outcome.confidence,
+            outcome.posted,
+            len(outcome.citations),
+            attributes={
+                "discord.channel_id": str(channel_id),
+                "support.outcome": outcome.action,
+                "support.confidence": outcome.confidence,
+                "support.citations": list(outcome.citations),
+                "support.posted": outcome.posted,
+                "support.posted_message_id": posted_message_id,
+            },
         )
         span.set_output(
             {
@@ -864,6 +1062,7 @@ def answer_support_question(
                 "confidence": outcome.confidence,
                 "citations": list(outcome.citations),
                 "posted": outcome.posted,
+                "posted_message_id": posted_message_id,
                 "reply": outcome.reply[:500],
             }
         )

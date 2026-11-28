@@ -2611,6 +2611,7 @@ def _disambiguate_with_reasons(
     jev_transport=None,  # deprecated legacy kwarg kept for signature compatibility
     haiku_complete=None,  # deprecated alias for llm_complete
     deadline: float | None = None,
+    traced_logins: set[str] | None = None,
 ) -> tuple[
     dict[str, tuple[DiscordMemberInfo, str, float]],
     str,
@@ -2619,6 +2620,8 @@ def _disambiguate_with_reasons(
     dict[str, tuple[str, ...]],
 ]:
     """Run list-wise _select_with_llm per author in a thread pool (never falls back to guessing)."""
+    from .tracing import OPENINFERENCE_SPAN_KIND_CHAIN, child_span
+
     del jev_transport
     if not candidates:
         return {}, "none", {}, {}, {}
@@ -2648,6 +2651,18 @@ def _disambiguate_with_reasons(
     model_used = _resolve_match_model(config)
 
     def _run_one(login_key: str, pairs: list[CandidatePair]):
+        profile = pairs[0].profile
+        top_heur = pairs[0].heuristic_score if pairs else 0.0
+        member_map = {pair.member.discord_id: pair.member for pair in pairs}
+        cand_preview = [
+            {
+                "discord_id": p.member.discord_id,
+                "username": p.member.username,
+                "score": round(p.heuristic_score, 4),
+                "signals": list(p.signals),
+            }
+            for p in pairs
+        ]
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 2.0:
@@ -2655,17 +2670,101 @@ def _disambiguate_with_reasons(
             req_timeout = min(20.0, max(3.0, remaining))
         else:
             req_timeout = 20.0
-        try:
-            res = _select_with_llm(
-                config,
-                pairs[0].profile,
-                pairs,
-                llm_complete=complete_fn,
-                timeout=req_timeout,
-            )
+        with child_span(
+            "match_contributor",
+            kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+            input_value={
+                "github_login": profile.login,
+                "candidate_count": len(pairs),
+                "top_score": round(top_heur, 4),
+                "candidates": cand_preview,
+            },
+            attributes={
+                "contributor.github_login": profile.login,
+                "contributor.candidate_count": len(pairs),
+                "contributor.top_score": round(top_heur, 4),
+            },
+        ) as cspan:
+            try:
+                res = _select_with_llm(
+                    config,
+                    profile,
+                    pairs,
+                    llm_complete=complete_fn,
+                    timeout=req_timeout,
+                )
+            except Exception as error:
+                cspan.set_attributes({
+                    "contributor.method": "llm",
+                    "contributor.outcome": "skipped",
+                    "contributor.skip_reason": "llm_unavailable",
+                })
+                cspan.set_output({
+                    "github_login": profile.login,
+                    "outcome": "skipped",
+                    "method": "llm",
+                    "skip_reason": "llm_unavailable",
+                    "detail": str(error)[:200],
+                })
+                return login_key, None, error
+
+            if _llm_selection_accepted(res) and res.discord_id in member_map:
+                cspan.set_attributes({
+                    "contributor.method": "llm",
+                    "contributor.outcome": "matched",
+                    "contributor.discord_id": str(res.discord_id),
+                    "contributor.confidence": round(float(res.confidence), 4),
+                    "contributor.llm_model": str(res.model or model_used),
+                })
+                cspan.set_output({
+                    "github_login": profile.login,
+                    "outcome": "matched",
+                    "method": "llm",
+                    "discord_id": res.discord_id,
+                    "confidence": round(float(res.confidence), 4),
+                    "evidence": list(res.evidence),
+                    "reasoning": res.reason or "",
+                    "model": res.model or model_used,
+                })
+            elif not res.discord_id:
+                cspan.set_attributes({
+                    "contributor.method": "llm",
+                    "contributor.outcome": "skipped",
+                    "contributor.skip_reason": "llm_none_of_these",
+                    "contributor.confidence": round(float(res.confidence), 4),
+                    "contributor.llm_model": str(res.model or model_used),
+                })
+                cspan.set_output({
+                    "github_login": profile.login,
+                    "outcome": "skipped",
+                    "method": "llm",
+                    "skip_reason": "llm_none_of_these",
+                    "confidence": round(float(res.confidence), 4),
+                    "evidence": list(res.evidence),
+                    "reasoning": res.reason or "none of these",
+                    "model": res.model or model_used,
+                })
+            else:
+                detail = res.reason or f"confidence={res.confidence:.2f}, evidence={len(res.evidence)}"
+                cspan.set_attributes({
+                    "contributor.method": "llm",
+                    "contributor.outcome": "skipped",
+                    "contributor.skip_reason": "llm_below_threshold",
+                    "contributor.confidence": round(float(res.confidence), 4),
+                    "contributor.llm_model": str(res.model or model_used),
+                })
+                cspan.set_output({
+                    "github_login": profile.login,
+                    "outcome": "skipped",
+                    "method": "llm",
+                    "skip_reason": "llm_below_threshold",
+                    "candidate_discord_id": res.discord_id,
+                    "confidence": round(float(res.confidence), 4),
+                    "evidence": list(res.evidence),
+                    "reasoning": detail,
+                    "model": res.model or model_used,
+                })
             return login_key, res, None
-        except Exception as error:
-            return login_key, None, error
 
     items = list(by_login.items())
     workers = min(LLM_SELECT_WORKERS, max(1, len(items)))
@@ -2681,6 +2780,8 @@ def _disambiguate_with_reasons(
                 results_list.append(fut.result())
 
     for login_key, res, error in results_list:
+        if traced_logins is not None:
+            traced_logins.add(login_key)
         pairs = by_login[login_key]
         member_map = {pair.member.discord_id: pair.member for pair in pairs}
         top_heur = pairs[0].heuristic_score if pairs else 0.0
@@ -3459,15 +3560,35 @@ def match_community_contributors_with_diagnostics(
                 sleep_fn=sleep_fn,
             )
             out_payload = {
+                "contributors": diagnostics.contributor_count,
+                "members": diagnostics.member_count,
+                "members_source": diagnostics.members_source,
+                "candidates": diagnostics.candidate_pair_count,
                 "matched": diagnostics.matched_count,
                 "skipped": diagnostics.skipped_count,
                 "methods": dict(diagnostics.method_counts),
                 "skip_reasons": dict(diagnostics.skip_reasons),
                 "llm_source": diagnostics.llm_source,
             }
+            summary_attrs = {
+                "engagement.contributors": diagnostics.contributor_count,
+                "engagement.members": diagnostics.member_count,
+                "engagement.members_source": diagnostics.members_source,
+                "engagement.candidates": diagnostics.candidate_pair_count,
+                "engagement.matched": diagnostics.matched_count,
+                "engagement.skipped": diagnostics.skipped_count,
+                "engagement.methods": dict(diagnostics.method_counts),
+                "engagement.skip_reasons": dict(diagnostics.skip_reasons),
+                "engagement.llm_source": diagnostics.llm_source,
+            }
+            span.set_attributes(summary_attrs)
             span.set_output(out_payload)
-            if outer_span is not None:
-                outer_span.set_output(out_payload)
+            from .tracing import current_agent_span
+            target_agent = outer_span if outer_span is not None else current_agent_span()
+            if target_agent is not None and target_agent.active:
+                target_agent.set_attributes(summary_attrs)
+                if outer_span is not None:
+                    outer_span.set_output(out_payload)
             return matched_groups, skipped_count, details, diagnostics
 
 
@@ -3514,6 +3635,8 @@ def _match_community_contributors_with_diagnostics_impl(
     pending: list[dict] = []
     skip_reason_by_login: dict[str, str] = {}
     skip_meta_by_login: dict[str, tuple[float, str]] = {}
+    llm_traced_logins: set[str] = set()
+    full_scores_cache: dict[str, tuple[CandidatePair | None, list[CandidatePair]]] = {}
 
     rejected_pairs: set[tuple[str, str]] = set()
     if store is not None and hasattr(store, "all_match_rejections"):
@@ -4154,6 +4277,7 @@ def _match_community_contributors_with_diagnostics_impl(
                     llm_complete=complete_fn,
                     jev_transport=jev_transport,
                     deadline=llm_deadline,
+                    traced_logins=llm_traced_logins,
                 )
                 if recent_llm_source != "none":
                     llm_source = recent_llm_source
@@ -4194,6 +4318,7 @@ def _match_community_contributors_with_diagnostics_impl(
                 llm_complete=complete_fn,
                 jev_transport=jev_transport,
                 deadline=llm_deadline,
+                traced_logins=llm_traced_logins,
             )
             if full_llm_source != "none":
                 llm_source = full_llm_source
@@ -4285,6 +4410,8 @@ def _match_community_contributors_with_diagnostics_impl(
             continue
         winning_logins.add(login_key)
 
+    from .tracing import OPENINFERENCE_SPAN_KIND_CHAIN, child_span, log_decision
+
     matched_groups: list[dict] = []
     details: list[MatchDetail] = []
     method_counter: Counter[str] = Counter()
@@ -4292,6 +4419,37 @@ def _match_community_contributors_with_diagnostics_impl(
         group, discord_id, method, confidence = resolved[login_key]
         ev_tuple = evidence_by_login.get(login_key, ())
         method_counter[method] += 1
+        if login_key not in llm_traced_logins:
+            _strong_c, scored_cands = full_scores_cache.get(login_key, (None, []))
+            cand_count = len(scored_cands)
+            top_sc = scored_cands[0].heuristic_score if scored_cands else float(confidence)
+            with child_span(
+                "match_contributor",
+                kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+                input_value={
+                    "github_login": group["login"],
+                    "pr_count": len(group.get("pulls", ())),
+                    "candidate_count": cand_count,
+                    "top_score": round(float(top_sc), 4),
+                },
+                attributes={
+                    "contributor.github_login": group["login"],
+                    "contributor.candidate_count": cand_count,
+                    "contributor.top_score": round(float(top_sc), 4),
+                    "contributor.method": method,
+                    "contributor.outcome": "matched",
+                    "contributor.discord_id": str(discord_id),
+                    "contributor.confidence": round(float(confidence), 4),
+                },
+            ) as cspan:
+                cspan.set_output({
+                    "github_login": group["login"],
+                    "outcome": "matched",
+                    "method": method,
+                    "discord_id": str(discord_id),
+                    "confidence": round(float(confidence), 4),
+                    "evidence": list(ev_tuple),
+                })
         if store is not None and hasattr(store, "delete_match_attempt"):
             try:
                 store.delete_match_attempt(group["login"])
@@ -4347,12 +4505,48 @@ def _match_community_contributors_with_diagnostics_impl(
             reason = skip_reason_by_login.get(login_key, "unmatched")
             skip_counter[reason] += 1
             top_score, detail = skip_meta_by_login.get(login_key, (0.0, reason))
-            logging.info(
+            _strong_c, scored_cands = full_scores_cache.get(login_key, (None, []))
+            cand_count = len(scored_cands)
+            if login_key not in llm_traced_logins or reason == "discord_id_conflict":
+                with child_span(
+                    "match_contributor",
+                    kind=OPENINFERENCE_SPAN_KIND_CHAIN,
+                    input_value={
+                        "github_login": login,
+                        "pr_count": len(group.get("pulls", ())),
+                        "candidate_count": cand_count,
+                        "top_score": round(float(top_score), 4),
+                    },
+                    attributes={
+                        "contributor.github_login": login,
+                        "contributor.candidate_count": cand_count,
+                        "contributor.top_score": round(float(top_score), 4),
+                        "contributor.method": "none",
+                        "contributor.outcome": "skipped",
+                        "contributor.skip_reason": reason,
+                    },
+                ) as cspan:
+                    cspan.set_output({
+                        "github_login": login,
+                        "outcome": "skipped",
+                        "method": "none",
+                        "skip_reason": reason,
+                        "top_score": round(float(top_score), 4),
+                        "detail": detail,
+                    })
+            log_decision(
+                "match_skipped",
                 "Match skipped for %s: reason=%s top_score=%.2f detail=%s",
                 login,
                 reason,
                 top_score,
                 detail,
+                attributes={
+                    "contributor.github_login": login,
+                    "contributor.skip_reason": reason,
+                    "contributor.top_score": round(float(top_score), 4),
+                    "contributor.detail": detail,
+                },
             )
             # Persist definitive no_match attempts for 7-day negative caching.
             if (
@@ -4385,7 +4579,8 @@ def _match_community_contributors_with_diagnostics_impl(
         enrichment_deferred=enrichment_deferred,
     )
     logging.info("Match summary by method: %s", dict(diagnostics.method_counts))
-    logging.info(
+    log_decision(
+        "match_summary",
         "Weekly match diagnostics: contributors=%d members=%d (source=%s) candidates=%d "
         "matched=%d skipped=%d llm=%s methods=%s skip_reasons=%s",
         diagnostics.contributor_count,
@@ -4397,6 +4592,17 @@ def _match_community_contributors_with_diagnostics_impl(
         diagnostics.llm_source,
         dict(diagnostics.method_counts),
         dict(diagnostics.skip_reasons),
+        attributes={
+            "engagement.contributors": diagnostics.contributor_count,
+            "engagement.members": diagnostics.member_count,
+            "engagement.members_source": diagnostics.members_source,
+            "engagement.candidates": diagnostics.candidate_pair_count,
+            "engagement.matched": diagnostics.matched_count,
+            "engagement.skipped": diagnostics.skipped_count,
+            "engagement.llm_source": diagnostics.llm_source,
+            "engagement.methods": dict(diagnostics.method_counts),
+            "engagement.skip_reasons": dict(diagnostics.skip_reasons),
+        },
     )
     return matched_groups, skipped_count, details, diagnostics
 
