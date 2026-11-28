@@ -117,10 +117,22 @@ def _safe_endpoint_for_log(endpoint: str) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
-def _shutdown_tracing_atexit() -> None:
-    provider = _tracer_provider
+def shutdown_tracing() -> None:
+    """Flush and shut down the active TracerProvider, if tracing was configured."""
+    global _configured, _tracer_provider, _tracer
+    with _guard:
+        provider = _tracer_provider
+        _configured = False
+        _tracer_provider = None
+        _tracer = None
     if provider is None:
         return
+    force_flush = getattr(provider, "force_flush", None)
+    if callable(force_flush):
+        try:
+            force_flush()
+        except Exception:
+            pass
     shutdown = getattr(provider, "shutdown", None)
     if callable(shutdown):
         try:
@@ -192,7 +204,7 @@ def configure_litellm_tracing(env: Mapping[str, str] | None = None) -> bool:
         _tracer = provider.get_tracer("contributor_bot")
         _configured = True
         if not _atexit_registered:
-            atexit.register(_shutdown_tracing_atexit)
+            atexit.register(shutdown_tracing)
             _atexit_registered = True
         logging.info(
             "LiteLLM OpenInference tracing enabled (service=%s, endpoint=%s, headers=%d)",

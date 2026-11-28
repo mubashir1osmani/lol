@@ -40,7 +40,7 @@ from .schedule import UTC, parse_time
 from .server import start_http_server, stop_http_server
 from .signatures import ed25519_public_key_ok
 from .state import load_state, save_state
-from .tracing import configure_litellm_tracing
+from .tracing import configure_litellm_tracing, shutdown_tracing
 from .weekly import log_weekly_boot_status, post_weekly_if_due, weekly_schedule_status
 
 
@@ -196,6 +196,7 @@ def main(argv: list[str] | None = None) -> None:
         stop_gateway(gateway)
         if server is not None:
             stop_http_server(server)
+        shutdown_tracing()
 
 
 def run_backfill(config) -> None:

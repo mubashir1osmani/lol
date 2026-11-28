@@ -35,6 +35,7 @@ from contributor_bot.tracing import (
     configure_litellm_tracing,
     normalize_otlp_traces_endpoint,
     parse_otel_headers,
+    shutdown_tracing,
     tracing_endpoint,
 )
 from contributor_bot.weekly import summarize_pr_titles
@@ -115,7 +116,8 @@ def _fake_otel_and_openinference_modules():
         def __init__(self, resource=None):
             self.resource = resource
             self.processors = []
-            self.shutdown_called = False
+            self.flush_called = 0
+            self.shutdown_called = 0
             state["providers"].append(self)
 
         def add_span_processor(self, processor):
@@ -124,8 +126,11 @@ def _fake_otel_and_openinference_modules():
         def get_tracer(self, name):
             return _FakeTracer(state["spans"])
 
+        def force_flush(self):
+            self.flush_called += 1
+
         def shutdown(self):
-            self.shutdown_called = True
+            self.shutdown_called += 1
 
     class BatchSpanProcessor:
         def __init__(self, exporter):
@@ -322,6 +327,11 @@ class TracingConfigTests(unittest.TestCase):
         self.assertIs(state["set_provider_calls"][0], state["providers"][0])
         self.assertEqual(len(state["instrument_calls"]), 1)
         self.assertIs(state["instrument_calls"][0]["tracer_provider"], state["providers"][0])
+
+        shutdown_tracing()
+        shutdown_tracing()
+        self.assertEqual(state["providers"][0].flush_called, 1)
+        self.assertEqual(state["providers"][0].shutdown_called, 1)
 
     def test_turns_on_with_otel_exporter_otlp_endpoint(self):
         fake_litellm = _fake_litellm_module()
