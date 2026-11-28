@@ -17,6 +17,8 @@ from contributor_bot.interactions import (
 from contributor_bot.matcher import DiscordMemberInfo
 from contributor_bot.roles_sync import (
     RolesPollResult,
+    format_backfill_result,
+    has_pending_backfill,
     log_roles_daily_boot_status,
     poll_merged_prs_for_roles,
     reset_roles_daily_scheduler_state,
@@ -812,6 +814,261 @@ class DailyRolesSchedulerTests(unittest.TestCase):
             )
         self.assertEqual(len(chunked_posts), 3)
         self.assertEqual(chunk_store.all_unannounced_grants(), [])
+
+    def test_backfill_processes_newest_first_and_resumes_across_backfill_and_daily_runs(self):
+        # 3 windows: Sep 1..Sep 29, Sep 29..Oct 27, Oct 27..Nov 20 (newest-first!)
+        cfg = get_config(minimal_roles_env(self.temp.name, BACKFILL_SINCE="2026-09-01T00:00:00Z"))
+        members = [
+            _member("6001", "recent-nov", "Recent Nov"),
+            _member("6002", "mid-oct", "Mid Oct"),
+            _member("6003", "old-sep", "Old Sep"),
+        ]
+        pulls = {
+            903: {
+                "number": 903, "merged": True, "merged_at": "2026-11-15T10:00:00Z", "title": "nov pr",
+                "user": {"login": "recent-nov", "id": 9003, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+            902: {
+                "number": 902, "merged": True, "merged_at": "2026-10-15T10:00:00Z", "title": "oct pr",
+                "user": {"login": "mid-oct", "id": 9002, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+            901: {
+                "number": 901, "merged": True, "merged_at": "2026-09-15T10:00:00Z", "title": "sep pr",
+                "user": {"login": "old-sep", "id": 9001, "type": "User"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR", "labels": [],
+            },
+        }
+        seen_windows = []
+        stop_after = {"n": 1}
+
+        def paged_search(repo, start, end, tok):
+            seen_windows.append((start.date().isoformat(), end.date().isoformat()))
+            if len(seen_windows) > stop_after["n"]:
+                raise TransientAPIError("rate limit")
+            if start.month == 10 and end.month == 11:
+                return {903}
+            if start.month == 9 and end.month == 10:
+                return {902}
+            return {901}
+
+        now1 = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role1, \
+             mock.patch("contributor_bot.roles_sync.post_message", return_value={"id": "1"}):
+            r1 = run_roles_backfill(
+                cfg,
+                self.store,
+                now=now1,
+                search_merged_fn=paged_search,
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+
+        # Window 1 MUST be the newest window (Oct 27..Nov 20), granting recent-nov immediately!
+        self.assertEqual(seen_windows[0], ("2026-10-27", "2026-11-20"))
+        self.assertEqual(r1.total_windows, 3)
+        self.assertEqual(r1.windows_done_total, 1)
+        self.assertEqual(r1.windows_remaining, 2)
+        self.assertFalse(r1.completed)
+        self.assertTrue(has_pending_backfill(cfg, self.store))
+        self.assertEqual([c.args[1] for c in add_role1.call_args_list], ["6001"])
+        reply1 = format_backfill_result(r1)
+        self.assertIn("1/3 windows done, run /roles-backfill again to continue", reply1)
+
+        # Run 2 (even at a later timestamp!) resumes at Oct window (skipping completed Nov window).
+        seen_windows.clear()
+        stop_after["n"] = 1
+        now2 = datetime(2026, 11, 20, 14, 0, tzinfo=UTC)
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role2, \
+             mock.patch("contributor_bot.roles_sync.post_message", return_value={"id": "2"}):
+            r2 = run_roles_backfill(
+                cfg,
+                self.store,
+                now=now2,
+                search_merged_fn=paged_search,
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+        self.assertEqual(seen_windows[0], ("2026-09-29", "2026-10-27"))
+        self.assertEqual(r2.windows_done_total, 2)
+        self.assertEqual(r2.windows_remaining, 1)
+        self.assertFalse(r2.completed)
+        self.assertEqual([c.args[1] for c in add_role2.call_args_list], ["6002"])
+        self.assertIn("2/3 windows done", format_backfill_result(r2))
+
+        # Run 3: Daily run automatically finishes the final pending Sep window until completed=True!
+        seen_windows.clear()
+        stop_after["n"] = 10
+        daily_day = datetime(2026, 11, 21, 15, 0, tzinfo=UTC)
+
+        def daily_and_backfill_search(repo, start, end, tok):
+            # Incremental daily check has 24h window -> no new PRs; backfill chunk asks for Sep window.
+            if (end - start).days >= 20:
+                seen_windows.append((start.date().isoformat(), end.date().isoformat()))
+                return {901}
+            return set()
+
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role3, \
+             mock.patch("contributor_bot.rewards.post_message", return_value={"id": "3"}):
+            run_daily_roles_if_due(
+                cfg,
+                self.store,
+                daily_day,
+                search_merged_fn=daily_and_backfill_search,
+                pull_fetcher=lambda repo, num, tok: pulls[num],
+                files_fetcher=lambda repo, num, tok: ["README.md"],
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+            )
+        self.assertEqual(seen_windows, [("2026-09-01", "2026-09-29")])
+        self.assertFalse(has_pending_backfill(cfg, self.store))
+        self.assertEqual([c.args[1] for c in add_role3.call_args_list], ["6003"])
+
+    def test_weekly_summary_matches_are_persisted_and_reused_without_llm_by_daily_roles(self):
+        from contributor_bot.matcher import MatchDetail
+        from contributor_bot.weekly import WEEKLY_HEADER, WeeklyReport, post_weekly_if_due, reset_weekly_scheduler_state
+
+        reset_weekly_scheduler_state()
+        fri_ten = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
+
+        fake_report = WeeklyReport(
+            chunks=[f"{WEEKLY_HEADER}\n\n<@7001> 🎉 - cool fix (<https://github.com/BerriAI/litellm/pull/1234>)"],
+            matched_count=1,
+            skipped_count=0,
+            since=datetime(2026, 11, 20, 15, 0, tzinfo=UTC),
+            match_details=(
+                MatchDetail(
+                    github_login="friday-hero",
+                    discord_id="7001",
+                    method="jev",
+                    confidence=0.95,
+                    discord_username="fhero",
+                    pr_count=1,
+                    github_user_id=7701,
+                ),
+            ),
+        )
+        with mock.patch("contributor_bot.weekly.build_weekly_report", return_value=fake_report):
+            post_weekly_if_due(
+                self.config,
+                self.store,
+                fri_ten,
+                post=lambda ch, tok, body: {"id": "1"},
+                messages_fetcher=lambda *_a, **_k: [],
+            )
+
+        # Weekly post persisted the match into github_discord_matches with github_user_id!
+        saved = self.store.get_confirmed_match("friday-hero")
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["discord_id"], "7001")
+        self.assertEqual(saved["github_user_id"], 7701)
+
+        # Daily roles run immediately after: even with 0 newly polled PRs and NO LLM/member access,
+        # grants Contributor directly from github_discord_matches and announces once!
+        posted = []
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
+             mock.patch("contributor_bot.rewards.post_message", side_effect=lambda ch, tok, body: (posted.append(body), {"id": "2"})[1]), \
+             mock.patch("contributor_bot.roles_sync.match_community_contributors_with_diagnostics", side_effect=AssertionError("must reuse stored match without LLM")):
+            res = run_daily_roles_if_due(
+                self.config,
+                self.store,
+                fri_ten,
+                search_merged_fn=lambda repo, start, end, tok: set(),
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+            )
+        self.assertEqual(res.roles_granted, 1)
+        self.assertEqual(add_role.call_args.args[1], "7001")
+        self.assertEqual(add_role.call_args.args[2], "1001")  # Contributor role
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["content"], "<@7001> just became a contributor 🎉")
+
+    def test_enrichment_deadline_caches_progress_and_continues_pending_authors_next_run(self):
+        cfg = get_config(minimal_roles_env(self.temp.name, BACKFILL_SINCE="2026-11-01T00:00:00Z"))
+        members = [
+            _member("8001", "zoe_discord", "Zoe Alpha"),
+            _member("8002", "liam_discord", "Liam Beta"),
+        ]
+        # Pre-store 2 authors whose logins don't match Discord usernames (need GitHub profile name!).
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=801, github_user_id=8801,
+            github_login="gh-alpha", merged_at="2026-11-18T10:00:00+00:00",
+            title="pr 1", labels=[], files=["README.md"],
+        )
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=802, github_user_id=8802,
+            github_login="gh-beta", merged_at="2026-11-19T10:00:00+00:00",
+            title="pr 2", labels=[], files=["README.md"],
+        )
+
+        fetched_users = []
+        now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+
+        # Run 1: Simulate rate limit hitting on the 2nd uncached user after caching the 1st!
+        def flaky_github_get(url, token, **kwargs):
+            if url.endswith("/users/gh-beta"):
+                fetched_users.append("gh-beta")
+                return {"login": "gh-beta", "name": "Liam Beta", "bio": "", "blog": "", "twitter_username": ""}
+            if url.endswith("/users/gh-alpha"):
+                fetched_users.append("gh-alpha")
+                raise TransientAPIError("rate limit")
+            return {}
+
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role1, \
+             mock.patch("contributor_bot.roles_sync.post_message", return_value={"id": "1"}):
+            r1 = run_roles_backfill(
+                cfg,
+                self.store,
+                now=now,
+                search_merged_fn=lambda repo, start, end, tok: set(),
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+                github_getter=flaky_github_get,
+            )
+
+        # Newest author (gh-beta, merged Nov 19) was enriched, cached, matched, and granted!
+        # Older author (gh-alpha) was deferred -> completed=False so next run picks them up!
+        self.assertEqual(fetched_users, ["gh-beta", "gh-alpha"])
+        self.assertEqual(r1.enrichment_deferred, 1)
+        self.assertFalse(r1.completed)
+        self.assertEqual([c.args[1] for c in add_role1.call_args_list], ["8002"])
+        self.assertIsNotNone(self.store.get_cached_github_user("gh-beta"))
+
+        # Run 2: gh-beta is ALREADY matched & cached (0 GitHub calls for gh-beta!); gh-alpha now succeeds!
+        fetched_users.clear()
+
+        def healthy_github_get(url, token, **kwargs):
+            if url.endswith("/users/gh-alpha"):
+                fetched_users.append("gh-alpha")
+                return {"login": "gh-alpha", "name": "Zoe Alpha", "bio": "", "blog": "", "twitter_username": ""}
+            raise AssertionError(f"unexpected re-fetch: {url}")
+
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role2, \
+             mock.patch("contributor_bot.roles_sync.post_message", return_value={"id": "2"}):
+            r2 = run_roles_backfill(
+                cfg,
+                self.store,
+                now=now,
+                search_merged_fn=lambda repo, start, end, tok: set(),
+                count_fetcher=lambda repo, login, tok: 1,
+                org_members_fetcher=lambda org, tok: frozenset(),
+                members=members,
+                github_getter=healthy_github_get,
+            )
+
+        self.assertEqual(fetched_users, ["gh-alpha"])
+        self.assertEqual(r2.enrichment_deferred, 0)
+        self.assertTrue(r2.completed)
+        self.assertEqual([c.args[1] for c in add_role2.call_args_list], ["8001"])
 
 
 if __name__ == "__main__":

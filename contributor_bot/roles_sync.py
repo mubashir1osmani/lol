@@ -57,6 +57,7 @@ AUTHOR_COUNT_CACHE_TTL_DAYS = 30
 BACKFILL_WINDOW = timedelta(days=28)
 BACKFILL_DEADLINE_SECONDS = 300.0
 BACKFILL_MATCH_RESERVE_SECONDS = 45.0
+DAILY_BACKFILL_CHUNK_SECONDS = 60.0
 
 _roles_poll_lock = threading.Lock()
 _roles_daily_lock = threading.Lock()
@@ -93,6 +94,9 @@ class BackfillResult:
     summary_announced: bool
     rate_limited: bool = False
     timed_out: bool = False
+    total_windows: int = 0
+    windows_done_total: int = 0
+    enrichment_deferred: int = 0
 
 
 def _checkpoint_key(repository: str) -> str:
@@ -103,11 +107,23 @@ def _boot_backfill_key(repository: str) -> str:
     return f"backfill_on_boot_done:{repository.lower()}"
 
 
+def _backfill_anchor_key(repository: str) -> str:
+    return f"backfill_anchor:{repository.lower()}"
+
+
 def should_run_boot_backfill(config: Config, store: Store | None) -> bool:
     """True when ROLES_BACKFILL_ON_BOOT=true and the one-time backfill has not finished yet."""
     if not config.contributor_roles_enabled or not config.roles_backfill_on_boot or store is None:
         return False
     return not store.get_roles_meta(_boot_backfill_key(config.github_repository))
+
+
+def has_pending_backfill(config: Config, store: Store | None) -> bool:
+    """True when a resumable backfill cursor is still in progress for this repository."""
+    if not config.contributor_roles_enabled or store is None:
+        return False
+    anchor = (store.get_roles_meta(_backfill_anchor_key(config.github_repository)) or "").strip()
+    return bool(anchor) or should_run_boot_backfill(config, store)
 
 
 def _is_excluded_author(
@@ -169,14 +185,18 @@ def ensure_author_merged_count(
             error,
         )
         return int(cached["total_count"]) if cached is not None else None
-    stored_count = len(store.pulls_for_author(repo, user_id))
+    stored_count = (
+        len(store.pulls_for_author(repo, user_id))
+        if isinstance(user_id, int) and user_id > 0
+        else len(store.pulls_for_author_login(repo, login))
+    )
     effective = max(total, stored_count)
     store.set_author_merged_count(
         repo,
         login,
         effective,
         iso(now),
-        github_user_id=user_id,
+        github_user_id=user_id if isinstance(user_id, int) and user_id > 0 else None,
     )
     return effective
 
@@ -281,6 +301,23 @@ def _ingest_community_pull(
     }, False
 
 
+def _resolve_stored_discord_id(config: Config, store: Store, login: str, user_id: int | None) -> str | None:
+    """Reuse an already-known Discord link/mapping/github_discord_matches row without calling any LLM."""
+    if isinstance(user_id, int) and user_id > 0:
+        link = store.link_for_github_user(user_id)
+        if link and link.get("discord_id"):
+            return str(link["discord_id"])
+    login_key = (login or "").strip().lower()
+    if login_key:
+        mapped = (getattr(config, "github_discord_map", None) or {}).get(login_key)
+        if mapped:
+            return str(mapped)
+        confirmed = store.get_confirmed_match(login_key)
+        if confirmed and confirmed.get("discord_id"):
+            return str(confirmed["discord_id"])
+    return None
+
+
 def _match_authors(
     authors: list[dict[str, Any]],
     config: Config,
@@ -296,12 +333,38 @@ def _match_authors(
     rest_fetcher=None,
     rest_searcher=None,
     deadline: float | None = None,
-) -> tuple[dict[int, str], int]:
-    """Resolve ``[{"user_id": int, "login": str, "pulls": [...]}]`` to ``{user_id: discord_id}``."""
+) -> tuple[dict[int, str], int, int]:
+    """Resolve ``[{"user_id": int, "login": str, "pulls": [...]}]`` to ``(resolved, matched_count, enrichment_deferred)``.
+
+    Reuses stored ``github_discord_matches`` / ``github_links`` / ``GITHUB_DISCORD_MAP``
+    directly without running GitHub enrichment or the LLM.
+    """
     if not authors:
-        return {}, 0
+        return {}, 0, 0
+
+    resolved: dict[int, str] = {}
+    reused_count = 0
+    unmatched: list[dict[str, Any]] = []
+    for author in authors:
+        uid = author.get("user_id")
+        login = str(author.get("login") or "")
+        stored_discord = _resolve_stored_discord_id(config, store, login, uid if isinstance(uid, int) else None)
+        if stored_discord and isinstance(uid, int) and uid > 0:
+            resolved[uid] = stored_discord
+            reused_count += 1
+        else:
+            unmatched.append(author)
+
+    if not unmatched:
+        logging.info(
+            "Contributor role auto-match: reused %d/%d stored Discord matches (0 LLM calls)",
+            reused_count,
+            len(authors),
+        )
+        return resolved, len(resolved), 0
+
     matched_groups, _skipped, _details, diagnostics = match_community_contributors_with_diagnostics(
-        authors,
+        unmatched,
         config,
         store,
         guild=guild,
@@ -315,21 +378,98 @@ def _match_authors(
         rest_searcher=rest_searcher,
         deadline=deadline,
     )
-    resolved: dict[int, str] = {}
     for group in matched_groups:
         uid = group.get("user_id")
         discord_id = group.get("discord_id")
         if isinstance(uid, int) and uid > 0 and isinstance(discord_id, str) and discord_id:
             resolved[uid] = discord_id
     logging.info(
-        "Contributor role auto-match: matched %d/%d community authors (members=%d, source=%s, llm=%s)",
+        "Contributor role auto-match: matched %d/%d community authors "
+        "(reused_stored=%d, members=%d, source=%s, llm=%s, enrichment_deferred=%d)",
         len(resolved),
         len(authors),
+        reused_count,
         diagnostics.member_count,
         diagnostics.members_source,
         diagnostics.llm_source,
+        diagnostics.enrichment_deferred,
     )
-    return resolved, len(resolved)
+    return resolved, len(resolved), diagnostics.enrichment_deferred
+
+
+def _grant_roles_for_stored_matches(
+    config: Config,
+    store: Store,
+    *,
+    now: datetime,
+    org: str,
+    org_members: frozenset[str],
+    count_fetcher=None,
+    deadline: float | None = None,
+) -> tuple[int, bool]:
+    """Ensure every confirmed match in ``github_discord_matches`` (incl. weekly shoutouts) gets earned roles."""
+    repo = config.github_repository
+    stored_matches = store.all_confirmed_matches()
+    if not stored_matches:
+        return 0, False
+
+    roles_granted = 0
+    rate_limited = False
+    for match in stored_matches:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        login = str(match.get("github_login") or "").strip()
+        discord_id = str(match.get("discord_id") or "").strip()
+        if not login or not discord_id:
+            continue
+        if _is_excluded_author(
+            login,
+            "User",
+            "",
+            config.maintainer_logins,
+            org_members=org_members,
+            org=org,
+        ):
+            continue
+        raw_uid = match.get("github_user_id")
+        uid = int(raw_uid) if isinstance(raw_uid, int) and raw_uid > 0 else 0
+        pulls = store.pulls_for_author(repo, uid) if uid > 0 else store.pulls_for_author_login(repo, login)
+        if uid == 0 and pulls:
+            uid = int(pulls[-1]["github_user_id"])
+        already = store.grant_keys(discord_id)
+        cached_count = store.get_author_merged_count(repo, login)
+        lifetime_count: int | None = None
+        if cached_count is not None and _count_is_fresh(cached_count.get("fetched_at"), now):
+            lifetime_count = int(cached_count["total_count"])
+        elif "contributor" not in already or "oss_champion" not in already:
+            lifetime_count = ensure_author_merged_count(
+                config,
+                store,
+                login,
+                uid,
+                now=now,
+                count_fetcher=count_fetcher,
+            )
+            if lifetime_count is None and "contributor" not in already:
+                # Confirmed weekly-summary match has at least 1 merged PR even if GitHub count lookup fails.
+                lifetime_count = max(1, len(pulls))
+        try:
+            granted = apply_roles(
+                config,
+                store,
+                discord_id,
+                uid,
+                shoutout=False,
+                announce=False,
+                mark_announced=False,
+                lifetime_merged_count=lifetime_count,
+            )
+            roles_granted += len(granted)
+        except TransientAPIError as error:
+            logging.warning("Stored-match role assignment deferred for user %s: %s", discord_id, error)
+            rate_limited = True
+            break
+    return roles_granted, rate_limited
 
 
 def poll_merged_prs_for_roles(
@@ -390,9 +530,30 @@ def poll_merged_prs_for_roles(
         else:
             org_members = fetch_org_public_members(org, token) if org else frozenset()
 
+        # Grant roles to any already-confirmed matches (including Friday weekly summary shoutouts) first!
+        stored_roles_granted, stored_rate_limited = _grant_roles_for_stored_matches(
+            config,
+            store,
+            now=moment,
+            org=org,
+            org_members=org_members,
+            count_fetcher=count_fetcher,
+            deadline=(deadline - 30.0) if deadline is not None else None,
+        )
+
         try:
             numbers = search_fn(repo, window_start, moment, token)
         except TransientAPIError as error:
+            if stored_roles_granted:
+                try:
+                    announce_pending_role_grants(
+                        config,
+                        store,
+                        now=moment,
+                        limit=announcement_chunk_limit,
+                    )
+                except TransientAPIError:
+                    pass
             logging.warning(
                 "Contributor roles poll deferred due to GitHub rate limit (%s); checkpoint unchanged",
                 error,
@@ -404,7 +565,7 @@ def poll_merged_prs_for_roles(
                 skipped_excluded=0,
                 authors_evaluated=0,
                 authors_matched=0,
-                roles_granted=0,
+                roles_granted=stored_roles_granted,
                 rate_limited=True,
             )
 
@@ -412,7 +573,7 @@ def poll_merged_prs_for_roles(
         skipped_existing = 0
         skipped_excluded = 0
         files_skipped = 0
-        rate_limited = False
+        rate_limited = stored_rate_limited
         timed_out = False
         affected_authors: dict[int, dict[str, Any]] = {}
         fetch_deadline = (deadline - 20.0) if deadline is not None else None
@@ -464,7 +625,7 @@ def poll_merged_prs_for_roles(
         store.set_roles_meta(f"last_roles_poll_at:{repo.lower()}", moment_iso, moment_iso)
 
         author_list = list(affected_authors.values())
-        resolved_map, matched_count = _match_authors(
+        resolved_map, matched_count, _enrichment_deferred = _match_authors(
             author_list,
             config,
             store,
@@ -480,7 +641,7 @@ def poll_merged_prs_for_roles(
             deadline=deadline,
         )
 
-        roles_granted = 0
+        roles_granted = stored_roles_granted
         for uid, discord_id in resolved_map.items():
             login = affected_authors[uid]["login"]
             lifetime_count = ensure_author_merged_count(
@@ -755,6 +916,37 @@ def run_daily_roles_if_due(
             result.stored,
             result.roles_granted,
         )
+        if not force and poll_fn is None and has_pending_backfill(config, store):
+            backfill_kwargs = {
+                k: v for k, v in poll_kwargs.items()
+                if k in {
+                    "search_merged_fn", "pull_fetcher", "files_fetcher",
+                    "count_fetcher", "org_members_fetcher", "members",
+                    "github_getter", "jev_transport", "haiku_complete",
+                    "rest_fetcher", "rest_searcher",
+                }
+            }
+            try:
+                bf = run_roles_backfill(
+                    config,
+                    store,
+                    guild=guild,
+                    loop=loop,
+                    now=moment,
+                    deadline_seconds=DAILY_BACKFILL_CHUNK_SECONDS,
+                    announce_summary=False,
+                    **backfill_kwargs,
+                )
+                if bf is not None:
+                    logging.info(
+                        "Daily run advanced resumable backfill: %d/%d windows done (completed=%s, roles_granted=%d)",
+                        bf.windows_done_total,
+                        bf.total_windows,
+                        bf.completed,
+                        bf.roles_granted,
+                    )
+            except Exception:
+                logging.exception("Daily resumable backfill chunk failed; will continue next run")
         return result
     finally:
         _roles_daily_lock.release()
@@ -821,26 +1013,46 @@ def run_roles_backfill(
         else:
             org_members = fetch_org_public_members(org, token) if org else frozenset()
 
+        anchor_key = _backfill_anchor_key(repo)
+        raw_anchor = (store.get_roles_meta(anchor_key) or "").strip()
+        anchor = moment
+        if raw_anchor:
+            try:
+                parsed_anchor = parse_time(raw_anchor)
+                if parsed_anchor > parse_time(config.backfill_since):
+                    anchor = parsed_anchor
+            except Exception:
+                anchor = moment
+        if not raw_anchor or anchor == moment:
+            store.set_roles_meta(anchor_key, iso(anchor), moment_iso)
+
         windows: list[tuple[datetime, datetime]] = []
         cursor = parse_time(config.backfill_since)
-        while cursor < moment:
-            end = min(moment, cursor + BACKFILL_WINDOW)
+        while cursor < anchor:
+            end = min(anchor, cursor + BACKFILL_WINDOW)
             windows.append((cursor, end))
             cursor = end
+        # Process NEWEST-FIRST so recent contributors receive roles first.
+        windows.reverse()
 
+        total_windows = len(windows)
         windows_completed = 0
         pending_windows = [
             (start, end)
             for start, end in windows
             if not store.backfill_done(repo, iso(start), iso(end))
         ]
+        done_before = total_windows - len(pending_windows)
         pulls_stored = 0
         rate_limited = False
         timed_out = False
 
         logging.info(
-            "Starting contributor roles backfill for %s: %d pending windows (since %s)",
+            "Starting contributor roles backfill for %s (newest-first): "
+            "%d/%d windows already done, %d pending (since %s)",
             repo,
+            done_before,
+            total_windows,
             len(pending_windows),
             config.backfill_since,
         )
@@ -864,7 +1076,7 @@ def run_roles_backfill(
 
             window_stored = 0
             window_incomplete = False
-            for number in sorted(numbers):
+            for number in sorted(numbers, reverse=True):
                 if store.get_pull(repo, number) is not None:
                     continue
                 if ingest_deadline is not None and time.monotonic() >= ingest_deadline:
@@ -908,16 +1120,18 @@ def run_roles_backfill(
             store.mark_backfill_done(repo, start_iso, end_iso, iso(datetime.now(UTC)))
             windows_completed += 1
             logging.info(
-                "Backfill window %s..%s complete (%d new community PRs)",
+                "Backfill window %s..%s complete (%d new community PRs; %d/%d windows done)",
                 start_iso,
                 end_iso,
                 window_stored,
+                done_before + windows_completed,
+                total_windows,
             )
 
-        windows_remaining = max(0, len(pending_windows) - windows_completed)
-        completed = windows_remaining == 0 and not rate_limited and not timed_out
+        windows_done_total = done_before + windows_completed
+        windows_remaining = max(0, total_windows - windows_done_total)
 
-        # Evaluate all community PR authors currently recorded in SQLite.
+        # Evaluate all community PR authors currently recorded in SQLite (newest merged_at first).
         stored_authors = store.all_pull_authors(repo)
         eligible_authors = [
             {
@@ -936,7 +1150,7 @@ def run_roles_backfill(
             )
         ]
 
-        resolved_map, matched_count = _match_authors(
+        resolved_map, matched_count, enrichment_deferred = _match_authors(
             eligible_authors,
             config,
             store,
@@ -951,6 +1165,8 @@ def run_roles_backfill(
             rest_searcher=rest_searcher,
             deadline=deadline,
         )
+        if enrichment_deferred > 0:
+            timed_out = True
 
         login_by_uid = {a["user_id"]: a["login"] for a in eligible_authors}
         contributors_granted = 0
@@ -985,6 +1201,13 @@ def run_roles_backfill(
                 contributors_granted += 1
                 roles_granted += len(newly)
 
+        completed = (
+            windows_remaining == 0
+            and enrichment_deferred == 0
+            and not rate_limited
+            and not timed_out
+        )
+
         summary_announced = False
         if announce_summary and contributors_granted > 0 and config.role_announcements_channel_id:
             try:
@@ -1004,21 +1227,25 @@ def run_roles_backfill(
                 )
 
         if completed:
+            store.set_roles_meta(anchor_key, "", moment_iso)
             store.set_roles_meta(_boot_backfill_key(repo), moment_iso, moment_iso)
             if not store.get_roles_meta(_checkpoint_key(repo)):
                 store.set_roles_meta(_checkpoint_key(repo), moment_iso, moment_iso)
 
         logging.info(
-            "Contributor roles backfill finished for %s: windows=%d/%d pulls_stored=%d "
-            "matched=%d/%d granted=%d contributors (%d roles) completed=%s rate_limited=%s timed_out=%s in %.2fs",
+            "Contributor roles backfill finished for %s: windows=%d/%d (this_run=%d) pulls_stored=%d "
+            "matched=%d/%d granted=%d contributors (%d roles) enrichment_deferred=%d "
+            "completed=%s rate_limited=%s timed_out=%s in %.2fs",
             repo,
+            windows_done_total,
+            total_windows,
             windows_completed,
-            len(pending_windows),
             pulls_stored,
             matched_count,
             len(eligible_authors),
             contributors_granted,
             roles_granted,
+            enrichment_deferred,
             completed,
             rate_limited,
             timed_out,
@@ -1036,6 +1263,9 @@ def run_roles_backfill(
             summary_announced=summary_announced,
             rate_limited=rate_limited,
             timed_out=timed_out,
+            total_windows=total_windows,
+            windows_done_total=windows_done_total,
+            enrichment_deferred=enrichment_deferred,
         )
     finally:
         _roles_backfill_lock.release()
@@ -1045,7 +1275,12 @@ def format_backfill_result(result: BackfillResult | None) -> str:
     """Ephemeral moderator summary for /roles-backfill."""
     if result is None:
         return "contributor roles backfill is already running or contributor roles are disabled."
-    status = "complete" if result.completed else "partial (run /roles-backfill again to continue)"
+    total = result.total_windows or (result.windows_done_total + result.windows_remaining)
+    done = result.windows_done_total or result.windows_completed
+    if result.completed:
+        status = f"complete ({done}/{total} windows done)"
+    else:
+        status = f"{done}/{total} windows done, run /roles-backfill again to continue"
     reasons = []
     if result.rate_limited:
         reasons.append("rate-limited")
@@ -1054,11 +1289,15 @@ def format_backfill_result(result: BackfillResult | None) -> str:
     suffix = f" ({', '.join(reasons)})" if reasons else ""
     lines = [
         f"**Contributor roles backfill: {status}**{suffix}",
-        f"- Windows completed this run: **{result.windows_completed}** (remaining: **{result.windows_remaining}**)",
+        f"- Progress: **{done}/{total} windows done** (+{result.windows_completed} this run, {result.windows_remaining} remaining; newest-first)",
         f"- New community PRs stored: **{result.pulls_stored}**",
         f"- Community authors matched in Discord: **{result.authors_matched}/{result.authors_evaluated}**",
         f"- New role grants: **{result.roles_granted}** across **{result.contributors_granted}** contributors",
     ]
+    if result.enrichment_deferred:
+        lines.append(
+            f"- Pending GitHub profile enrichment: **{result.enrichment_deferred}** authors deferred (cached progress saved; will continue on next run)"
+        )
     if result.summary_announced:
         lines.append("- Posted a single summary line to the role announcements channel.")
     return "\n".join(lines)

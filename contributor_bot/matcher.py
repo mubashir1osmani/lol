@@ -144,6 +144,7 @@ class MatchDetail:
     confidence: float
     discord_username: str = ""
     pr_count: int = 0
+    github_user_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,7 @@ class MatchDiagnostics:
     llm_source: str = "none"
     skip_reasons: tuple[tuple[str, int], ...] = ()
     method_counts: tuple[tuple[str, int], ...] = ()
+    enrichment_deferred: int = 0
 
     def summary_line(self) -> str:
         parts = [f"checked {self.contributor_count} contributors against {self.member_count} members"]
@@ -290,6 +292,36 @@ def _call_github_enrichment(fetch, url: str, token: str | None, *, timeout: floa
     return fetch(url, token, pace=False)
 
 
+def _cached_github_profile(
+    store,
+    login: str,
+    moment: datetime,
+    *,
+    user_id: int | None = None,
+) -> GitHubAuthorProfile | None:
+    if not login or not re.fullmatch(r"[A-Za-z0-9-]+", login):
+        return None
+    if store is None or not hasattr(store, "get_cached_github_user"):
+        return None
+    cached_user = store.get_cached_github_user(login)
+    if not cached_user or not _match_is_fresh(
+        cached_user.get("fetched_at"), moment, ttl_days=GITHUB_USER_CACHE_TTL_DAYS
+    ):
+        return None
+    cached_email = (cached_user.get("email_local") or "").strip()
+    cached_commit = (cached_user.get("commit_name") or "").strip()
+    return GitHubAuthorProfile(
+        login=login,
+        user_id=user_id,
+        name=(cached_user.get("name") or "").strip(),
+        blog=(cached_user.get("blog") or "").strip(),
+        twitter_username=(cached_user.get("twitter_username") or "").strip().lstrip("@"),
+        bio=(cached_user.get("bio") or "").strip(),
+        commit_names=(cached_commit,) if cached_commit else (),
+        email_locals=(cached_email,) if cached_email else (),
+    )
+
+
 def fetch_github_author_profile(
     login: str,
     repository: str,
@@ -335,21 +367,17 @@ def fetch_github_author_profile(
         return deadline - time.monotonic()
 
     used_cached_user = False
+    profile_fetched = False
     if login and re.fullmatch(r"[A-Za-z0-9-]+", login):
-        cached_user = (
-            store.get_cached_github_user(login)
-            if store is not None and hasattr(store, "get_cached_github_user")
-            else None
-        )
-        if cached_user and _match_is_fresh(cached_user.get("fetched_at"), moment, ttl_days=GITHUB_USER_CACHE_TTL_DAYS):
+        cached_profile = _cached_github_profile(store, login, moment, user_id=user_id)
+        if cached_profile is not None:
             used_cached_user = True
-            name = (cached_user.get("name") or "").strip()
-            blog = (cached_user.get("blog") or "").strip()
-            twitter = (cached_user.get("twitter_username") or "").strip().lstrip("@")
-            bio = (cached_user.get("bio") or "").strip()
-            cached_email_local = (cached_user.get("email_local") or "").strip()
-            if cached_email_local:
-                email_locals.append(cached_email_local)
+            name = cached_profile.name
+            blog = cached_profile.blog
+            twitter = cached_profile.twitter_username
+            bio = cached_profile.bio
+            commit_names.extend(cached_profile.commit_names)
+            email_locals.extend(cached_profile.email_locals)
 
         if not used_cached_user:
             if deadline is not None and _time_left() <= 1.0:
@@ -361,6 +389,7 @@ def fetch_github_author_profile(
                     req_timeout = min(10.0, max(2.0, _time_left()))
                     profile = _call_github_enrichment(fetch, f"{GITHUB_API}/users/{login}", token, timeout=req_timeout)
                     if isinstance(profile, dict):
+                        profile_fetched = True
                         name = (profile.get("name") or "").strip() if isinstance(profile.get("name"), str) else ""
                         blog = (profile.get("blog") or "").strip() if isinstance(profile.get("blog"), str) else ""
                         twitter = (
@@ -387,7 +416,14 @@ def fetch_github_author_profile(
                         rate_limited = True
                     logging.warning("Could not fetch GitHub profile for %s: %s", login, error)
 
-    if not rate_limited and repository and pull_numbers:
+    should_fetch_commits = (
+        not rate_limited
+        and bool(repository)
+        and bool(pull_numbers)
+        and not (used_cached_user and (commit_names or email_locals))
+    )
+    if should_fetch_commits:
+        commits_added = False
         for pr_number in pull_numbers[:2]:
             if not isinstance(pr_number, int) or pr_number <= 0:
                 continue
@@ -422,10 +458,27 @@ def fetch_github_author_profile(
                         continue
                 commit = entry.get("commit") if isinstance(entry.get("commit"), dict) else {}
                 c_author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+                before_counts = (len(commit_names), len(email_locals))
                 _add_commit_name(c_author.get("name"))
                 _add_email(c_author.get("email"))
+                if (len(commit_names), len(email_locals)) != before_counts:
+                    commits_added = True
             if commit_names and email_locals:
                 break
+        if commits_added and (profile_fetched or used_cached_user) and store is not None and hasattr(store, "save_cached_github_user"):
+            try:
+                store.save_cached_github_user(
+                    login,
+                    name=name,
+                    blog=blog,
+                    twitter_username=twitter,
+                    bio=bio,
+                    email_local=email_locals[0] if email_locals else "",
+                    commit_name=commit_names[0] if commit_names else "",
+                    fetched_at=iso(moment),
+                )
+            except Exception as cache_error:
+                logging.warning("Could not update cached commit info for %s: %s", login, cache_error)
 
     return (
         GitHubAuthorProfile(
@@ -1439,6 +1492,7 @@ def match_community_contributors_with_diagnostics(
             member_by_id = member_index.by_id
             members_source = "guild_cache+rest_search" if members_source == "guild_cache" else "rest_search"
 
+    enrichment_deferred = 0
     if pending and not guild_members:
         for group in pending:
             skip_reason_by_login[group["login"].strip().casefold()] = "no_guild_members"
@@ -1470,13 +1524,24 @@ def match_community_contributors_with_diagnostics(
                     deadline_tripped = True
                     logging.warning(
                         "Weekly report GitHub enrichment deadline reached after %d/%d pending authors; "
-                        "continuing with deterministic login matching",
+                        "using cached profiles and deferring uncached authors to next run",
                         idx,
                         len(pending),
                     )
-                profile = GitHubAuthorProfile(login=login, user_id=group.get("user_id"))
+                cached = _cached_github_profile(store, login, moment, user_id=group.get("user_id"))
+                if cached is not None:
+                    profile = cached
+                else:
+                    enrichment_deferred += 1
+                    profile = GitHubAuthorProfile(login=login, user_id=group.get("user_id"))
             elif skip_github_enrichment or rate_limited:
-                profile = GitHubAuthorProfile(login=login, user_id=group.get("user_id"))
+                cached = _cached_github_profile(store, login, moment, user_id=group.get("user_id"))
+                if cached is not None:
+                    profile = cached
+                else:
+                    if rate_limited:
+                        enrichment_deferred += 1
+                    profile = GitHubAuthorProfile(login=login, user_id=group.get("user_id"))
             else:
                 profile, hit_limit = fetch_github_author_profile(
                     login,
@@ -1491,6 +1556,7 @@ def match_community_contributors_with_diagnostics(
                 )
                 if hit_limit:
                     rate_limited = True
+                    enrichment_deferred += 1
 
             strong, candidates = score_author_against_members(
                 profile,
@@ -1575,6 +1641,7 @@ def match_community_contributors_with_diagnostics(
             confidence=confidence,
             discord_username=member.username if member else "",
             pr_count=len(group.get("pulls", ())),
+            github_user_id=group.get("user_id") if isinstance(group.get("user_id"), int) else None,
         ))
 
     matched_groups.sort(key=lambda item: (-len(item["pulls"]), item["login"].lower()))
@@ -1597,6 +1664,7 @@ def match_community_contributors_with_diagnostics(
         llm_source=llm_source,
         skip_reasons=tuple(sorted(skip_counter.items())),
         method_counts=tuple(sorted(method_counter.items())),
+        enrichment_deferred=enrichment_deferred,
     )
     logging.info(
         "Weekly match diagnostics: contributors=%d members=%d (source=%s) candidates=%d "

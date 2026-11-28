@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS github_users_cache (
     twitter_username TEXT NOT NULL DEFAULT '',
     bio TEXT NOT NULL DEFAULT '',
     email_local TEXT NOT NULL DEFAULT '',
+    commit_name TEXT NOT NULL DEFAULT '',
     fetched_at TEXT NOT NULL
 );
 
@@ -206,6 +207,9 @@ class Store:
             mw_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(merged_weeks)")}
             if mw_columns and "via" not in mw_columns:
                 self._conn.execute("ALTER TABLE merged_weeks ADD COLUMN via TEXT NOT NULL DEFAULT 'scheduler'")
+            guc_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(github_users_cache)")}
+            if guc_columns and "commit_name" not in guc_columns:
+                self._conn.execute("ALTER TABLE github_users_cache ADD COLUMN commit_name TEXT NOT NULL DEFAULT ''")
             # One-time migration for the bogus 2026-W48 mark created by an ephemeral /merged-this-week preview.
             # Guarded by schema_migrations so it runs at most once and never touches legitimate public posts.
             migration_name = "clear_bogus_2026_w48_preview_v1"
@@ -440,11 +444,12 @@ class Store:
                         ORDER BY p2.merged_at DESC, p2.number DESC
                         LIMIT 1
                     ) AS github_login,
-                    COUNT(*) AS pull_count
+                    COUNT(*) AS pull_count,
+                    MAX(merged_at) AS last_merged_at
                 FROM merged_pull_requests p1
                 WHERE repository = ?
                 GROUP BY github_user_id
-                ORDER BY github_user_id
+                ORDER BY last_merged_at DESC, github_user_id DESC
                 """,
                 (repository,),
             ).fetchall()
@@ -453,6 +458,7 @@ class Store:
                 "github_user_id": int(row["github_user_id"]),
                 "github_login": str(row["github_login"]),
                 "pull_count": int(row["pull_count"]),
+                "last_merged_at": str(row["last_merged_at"] or ""),
             }
             for row in rows
         ]
@@ -879,7 +885,7 @@ class Store:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT github_login, name, blog, twitter_username, bio, email_local, fetched_at
+                SELECT github_login, name, blog, twitter_username, bio, email_local, commit_name, fetched_at
                 FROM github_users_cache
                 WHERE github_login = ?
                 """,
@@ -896,6 +902,7 @@ class Store:
         twitter_username: str = "",
         bio: str = "",
         email_local: str = "",
+        commit_name: str = "",
         fetched_at: str,
     ) -> None:
         key = (github_login or "").strip().lower()
@@ -905,14 +912,18 @@ class Store:
             self._conn.execute(
                 """
                 INSERT INTO github_users_cache (
-                    github_login, name, blog, twitter_username, bio, email_local, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    github_login, name, blog, twitter_username, bio, email_local, commit_name, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(github_login) DO UPDATE SET
                     name = excluded.name,
                     blog = excluded.blog,
                     twitter_username = excluded.twitter_username,
                     bio = excluded.bio,
                     email_local = excluded.email_local,
+                    commit_name = CASE
+                        WHEN excluded.commit_name != '' THEN excluded.commit_name
+                        ELSE github_users_cache.commit_name
+                    END,
                     fetched_at = excluded.fetched_at
                 """,
                 (
@@ -922,6 +933,7 @@ class Store:
                     (twitter_username or "")[:100],
                     (bio or "")[:400],
                     (email_local or "")[:120],
+                    (commit_name or "")[:200],
                     fetched_at,
                 ),
             )

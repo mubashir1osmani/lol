@@ -207,9 +207,13 @@ has that Discord role keeps it.
      `GITHUB_ACTOR_TOKEN`) for higher GitHub read limits.
 4. **Historical backfill**: either set `ROLES_BACKFILL_ON_BOOT=true` for a
    one-time boot run, or have a moderator run `/roles-backfill` in Discord
-   (ephemeral, rate-limit aware, time-bounded, resumable). Backfill assigns
-   roles silently and posts **at most a single summary line** to
-   `ROLE_ANNOUNCEMENTS_CHANNEL_ID` (never one message per contributor).
+   (ephemeral, newest-first so recent contributors get roles first, rate-limit
+   aware, time-bounded, and resumable across `/roles-backfill` and daily runs
+   via SQLite `backfill_windows` + cursor until all windows complete). Confirmed
+   matches from the weekly merge summary (`github_discord_matches`) are reused
+   directly without re-running the LLM. Backfill assigns roles silently and
+   posts **at most a single summary line** to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`
+   (never one message per contributor).
 
 `DISCORD_PUBLIC_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_*`, and the
 Interactions Endpoint URL are all **optional** and not required. `/link-github`
