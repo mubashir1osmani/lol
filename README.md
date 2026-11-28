@@ -553,28 +553,30 @@ web service on port `4318` + `lens-clickhouse` private service) inside the
 **only** declares Lens resources and does **not** define the existing `lol`
 background worker, so syncing the Blueprint never modifies the bot service.
 
-On the bot worker, tracing via LiteLLM's built-in OpenTelemetry callback stays
-**off** (no-op) until `OTEL_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) is
-set. When set, the bot registers `"otel"` in `litellm.callbacks` at startup
-before any completion call, and tags each call with feature/agent metadata
-(`role_matcher`, `pr_review`, `pr_review_classifier`, `message_router`,
-`weekly_summary`, `discord_qa`) and a `session_id` so Lens can group traces.
+On the bot worker, tracing via OpenTelemetry + OpenInference
+(`openinference-instrumentation-litellm`) stays **off** (full no-op, zero
+third-party imports) until `OTEL_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) is
+set. When set, the bot configures an OTel `TracerProvider` with an OTLP HTTP
+span exporter, calls `LiteLLMInstrumentor().instrument(tracer_provider=provider)`
+(without adding `"otel"` to `litellm.callbacks`, which Lens v0.6.0 hides as
+gateway-internal), and wraps each logical task (`role_matcher`, `pr_review`,
+`pr_review_followup`, `discord_qa`, `weekly_summary`, `message_router`,
+`pr_review_classifier`) in an OpenInference `AGENT` span so Lens shows one run
+per task with its nested LLM calls.
 
-### Bot environment variables (`litellm==1.111.0`)
+### Bot environment variables
 
-`litellm`'s `OpenTelemetryConfig.from_env()` reads the following variables
+`contributor_bot/tracing.py` reads the following variables
 (`OTEL_EXPORTER_OTLP_*` aliases take precedence if both are set):
 
 | Environment variable | Value / notes |
 | --- | --- |
-| `OTEL_EXPORTER` | `otlp_http` (alias: `OTEL_EXPORTER_OTLP_PROTOCOL`). LiteLLM also auto-selects `otlp_http` when an endpoint is set and exporter defaults to `console`. |
-| `OTEL_ENDPOINT` | `https://<lens-host>/v1/traces` (alias: `OTEL_EXPORTER_OTLP_ENDPOINT`). Leaving both unset keeps tracing completely off. |
-| `OTEL_HEADERS` | `Authorization=Bearer <tracing-key>` (alias: `OTEL_EXPORTER_OTLP_HEADERS`). |
-| `OTEL_SERVICE_NAME` | `litellm-contributor-bot` (optional; defaults to `litellm`). |
+| `OTEL_ENDPOINT` | `https://<lens-host>/v1/traces` (or base URL `https://<lens-host>`, auto-normalized to `/v1/traces`; alias: `OTEL_EXPORTER_OTLP_ENDPOINT`). Leaving both unset keeps tracing completely off. |
+| `OTEL_HEADERS` | `Authorization=Bearer <tracing-key>` (comma-separated `k=v,k2=v2` with literal values; alias: `OTEL_EXPORTER_OTLP_HEADERS`). |
+| `OTEL_SERVICE_NAME` | `litellm-contributor-bot` (optional; defaults to `litellm-contributor-bot`). |
 
-**Important header formatting note (`litellm==1.111.0`):** `OpenTelemetry._get_headers_dictionary()`
-splits `OTEL_HEADERS` on `,` and then on the first `=` **without** URL-decoding
-or stripping whitespace. Set the value literally as
+**Header formatting note:** `parse_otel_headers()` splits `OTEL_HEADERS` on `,`
+and then on the first `=` **without** URL-decoding. Set the value literally as
 `Authorization=Bearer <tracing-key>` (using `=` and a literal space; do **not**
 use `Authorization: Bearer ...` and do **not** percent-encode the space as
 `%20`).
