@@ -626,6 +626,22 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def all_granted_discord_ids(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT discord_id FROM role_grants ORDER BY discord_id"
+            ).fetchall()
+        return [str(row["discord_id"]) for row in rows]
+
+    def delete_grant(self, discord_id: str, role_key: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM role_grants WHERE discord_id = ? AND role_key = ?",
+                (discord_id, role_key),
+            )
+            self._conn.commit()
+        return cur.rowcount > 0
+
     def mark_grants_announced(self, discord_id: str, role_keys: list[str], announced_at: str) -> None:
         if not role_keys:
             return

@@ -62,6 +62,12 @@ def _member(discord_id: str, username: str, display_name: str = "", global_name:
     )
 
 
+def _stub_github_profile_get(url: str, token: str | None = None, **kwargs):
+    if "/users/" in url:
+        return {"login": url.rsplit("/users/", 1)[1]}
+    return []
+
+
 class ZeroOAuthConfigAndCommandsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -265,7 +271,9 @@ class AutoRolesPollerTests(unittest.TestCase):
         def fake_github_get(url, token, **kwargs):
             if url.endswith("/users/asmith99"):
                 return {"login": "asmith99", "name": "Alex Smith", "bio": "", "blog": "", "twitter_username": ""}
-            return {}
+            if "/users/" in url:
+                return {"login": url.rsplit("/users/", 1)[1]}
+            return []
 
         now = datetime(2026, 11, 27, 15, 0, tzinfo=UTC)
         with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
@@ -387,6 +395,7 @@ class AutoRolesPollerTests(unittest.TestCase):
                 count_fetcher=fake_count,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
 
         # Needed files for PR #401 (didn't have Agent Builder or Provider Wizard yet).
@@ -487,6 +496,7 @@ class AutoRolesBackfillTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
 
         self.assertTrue(res.completed)
@@ -540,6 +550,7 @@ class AutoRolesBackfillTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
 
         self.assertTrue(res.rate_limited)
@@ -758,6 +769,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
 
         self.assertEqual(res.stored, 3)
@@ -812,6 +824,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
         self.assertEqual(len(chunked_posts), 3)
         self.assertEqual(chunk_store.all_unannounced_grants(), [])
@@ -867,6 +880,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
 
         # Window 1 MUST be the newest window (Oct 27..Nov 20), granting recent-nov immediately!
@@ -896,6 +910,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
         self.assertEqual(seen_windows[0], ("2026-09-29", "2026-10-27"))
         self.assertEqual(r2.windows_done_total, 2)
@@ -939,6 +954,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
         self.assertEqual(seen_windows, [("2026-09-01", "2026-09-29")])
         self.assertTrue(r3.completed)
@@ -1004,6 +1020,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
+                github_getter=_stub_github_profile_get,
             )
 
         self.assertEqual(search_windows, [(now - timedelta(days=7), now)])
@@ -1065,6 +1082,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 search_merged_fn=lambda repo, start, end, tok: set(),
                 count_fetcher=lambda repo, login, tok: 1,
                 org_members_fetcher=lambda org, tok: frozenset(),
+                members=[_member("7001", "fhero", "Friday Hero")],
             )
         self.assertEqual(res.roles_granted, 1)
         self.assertEqual(add_role.call_args.args[1], "7001")
@@ -1094,14 +1112,22 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         now = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
 
         # Run 1: Simulate rate limit hitting on the 2nd uncached user after caching the 1st!
+        sleeps = []
+
         def flaky_github_get(url, token, **kwargs):
             if url.endswith("/users/gh-beta"):
                 fetched_users.append("gh-beta")
-                return {"login": "gh-beta", "name": "Liam Beta", "bio": "", "blog": "", "twitter_username": ""}
+                return {
+                    "login": "gh-beta",
+                    "name": "Liam Beta",
+                    "bio": "Discord: liam_discord",
+                    "blog": "",
+                    "twitter_username": "",
+                }
             if url.endswith("/users/gh-alpha"):
                 fetched_users.append("gh-alpha")
                 raise TransientAPIError("rate limit")
-            return {}
+            return []
 
         with mock.patch("contributor_bot.rewards.add_member_role") as add_role1, \
              mock.patch("contributor_bot.roles_sync.post_message", return_value={"id": "1"}):
@@ -1114,11 +1140,14 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
                 github_getter=flaky_github_get,
+                sleep_fn=sleeps.append,
             )
 
         # Newest author (gh-beta, merged Nov 19) was enriched, cached, matched, and granted!
-        # Older author (gh-alpha) was deferred -> completed=False so next run picks them up!
-        self.assertEqual(fetched_users, ["gh-beta", "gh-alpha"])
+        # Older author (gh-alpha) retried with backoff then failed enrichment -> completed=False so next run picks them up!
+        self.assertIn("gh-beta", fetched_users)
+        self.assertGreater(fetched_users.count("gh-alpha"), 1)
+        self.assertTrue(sleeps)
         self.assertEqual(r1.enrichment_deferred, 1)
         self.assertFalse(r1.completed)
         self.assertEqual([c.args[1] for c in add_role1.call_args_list], ["8002"])
@@ -1130,7 +1159,15 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         def healthy_github_get(url, token, **kwargs):
             if url.endswith("/users/gh-alpha"):
                 fetched_users.append("gh-alpha")
-                return {"login": "gh-alpha", "name": "Zoe Alpha", "bio": "", "blog": "", "twitter_username": ""}
+                return {
+                    "login": "gh-alpha",
+                    "name": "Zoe Alpha",
+                    "bio": "Discord: zoe_discord",
+                    "blog": "",
+                    "twitter_username": "",
+                }
+            if "/commits" in url:
+                return []
             raise AssertionError(f"unexpected re-fetch: {url}")
 
         with mock.patch("contributor_bot.rewards.add_member_role") as add_role2, \
@@ -1144,6 +1181,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
                 org_members_fetcher=lambda org, tok: frozenset(),
                 members=members,
                 github_getter=healthy_github_get,
+                sleep_fn=sleeps.append,
             )
 
         self.assertEqual(fetched_users, ["gh-alpha"])
@@ -1203,7 +1241,7 @@ class DailyRolesSchedulerTests(unittest.TestCase):
         ]
 
         profiles = {
-            "gh-jsmith": {"login": "gh-jsmith", "name": "John Smith", "bio": "", "blog": "", "twitter_username": ""},
+            "gh-jsmith": {"login": "gh-jsmith", "name": "John Smith", "bio": "Discord: john_recent", "blog": "", "twitter_username": ""},
             "miracode": {"login": "miracode", "name": "Mira", "bio": "", "blog": "", "twitter_username": ""},
             "veteran-dev": {"login": "veteran-dev", "name": "Veteran Dev", "bio": "", "blog": "", "twitter_username": ""},
         }

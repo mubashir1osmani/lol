@@ -1,963 +1,812 @@
-from datetime import datetime, timedelta, timezone
+from __future__ import annotations
+
 import json
-from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest import mock
 
+from contributor_bot.api import TransientAPIError
 from contributor_bot.config import Config, get_config
-from contributor_bot.interactions import handle_interaction, role_slash_commands
+from contributor_bot.interactions import role_slash_commands
 from contributor_bot.matcher import (
     DiscordMemberInfo,
     GitHubAuthorProfile,
     PRLinkPosterEvidence,
+    _cached_github_profile,
     match_community_contributors_with_diagnostics,
-    multi_author_poster_ids,
     score_author_against_members,
+    validate_pr_link_poster_match,
 )
 from contributor_bot.rewards import announce_pending_role_grants, apply_roles
 from contributor_bot.roles_sync import (
     _grant_roles_for_stored_matches,
-    execute_roles_revoke,
     poll_merged_prs_for_roles,
-    revalidate_pr_link_poster_matches_on_boot,
+    revalidate_all_grants_on_boot,
     run_daily_roles_if_due,
     run_roles_backfill,
-    should_run_pr_link_poster_revalidation,
+    should_run_grants_revalidation,
 )
+from contributor_bot.schedule import UTC, iso
 from contributor_bot.store import Store
 
 
-def _make_config(**overrides) -> Config:
-    defaults = dict(
-        discord_guild_id="333333333333333333",
-        discord_application_id="444444444444444444",
-        github_repository="BerriAI/litellm",
-        contributor_roles_enabled=True,
-        role_ids={
-            "contributor": "900000000000000001",
-            "oss_champion": "900000000000000002",
-            "agent_builder": "900000000000000003",
-            "provider_wizard": "900000000000000004",
-        },
-        role_announcements_channel_id="800000000000000001",
+def _roles_env(directory: str, **extra: str) -> dict[str, str]:
+    return {
+        "DISCORD_BOT_TOKEN": "discord-secret",
+        "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
+        "ANNOUNCEMENTS_CHANNEL_ID": "456",
+        "CONTRIBUTOR_ROLES_ENABLED": "true",
+        "DISCORD_GUILD_ID": "333",
+        "ROLE_CONTRIBUTOR_ID": "1001",
+        "ROLE_OSS_CHAMPION_ID": "1002",
+        "ROLE_AGENT_BUILDER_ID": "1003",
+        "ROLE_PROVIDER_WIZARD_ID": "1004",
+        "ROLE_ANNOUNCEMENTS_CHANNEL_ID": "789",
+        "MAINTAINER_GITHUB_LOGINS": "maint-alice",
+        "GITHUB_TOKEN": "github-secret",
+        "ROLES_DB_PATH": str(Path(directory) / "roles.db"),
+        "STATE_FILE": str(Path(directory) / "state.json"),
+        **extra,
+    }
+
+
+def _member(
+    discord_id: str,
+    username: str,
+    global_name: str = "",
+    nick: str = "",
+) -> DiscordMemberInfo:
+    return DiscordMemberInfo(
+        discord_id=discord_id,
+        username=username,
+        global_name=global_name,
+        nick=nick,
+        display_name=nick or global_name or username,
     )
-    defaults.update(overrides)
-    return Config("tok", "123", "456", **defaults)
 
 
-def _seed_pull(
-    store: Store,
-    repo: str,
-    number: int,
-    uid: int,
+def _gql_user_node(
     login: str,
-    merged_at: str,
     *,
-    title: str = "feat: change",
-    labels: list[str] | None = None,
-    files: list[str] | None = None,
-) -> None:
-    store.upsert_pull(
-        repository=repo,
-        number=number,
-        github_user_id=uid,
-        github_login=login,
-        merged_at=merged_at,
-        title=title,
-        labels=labels or [],
-        files=files or [],
-    )
+    name: str = "",
+    bio: str = "",
+    company: str = "",
+    email: str = "",
+    twitter: str = "",
+    website: str = "",
+    socials: list[dict] | None = None,
+    readme: str = "",
+) -> dict:
+    return {
+        "login": login,
+        "name": name,
+        "bio": bio,
+        "company": company,
+        "email": email,
+        "twitterUsername": twitter,
+        "websiteUrl": website,
+        "socialAccounts": {"nodes": socials or []},
+        "profileRepo": {"object": {"text": readme}} if readme else None,
+    }
 
 
-class TestPRLinkPosterHardening(unittest.TestCase):
+def _stub_gql_from_nodes(nodes_by_login: dict[str, dict]):
+    def _caller(_token, query, variables):
+        if "BatchPRCommits" in query:
+            return {"data": {"repository": {}}}
+        data = {}
+        for var_key, login in (variables or {}).items():
+            idx = var_key.removeprefix("l")
+            node = nodes_by_login.get(login.lower())
+            if node is not None:
+                data[f"u{idx}"] = node
+            else:
+                data[f"u{idx}"] = _gql_user_node(login)
+        return {"data": data}
+
+    return _caller
+
+
+class NoExtraModCommandsTests(unittest.TestCase):
+    def test_roles_why_and_roles_revoke_are_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = get_config(_roles_env(tmp))
+            cmd_names = {cmd["name"] for cmd in role_slash_commands(cfg)}
+            self.assertNotIn("roles-why", cmd_names)
+            self.assertNotIn("roles-revoke", cmd_names)
+            self.assertIn("my-prs", cmd_names)
+            self.assertIn("roles-backfill", cmd_names)
+
+
+class FourTierMatchingOrderTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = get_config(_roles_env(self.temp.name))
+        self.store = Store(self.config.roles_db_path)
         self.addCleanup(self.store.close)
-        self.cfg = _make_config()
-        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
 
-    def test_reviewer_posting_links_by_multiple_authors_is_rejected_completely(self):
-        """Production bug repro: community member 'edvn' links PRs by other authors."""
-        repo = self.cfg.github_repository
-        _seed_pull(
-            self.store, repo, 1001, 501, "real-prolific-author", "2026-11-20T10:00:00+00:00",
-            labels=["agents"], files=["litellm/llms/openai/chat.py", "litellm/proxy/agent.py"],
-        )
-        _seed_pull(
-            self.store, repo, 1002, 501, "real-prolific-author", "2026-11-21T10:00:00+00:00",
-            files=["litellm/llms/anthropic/chat.py"],
-        )
-        _seed_pull(
-            self.store, repo, 2001, 502, "another-author", "2026-11-22T10:00:00+00:00",
-            files=["litellm/router.py"],
-        )
-
-        # Discord member 'edvn' links PRs from BOTH real-prolific-author and another-author.
-        edvn_id = "700000000000000001"
-        self.store.record_pr_link_poster(repo, 1001, edvn_id, "800000000000000011", "2026-11-20T11:00:00+00:00", message_text="taking a look at this PR")
-        self.store.record_pr_link_poster(repo, 1002, edvn_id, "800000000000000012", "2026-11-21T11:00:00+00:00", message_text="my pr")  # even with ownership phrase!
-        self.store.record_pr_link_poster(repo, 2001, edvn_id, "800000000000000013", "2026-11-22T11:00:00+00:00", message_text="also reviewing #2001")
-
-        # Verify multi_author_poster_ids catches edvn.
-        all_rows = self.store.all_pr_link_posters(repo)
-        pr_authors = self.store.pr_authors_for_numbers(repo, [1001, 1002, 2001])
-        multi = multi_author_poster_ids(all_rows, pr_authors)
-        self.assertIn(edvn_id, multi)
-
-        members = [DiscordMemberInfo(edvn_id, username="edvn", global_name="Edvn")]
-        groups = [
-            {
-                "login": "real-prolific-author",
-                "user_id": 501,
-                "first_time": False,
-                "pulls": [
-                    {"number": 1001, "title": "feat: a", "url": "https://github.com/BerriAI/litellm/pull/1001"},
-                    {"number": 1002, "title": "feat: b", "url": "https://github.com/BerriAI/litellm/pull/1002"},
-                ],
-            },
+    def test_tier_a_direct_link_socials_bio_readme_and_never_matches_nick(self):
+        members = [
+            _member("111111111111111111", "real_social_user", "Real Social"),
+            _member("222222222222222222", "bio_handle_user", "Bio Handle"),
+            _member("333333333333333333", "readme_user", "Readme Person"),
+            _member("444444444444444444", "spoof_acct", "Unrelated", nick="target_handle"),
         ]
+        groups = [
+            {"login": "gh-social", "user_id": 101, "pulls": [{"number": 1}]},
+            {"login": "gh-bio", "user_id": 102, "pulls": [{"number": 2}]},
+            {"login": "gh-readme", "user_id": 103, "pulls": [{"number": 3}]},
+            {"login": "gh-nick-spoof", "user_id": 104, "pulls": [{"number": 4}]},
+        ]
+        gql = _stub_gql_from_nodes({
+            "gh-social": _gql_user_node(
+                "gh-social",
+                socials=[{"provider": "GENERIC", "displayName": "Discord", "url": "https://discord.com/users/111111111111111111"}],
+            ),
+            "gh-bio": _gql_user_node("gh-bio", bio="Reach me on Discord: bio_handle_user"),
+            "gh-readme": _gql_user_node("gh-readme", readme="Find me on discord: readme_user"),
+            "gh-nick-spoof": _gql_user_node("gh-nick-spoof", bio="Discord: target_handle"),
+        })
 
-        llm_called = []
-
-        def fake_llm(prompt, model):
-            llm_called.append(prompt)
-            return '{"discord_id": "700000000000000001", "confidence": 0.99, "evidence": ["x"], "reason": "forced"}'
-
-        matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
+        matched, _skipped, details, _diag = match_community_contributors_with_diagnostics(
             groups,
-            self.cfg,
+            self.config,
             self.store,
+            now=self.now,
             members=members,
-            now=self.now,
-            skip_github_enrichment=True,
-            llm_complete=fake_llm,
+            graphql_caller=gql,
         )
-        # edvn must NOT be matched deterministically AND must NOT even be sent to LLM!
-        self.assertEqual(matched, [])
-        self.assertEqual(skipped, 1)
-        self.assertEqual(llm_called, [])
-        self.assertIsNone(self.store.get_confirmed_match("real-prolific-author"))
+        by_login = {g["login"]: g for g in matched}
+        self.assertEqual(by_login["gh-social"]["discord_id"], "111111111111111111")
+        self.assertEqual(by_login["gh-social"]["match_method"], "social_discord_id")
+        self.assertEqual(by_login["gh-social"]["match_confidence"], 0.99)
+        self.assertTrue(any("direct_link:social_discord_id" in e for e in by_login["gh-social"]["match_evidence"]))
 
-    def test_two_links_without_ownership_or_similarity_never_auto_accepts(self):
-        """Linking >=2 PRs by one author without ownership text or similarity >= 0.5 is LLM-only."""
-        prof = GitHubAuthorProfile(login="kiran-dev-99", name="Kiran Patel")
-        members = [DiscordMemberInfo("700000000000000002", username="edvn", global_name="Edvn")]
-        strong, cands = score_author_against_members(
-            prof,
-            members,
-            pr_link_posters=[
-                PRLinkPosterEvidence(
-                    "700000000000000002",
-                    (101, 102, 103),
-                    ("check out #101", "please review #102", "bump #103"),
-                )
-            ],
-        )
-        # Must NOT auto-accept (not even with "please review" or 3 PRs!).
-        self.assertIsNone(strong)
-        self.assertEqual(len(cands), 1)
-        self.assertEqual(cands[0].member.discord_id, "700000000000000002")
-        self.assertIn("pr_link_poster:3_prs", cands[0].signals)
+        self.assertEqual(by_login["gh-bio"]["discord_id"], "222222222222222222")
+        self.assertEqual(by_login["gh-bio"]["match_method"], "bio_discord_handle")
+        self.assertEqual(by_login["gh-bio"]["match_confidence"], 0.98)
 
-    def test_ownership_phrases_and_name_similarity_auto_accept_for_single_author_poster(self):
-        prof = GitHubAuthorProfile(login="unusual-gh-author", name="Carlos Vega")
-        unrelated_member = DiscordMemberInfo("700000000000000002", username="edvn", global_name="Edvn")
-        similar_member = DiscordMemberInfo("700000000000000003", username="carlos_v_dev", global_name="Carlos V")
-        for phrase in (
-            "here is my pr for streaming",
-            "I opened https://github.com/BerriAI/litellm/pull/55",
-            "I made this fix yesterday",
-            "I raised a PR for gemini",
-            "I submitted a patch",
-        ):
-            strong, _ = score_author_against_members(
-                prof,
-                [unrelated_member],
-                pr_link_posters=[PRLinkPosterEvidence("700000000000000002", (55,), (phrase,))],
+        self.assertEqual(by_login["gh-readme"]["discord_id"], "333333333333333333")
+        self.assertEqual(by_login["gh-readme"]["match_method"], "readme_discord_handle")
+
+        # Server nickname alone must NOT satisfy Tier (a) direct-link handle match.
+        self.assertNotIn("gh-nick-spoof", by_login)
+        self.assertEqual(len(details), 3)
+
+    def test_tier_b_exact_identity_matches_username_or_global_name_only_not_nick_or_name_alone(self):
+        members = [
+            _member("111111111111111111", "alice_dev", "Alice"),
+            _member("222222222222222222", "other_user", "Bob-Coder"),
+            _member("333333333333333333", "imposter99", "Imposter", nick="carol_dev"),
+            _member("444444444444444444", "john_smith", "John Smith"),
+            _member("555555555555555555", "cooltweet", "Cool"),
+        ]
+        groups = [
+            {"login": "Alice-Dev", "user_id": 201, "pulls": [{"number": 10}]},
+            {"login": "bob-coder", "user_id": 202, "pulls": [{"number": 11}]},
+            {"login": "carol-dev", "user_id": 203, "pulls": [{"number": 12}]},
+            # Full-name only and twitter-only must NOT auto-accept in Tier (b).
+            {"login": "gh-unrelated-1", "user_id": 204, "pulls": [{"number": 13}]},
+            {"login": "gh-unrelated-2", "user_id": 205, "pulls": [{"number": 14}]},
+        ]
+        gql = _stub_gql_from_nodes({
+            "alice-dev": _gql_user_node("Alice-Dev", name="Alice"),
+            "bob-coder": _gql_user_node("bob-coder", name="Bob"),
+            "carol-dev": _gql_user_node("carol-dev", name="Carol"),
+            "gh-unrelated-1": _gql_user_node("gh-unrelated-1", name="John Smith"),
+            "gh-unrelated-2": _gql_user_node("gh-unrelated-2", twitter="cooltweet"),
+        })
+        cleared_env = {
+            k: ""
+            for k in ("TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "LITELLM_API_KEY")
+        }
+        with mock.patch.dict("os.environ", cleared_env, clear=False):
+            matched, _skipped, _details, _diag = match_community_contributors_with_diagnostics(
+                groups,
+                self.config,
+                self.store,
+                now=self.now,
+                members=members,
+                graphql_caller=gql,
             )
-            self.assertIsNotNone(strong, f"Expected auto-accept for phrase: {phrase!r}")
-            self.assertEqual(strong[0].discord_id, "700000000000000002")
-            self.assertEqual(strong[1], "pr_link_poster")
 
-        # Similarity >= 0.50 against global_name/username without ownership text auto-accepts.
-        strong_sim, _ = score_author_against_members(
-            prof,
-            [similar_member],
-            pr_link_posters=[PRLinkPosterEvidence("700000000000000003", (55,), ("https://github.com/BerriAI/litellm/pull/55",))],
+        by_login = {g["login"]: g for g in matched}
+        self.assertEqual(by_login["Alice-Dev"]["discord_id"], "111111111111111111")
+        self.assertEqual(by_login["Alice-Dev"]["match_method"], "exact_login")
+        self.assertTrue(any("exact_identity:" in e for e in by_login["Alice-Dev"]["match_evidence"]))
+        self.assertEqual(by_login["bob-coder"]["discord_id"], "222222222222222222")
+        self.assertNotIn("carol-dev", by_login)
+        self.assertNotIn("gh-unrelated-1", by_login)
+        self.assertNotIn("gh-unrelated-2", by_login)
+
+    def test_tier_c_pr_link_poster_corroboration_signals_and_multi_author_rejection(self):
+        # 1) Same X handle corroborates PR-link poster -> ACCEPTED!
+        prof_x = GitHubAuthorProfile(login="gh-z1", name="Zed", twitter_username="zed_builds")
+        member_x = _member("100000000000000001", "zed_builds", "Z")
+        ev_x = PRLinkPosterEvidence("100000000000000001", (501,), ("check out https://github.com/BerriAI/litellm/pull/501",))
+        ok, reason = validate_pr_link_poster_match(prof_x, member_x, ev_x, eligible_posters=[ev_x])
+        self.assertTrue(ok)
+        self.assertIn("same_x:zed_builds", reason)
+
+        # 2) Same website / email domain corroborates PR-link poster -> ACCEPTED!
+        prof_web = GitHubAuthorProfile(login="gh-w1", name="W", blog="https://wrenworks.dev", email_domain="wrenworks.dev")
+        member_web = _member("100000000000000002", "random_u", "Random")
+        ev_web = PRLinkPosterEvidence(
+            "100000000000000002",
+            (502,),
+            ("linked PR https://github.com/BerriAI/litellm/pull/502 docs on https://wrenworks.dev/post",),
         )
-        self.assertIsNotNone(strong_sim)
-        self.assertEqual(strong_sim[0].discord_id, "700000000000000003")
-        self.assertEqual(strong_sim[1], "pr_link_poster")
+        ok_web, reason_web = validate_pr_link_poster_match(prof_web, member_web, ev_web, eligible_posters=[ev_web])
+        self.assertTrue(ok_web)
+        self.assertIn("same_website:wrenworks.dev", reason_web)
 
-        # "please review" alone (and short token overlap like "edvn" vs "Zed") must NOT auto-accept.
-        strong_pr, _ = score_author_against_members(
-            prof,
-            [unrelated_member],
-            pr_link_posters=[PRLinkPosterEvidence("700000000000000002", (55,), ("please review https://github.com/BerriAI/litellm/pull/55",))],
+        # 3) Ownership language ("my PR") -> ACCEPTED; "please review" alone -> REJECTED!
+        prof_own = GitHubAuthorProfile(login="gh-own", name="Quiet Author")
+        member_own = _member("100000000000000003", "totally_diff", "Diff")
+        ev_own = PRLinkPosterEvidence("100000000000000003", (503,), ("Here is my PR https://github.com/BerriAI/litellm/pull/503",))
+        ok_own, _ = validate_pr_link_poster_match(prof_own, member_own, ev_own, eligible_posters=[ev_own])
+        self.assertTrue(ok_own)
+
+        ev_review = PRLinkPosterEvidence("100000000000000003", (503, 504, 505), ("please review https://github.com/BerriAI/litellm/pull/503",))
+        ok_rev, _ = validate_pr_link_poster_match(prof_own, member_own, ev_review, eligible_posters=[ev_review])
+        self.assertFalse(ok_rev)
+
+        # 4) Name similarity >= 0.50 -> ACCEPTED!
+        prof_sim = GitHubAuthorProfile(login="alexchen99", name="Alex Chen")
+        member_sim = _member("100000000000000004", "alexchen_ai", "Alex")
+        ev_sim = PRLinkPosterEvidence("100000000000000004", (506,), ("https://github.com/BerriAI/litellm/pull/506",))
+        ok_sim, reason_sim = validate_pr_link_poster_match(prof_sim, member_sim, ev_sim, eligible_posters=[ev_sim])
+        self.assertTrue(ok_sim)
+        self.assertIn("name_sim:", reason_sim)
+
+        # 5) Multi-author poster (linked PRs by >= 2 authors) -> REJECTED from Tier (c) AND Tier (d)!
+        self.store.record_pr_link_poster(
+            "BerriAI/litellm", 601, "100000000000000009", "900000000000000001",
+            iso(self.now), message_text="my PR https://github.com/BerriAI/litellm/pull/601",
         )
-        self.assertIsNone(strong_pr)
-
-
-class TestExactLoginNoNick(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
-        self.addCleanup(self.store.close)
-        self.cfg = _make_config()
-        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
-
-    def test_exact_login_ignores_nick_and_display_name(self):
-        # Member sets server nick to someone else's GitHub login!
-        impostor = DiscordMemberInfo(
-            "710000000000000001",
-            username="edvn",
-            global_name="Edvn",
-            nick="prolific-gh-dev",
-            display_name="prolific-gh-dev",
+        self.store.record_pr_link_poster(
+            "BerriAI/litellm", 602, "100000000000000009", "900000000000000002",
+            iso(self.now), message_text="also check https://github.com/BerriAI/litellm/pull/602",
         )
-        prof = GitHubAuthorProfile(login="prolific-gh-dev", name="Alex Rivera")
-        strong, _cands = score_author_against_members(prof, [impostor])
-        self.assertIsNone(strong)
-
-        # Also check pre-enrichment fast path in match_community_contributors_with_diagnostics.
-        groups = [
-            {
-                "login": "prolific-gh-dev",
-                "user_id": 801,
-                "first_time": False,
-                "pulls": [{"number": 9001, "title": "fix", "url": "https://github.com/BerriAI/litellm/pull/9001"}],
-            }
-        ]
-        matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
-            groups,
-            self.cfg,
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=601, github_user_id=6010,
+            github_login="author-one", merged_at=iso(self.now), title="p1", labels=[], files=[],
+        )
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=602, github_user_id=6020,
+            github_login="author-two", merged_at=iso(self.now), title="p2", labels=[], files=[],
+        )
+        reviewer = _member("100000000000000009", "triager_bot_human", "Triager")
+        llm_seen = []
+        matched, _skipped, _details, _diag = match_community_contributors_with_diagnostics(
+            [{"login": "author-one", "user_id": 6010, "pulls": [{"number": 601}]}],
+            self.config,
             self.store,
-            members=[impostor],
             now=self.now,
-            skip_github_enrichment=True,
+            members=[reviewer],
+            graphql_caller=_stub_gql_from_nodes({"author-one": _gql_user_node("author-one", name="Author One")}),
+            llm_complete=lambda m, msgs: (llm_seen.append(msgs), json.dumps({"discord_id": None, "confidence": 0.0, "reason": "none", "evidence": []}))[1],
         )
         self.assertEqual(matched, [])
-        self.assertEqual(skipped, 1)
+        self.assertEqual(llm_seen, [])
 
-    def test_exact_login_matches_username_and_global_name(self):
-        by_user = DiscordMemberInfo("710000000000000002", username="prolific-gh-dev", global_name="Other")
-        by_global = DiscordMemberInfo("710000000000000003", username="other-handle", global_name="prolific-gh-dev")
-        prof = GitHubAuthorProfile(login="prolific-gh-dev")
-
-        s1, _ = score_author_against_members(prof, [by_user])
-        self.assertIsNotNone(s1)
-        self.assertEqual((s1[0].discord_id, s1[1]), ("710000000000000002", "exact_login"))
-
-        s2, _ = score_author_against_members(prof, [by_global])
-        self.assertIsNotNone(s2)
-        self.assertEqual((s2[0].discord_id, s2[1]), ("710000000000000003", "exact_login"))
-
-
-class TestStrictOneToOneBijection(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
-        self.addCleanup(self.store.close)
-        self.cfg = _make_config()
-        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
-
-    def test_intra_batch_conflict_grants_nothing_and_logs(self):
-        # Two GitHub logins both match the SAME Discord user (one via username, one via global_name).
-        member = DiscordMemberInfo("720000000000000001", username="alice-gh", global_name="bob-gh")
-        groups = [
-            {"login": "alice-gh", "user_id": 1, "first_time": False, "pulls": [{"number": 1, "title": "a", "url": "u"}]},
-            {"login": "bob-gh", "user_id": 2, "first_time": False, "pulls": [{"number": 2, "title": "b", "url": "u"}]},
+    def test_tier_d_llm_requires_full_enrichment_top5_two_signals_and_085(self):
+        members = [
+            _member(f"20000000000000000{i}", f"kpatel_{i}", f"Kiran Patel {i}")
+            for i in range(1, 8)
         ]
+        group = [{"login": "kpatel-gh", "user_id": 701, "pulls": [{"number": 701}]}]
+        gql_rich = _stub_gql_from_nodes({
+            "kpatel-gh": _gql_user_node(
+                "kpatel-gh",
+                name="Kiran Patel 1",
+                company="Acme",
+                email="kiran@acme.io",
+            )
+        })
+
+        # Captures payload to verify top-5 cap + email_domain present.
+        seen_payloads = []
+
+        def llm_reject_single(model, messages):
+            seen_payloads.append(json.loads(messages[1]["content"]))
+            return json.dumps({
+                "discord_id": seen_payloads[-1]["candidates"][0]["discord_id"],
+                "confidence": 0.99,
+                "reason": "only one signal",
+                "evidence": ["single handle overlap"],
+            })
+
+        matched_single, _sk, _d, diag_single = match_community_contributors_with_diagnostics(
+            group, self.config, None, now=self.now, members=members, graphql_caller=gql_rich, llm_complete=llm_reject_single,
+        )
+        self.assertEqual(matched_single, [])
+        self.assertEqual(dict(diag_single.skip_reasons), {"llm_below_threshold": 1})
+        self.assertLessEqual(len(seen_payloads[0]["candidates"]), 5)
+        self.assertEqual(seen_payloads[0]["github_author"]["email_domain"], "acme.io")
+
+        # 2 signals but confidence 0.84 (< 0.85) -> REJECTED!
+        def llm_below_85(model, messages):
+            payload = json.loads(messages[1]["content"])
+            return json.dumps({
+                "discord_id": payload["candidates"][0]["discord_id"],
+                "confidence": 0.84,
+                "reason": "below 0.85",
+                "evidence": ["sig 1", "sig 2"],
+            })
+
+        matched_low, _sk, _d, diag_low = match_community_contributors_with_diagnostics(
+            group, self.config, None, now=self.now, members=members, graphql_caller=gql_rich, llm_complete=llm_below_85,
+        )
+        self.assertEqual(matched_low, [])
+        self.assertEqual(dict(diag_low.skip_reasons), {"llm_below_threshold": 1})
+
+        # 2 independent signals AND confidence >= 0.85 -> ACCEPTED with evidence!
+        def llm_accept(model, messages):
+            payload = json.loads(messages[1]["content"])
+            return json.dumps({
+                "discord_id": payload["candidates"][0]["discord_id"],
+                "confidence": 0.87,
+                "reason": "name and login match",
+                "evidence": ["GitHub name matches global_name", "login prefix matches username"],
+            })
+
+        matched_ok, _sk, details_ok, _diag_ok = match_community_contributors_with_diagnostics(
+            group, self.config, self.store, now=self.now, members=members, graphql_caller=gql_rich, llm_complete=llm_accept,
+        )
+        self.assertEqual(len(matched_ok), 1)
+        self.assertEqual(matched_ok[0]["match_method"], "llm")
+        self.assertGreaterEqual(len(details_ok[0].evidence), 2)
+
+        # Empty GitHub enrichment (no name/bio/socials/company/email/readme/commits) must NOT call LLM!
+        llm_called_on_empty = []
+        gql_empty = _stub_gql_from_nodes({"kpatel-empty": _gql_user_node("kpatel-empty")})
+        matched_empty, _sk, _d, _diag = match_community_contributors_with_diagnostics(
+            [{"login": "kpatel-empty", "user_id": 702, "pulls": []}],
+            self.config,
+            None,
+            now=self.now,
+            members=members,
+            graphql_caller=gql_empty,
+            llm_complete=lambda m, msgs: (llm_called_on_empty.append(True), "{}")[1],
+        )
+        self.assertEqual(matched_empty, [])
+        self.assertEqual(llm_called_on_empty, [])
+
+
+class NoSkipEnrichmentAndNegativeCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = get_config(_roles_env(self.temp.name))
+        self.store = Store(self.config.roles_db_path)
+        self.addCleanup(self.store.close)
+        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
+
+    def test_exact_login_never_skips_github_profile_lookup_and_rate_limit_backs_off_then_succeeds(self):
+        members = [_member("300000000000000001", "exact_hero", "Exact Hero")]
+        groups = [{"login": "exact-hero", "user_id": 301, "pulls": []}]
+        attempts = {"n": 0}
+        sleeps: list[float] = []
+
+        def flaky_gql(_token, query, variables):
+            if "BatchPRCommits" in query:
+                return {"data": {"repository": {}}}
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise TransientAPIError("GitHub secondary rate limit", retry_after=3.0)
+            return {"data": {"u0": _gql_user_node("exact-hero", name="Exact Hero", email="hero@acme.io")}}
+
+        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
+            groups,
+            self.config,
+            self.store,
+            now=self.now,
+            members=members,
+            graphql_caller=flaky_gql,
+            sleep_fn=sleeps.append,
+        )
+        self.assertEqual(attempts["n"], 3)  # Proves lookup ran AND retried on rate limit!
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(skipped, 0)
+        self.assertEqual(diag.enrichment_deferred, 0)
+        cached_prof = _cached_github_profile(self.store, "exact-hero", self.now)
+        self.assertIsNotNone(cached_prof)
+        self.assertEqual(cached_prof.email_domain, "acme.io")
+
+    def test_enrichment_failure_blocks_matching_without_guessing_and_persists_completed_batches(self):
+        members = [
+            _member("310000000000000001", "batch_one_user", "Batch One"),
+            _member("310000000000000002", "batch_two_user", "Batch Two"),
+        ]
+        groups = [
+            {"login": "batch-one-user", "user_id": 311, "pulls": []},
+            {"login": "batch-two-user", "user_id": 312, "pulls": []},
+        ]
+        sleeps: list[float] = []
+        called_logins: list[str] = []
+
+        # Force 1 login per GraphQL batch so batch 1 succeeds and persists while batch 2 fails after retries.
+        def partial_gql(_token, query, variables):
+            if "BatchPRCommits" in query:
+                return {"data": {"repository": {}}}
+            login = variables["l0"]
+            called_logins.append(login)
+            if login == "batch-one-user":
+                return {"data": {"u0": _gql_user_node("batch-one-user", name="Batch One")}}
+            raise TransientAPIError("403 rate limit exceeded")
+
+        with mock.patch("contributor_bot.matcher.GRAPHQL_PROFILE_BATCH_SIZE", 1):
+            matched1, skipped1, _d1, diag1 = match_community_contributors_with_diagnostics(
+                groups,
+                self.config,
+                self.store,
+                now=self.now,
+                members=members,
+                graphql_caller=partial_gql,
+                sleep_fn=sleeps.append,
+            )
+
+        # Batch 1 was persisted and matched; batch 2 failed enrichment -> NOT matched even though login matches!
+        self.assertEqual([g["login"] for g in matched1], ["batch-one-user"])
+        self.assertEqual(skipped1, 1)
+        self.assertEqual(dict(diag1.skip_reasons), {"enrichment_failed": 1})
+        self.assertIsNotNone(self.store.get_cached_github_user("batch-one-user"))
+        # Must NOT negatively cache enrichment_failed!
+        self.assertIsNone(self.store.get_match_attempt("batch-two-user"))
+
+        # Next run: batch 1 comes from confirmed cache / SQLite (0 GraphQL calls for batch-one-user),
+        # batch 2 now succeeds and matches!
+        called_logins.clear()
+
+        def recovered_gql(_token, query, variables):
+            if "BatchPRCommits" in query:
+                return {"data": {"repository": {}}}
+            login = variables["l0"]
+            called_logins.append(login)
+            return {"data": {"u0": _gql_user_node(login, name="Batch Two")}}
+
+        with mock.patch("contributor_bot.matcher.GRAPHQL_PROFILE_BATCH_SIZE", 1):
+            matched2, skipped2, _d2, _diag2 = match_community_contributors_with_diagnostics(
+                groups,
+                self.config,
+                self.store,
+                now=self.now + timedelta(minutes=10),
+                members=members,
+                graphql_caller=recovered_gql,
+                sleep_fn=sleeps.append,
+            )
+        self.assertEqual(called_logins, ["batch-two-user"])
+        self.assertEqual({g["login"] for g in matched2}, {"batch-one-user", "batch-two-user"})
+        self.assertEqual(skipped2, 0)
+
+    def test_negative_cache_expires_after_7_days_and_picks_up_new_evidence(self):
+        members = [_member("320000000000000001", "newbie_handle", "Newbie")]
+        group = [{"login": "gh-stranger", "user_id": 321, "pulls": []}]
+
+        gql_calls = {"n": 0}
+
+        def gql_phase1(_token, query, variables):
+            if "BatchPRCommits" in query:
+                return {"data": {"repository": {}}}
+            gql_calls["n"] += 1
+            return {"data": {"u0": _gql_user_node("gh-stranger", name="Unrelated Person")}}
+
+        # Day 0: no match -> recorded in match_attempts negative cache.
+        m0, _s0, _d0, diag0 = match_community_contributors_with_diagnostics(
+            group, self.config, self.store, now=self.now, members=members, graphql_caller=gql_phase1,
+        )
+        self.assertEqual(m0, [])
+        self.assertEqual(dict(diag0.skip_reasons), {"no_signal_match": 1})
+        self.assertIsNotNone(self.store.get_match_attempt("gh-stranger"))
+
+        # Day 3: cached_negative hit within 7 days!
+        m3, _s3, _d3, diag3 = match_community_contributors_with_diagnostics(
+            group, self.config, self.store, now=self.now + timedelta(days=3), members=members, graphql_caller=gql_phase1,
+        )
+        self.assertEqual(m3, [])
+        self.assertEqual(dict(diag3.skip_reasons), {"cached_negative": 1})
+
+        # Day 8 (> 7 days): negative cache expired AND profile cache expired -> picks up new Discord bio link!
+        def gql_phase2(_token, query, variables):
+            if "BatchPRCommits" in query:
+                return {"data": {"repository": {}}}
+            return {"data": {"u0": _gql_user_node("gh-stranger", name="Unrelated Person", bio="Discord: newbie_handle")}}
+
+        m8, _s8, _d8, _diag8 = match_community_contributors_with_diagnostics(
+            group, self.config, self.store, now=self.now + timedelta(days=8), members=members, graphql_caller=gql_phase2,
+        )
+        self.assertEqual(len(m8), 1)
+        self.assertEqual(m8[0]["discord_id"], "320000000000000001")
+        self.assertEqual(m8[0]["match_method"], "bio_discord_handle")
+
+
+class OneToOneGuildPresenceAndGitHubTruthTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = get_config(_roles_env(self.temp.name))
+        self.store = Store(self.config.roles_db_path)
+        self.addCleanup(self.store.close)
+        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
+
+    def test_one_to_one_conflict_grants_nothing(self):
+        shared_member = _member("400000000000000001", "shared_user", "Shared User")
+        groups = [
+            {"login": "gh-first", "user_id": 401, "pulls": [{"number": 41}]},
+            {"login": "gh-second", "user_id": 402, "pulls": [{"number": 42}]},
+        ]
+        gql = _stub_gql_from_nodes({
+            "gh-first": _gql_user_node("gh-first", bio="Discord: shared_user"),
+            "gh-second": _gql_user_node("gh-second", bio="Discord: shared_user"),
+        })
         with self.assertLogs(level="WARNING") as logs:
             matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
-                groups,
-                self.cfg,
-                self.store,
-                members=[member],
-                now=self.now,
-                skip_github_enrichment=True,
+                groups, self.config, self.store, now=self.now, members=[shared_member], graphql_caller=gql,
             )
         self.assertEqual(matched, [])
         self.assertEqual(skipped, 2)
-        self.assertEqual(dict(diag.skip_reasons).get("discord_id_conflict"), 2)
-        self.assertTrue(any("1-to-1 match conflict" in msg for msg in logs.output))
-        self.assertIsNone(self.store.get_confirmed_match("alice-gh"))
-        self.assertIsNone(self.store.get_confirmed_match("bob-gh"))
+        self.assertEqual(dict(diag.skip_reasons), {"discord_id_conflict": 2})
+        self.assertTrue(any("1-to-1 match conflict" in line for line in logs.output))
 
-    def test_cross_run_conflict_against_stored_match_grants_nothing(self):
-        # Stored match already binds discord_id to existing-author.
-        self.store.save_confirmed_match(
-            "existing-author",
-            "720000000000000002",
-            method="exact_login",
-            confidence=0.98,
-            matched_at="2026-11-27T00:00:00+00:00",
+    def test_guild_presence_verified_github_only_truth_and_grant_log_includes_evidence(self):
+        # 1) Member NOT in guild -> apply_roles refuses to grant.
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=501, github_user_id=501,
+            github_login="departed-dev", merged_at=iso(self.now), title="fix", labels=[], files=[],
         )
-        member = DiscordMemberInfo("720000000000000002", username="second-author", global_name="Second")
-        groups = [
-            {"login": "second-author", "user_id": 3, "first_time": False, "pulls": [{"number": 3, "title": "c", "url": "u"}]},
-        ]
-        with self.assertLogs(level="WARNING") as logs:
-            matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
-                groups,
-                self.cfg,
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role:
+            granted = apply_roles(
+                self.config,
                 self.store,
-                members=[member],
-                now=self.now,
-                skip_github_enrichment=True,
+                "500000000000000001",
+                501,
+                github_login="departed-dev",
+                match_method="exact_login",
+                match_confidence=0.96,
+                match_evidence="exact_identity:departed-dev->departed_dev",
+                present_member_ids=frozenset({"999999999999999999"}),
             )
-        self.assertEqual(matched, [])
-        self.assertEqual(skipped, 1)
-        self.assertTrue(any("1-to-1 match conflict" in msg for msg in logs.output))
-        self.assertIsNone(self.store.get_confirmed_match("second-author"))
+        self.assertEqual(granted, [])
+        add_role.assert_not_called()
 
-    def test_roles_sync_stored_matches_blocks_conflicting_discord_id(self):
-        # Simulate corrupt DB state where two GitHub logins point to the same discord_id.
+        # 2) Stored match with ZERO GitHub PRs (count_fetcher returns 0 or raises) -> NO role granted (no fabrication!).
         self.store.save_confirmed_match(
-            "author-one", "720000000000000003", method="exact_login", confidence=0.98, matched_at="2026-11-27T00:00:00+00:00",
+            "ghost-author", "500000000000000002", method="exact_login", confidence=0.96,
+            matched_at=iso(self.now), github_user_id=502, evidence="exact_identity:ghost-author",
         )
-        self.store.save_confirmed_match(
-            "author-two", "720000000000000003", method="pr_link_poster", confidence=0.92, matched_at="2026-11-27T00:00:00+00:00",
-        )
-        _seed_pull(self.store, self.cfg.github_repository, 10, 100, "author-one", "2026-11-27T00:00:00+00:00")
-        _seed_pull(self.store, self.cfg.github_repository, 11, 101, "author-two", "2026-11-27T00:00:00+00:00")
-
-        with patch("contributor_bot.rewards.add_member_role") as mock_add, self.assertLogs(level="WARNING") as logs:
-            granted, _rl = _grant_roles_for_stored_matches(
-                self.cfg,
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role_ghost:
+            granted_ghost, _rl = _grant_roles_for_stored_matches(
+                self.config,
                 self.store,
                 now=self.now,
                 org="BerriAI",
                 org_members=frozenset(),
-                count_fetcher=lambda *_a, **_kw: 5,
+                count_fetcher=lambda repo, login, tok: 0,
+                present_member_ids=frozenset({"500000000000000002"}),
             )
-        self.assertEqual(granted, 0)
-        mock_add.assert_not_called()
-        self.assertTrue(any("1-to-1 stored-match conflict" in msg for msg in logs.output))
+        self.assertEqual(granted_ghost, 0)
+        add_role_ghost.assert_not_called()
+
+        # 3) Present guild member with real GitHub PR -> granted AND log includes discord_id, github_login, method, confidence, evidence!
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=503, github_user_id=503,
+            github_login="present-dev", merged_at=iso(self.now), title="feat", labels=[], files=[],
+        )
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role_ok, \
+             self.assertLogs(level="INFO") as logs:
+            granted_ok = apply_roles(
+                self.config,
+                self.store,
+                "500000000000000003",
+                503,
+                github_login="present-dev",
+                match_method="exact_login",
+                match_confidence=0.96,
+                match_evidence="exact_identity:present-dev->present_dev",
+                present_member_ids=frozenset({"500000000000000003"}),
+            )
+        self.assertEqual(granted_ok, ["contributor"])
+        add_role_ok.assert_called_once()
+        self.assertTrue(
+            any(
+                "discord_id=500000000000000003" in line
+                and "github_login=present-dev" in line
+                and "method=exact_login" in line
+                and "confidence=0.96" in line
+                and "evidence=exact_identity:present-dev->present_dev" in line
+                for line in logs.output
+            )
+        )
 
 
-class TestRolesWhyAndRevokeCommands(unittest.TestCase):
+class SilentAnnouncementsLeaseLockAndBootRevalidationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = get_config(_roles_env(self.temp.name))
+        self.store = Store(self.config.roles_db_path)
         self.addCleanup(self.store.close)
-        self.cfg = _make_config()
-        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
-        self.edvn_id = "730000000000000001"
-        self.mod_id = "730000000000000099"
+        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
 
-        # Seed edvn with a bad match, 4 role grants, and PRs for the wrongly attached author.
-        repo = self.cfg.github_repository
-        self.store.save_confirmed_match(
-            "wrong-author",
-            self.edvn_id,
-            method="pr_link_poster",
-            confidence=0.92,
-            matched_at="2026-11-25T10:00:00+00:00",
-            github_user_id=901,
-            evidence="pr_link_poster:2_prs",
+    def test_roles_announce_disabled_by_default_and_no_backlog_later(self):
+        self.assertFalse(self.config.roles_announce_enabled)
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=601, github_user_id=601,
+            github_login="quiet-dev", merged_at=iso(self.now), title="fix", labels=[], files=[],
         )
-        self.store.record_grant(self.edvn_id, "contributor", "Contributor", "2026-11-25T10:00:00+00:00")
-        self.store.record_grant(self.edvn_id, "oss_champion", "OSS Champion", "2026-11-25T10:00:00+00:00")
-        self.store.record_grant(self.edvn_id, "agent_builder", "Agent Builder", "2026-11-25T10:00:00+00:00")
-        self.store.record_grant(self.edvn_id, "provider_wizard", "Provider Wizard", "2026-11-25T10:00:00+00:00")
-        _seed_pull(
-            self.store, repo, 5001, 901, "wrong-author", "2026-11-20T00:00:00+00:00",
-            labels=["agents"], files=["litellm/llms/openai/a.py", "litellm/proxy/mcp.py"],
-        )
-        _seed_pull(
-            self.store, repo, 5002, 901, "wrong-author", "2026-11-21T00:00:00+00:00",
-            files=["litellm/llms/anthropic/b.py"],
-        )
-        _seed_pull(
-            self.store, repo, 5003, 901, "wrong-author", "2026-11-22T00:00:00+00:00",
-            files=["litellm/llms/gemini/c.py"],
-        )
-        self.store.record_pr_link_poster(repo, 5001, self.edvn_id, "800000000000000021", "2026-11-20T01:00:00+00:00", message_text="reviewing")
-
-    def test_commands_registered_when_roles_enabled(self):
-        names = {cmd["name"] for cmd in role_slash_commands(self.cfg)}
-        self.assertIn("roles-why", names)
-        self.assertIn("roles-revoke", names)
-
-    def test_roles_why_requires_mod_and_shows_full_audit(self):
-        non_mod_payload = {
-            "type": 2,
-            "application_id": self.cfg.discord_application_id,
-            "guild_id": self.cfg.discord_guild_id,
-            "data": {"name": "roles-why", "options": [{"name": "member", "value": self.edvn_id}]},
-            "member": {"user": {"id": "730000000000000050"}, "permissions": "0"},
-        }
-        resp = handle_interaction(self.cfg, self.store, non_mod_payload)
-        self.assertEqual(resp["data"]["flags"], 64)
-        self.assertIn("only mods can run this", resp["data"]["content"])
-
-        mod_payload = {
-            "type": 2,
-            "application_id": self.cfg.discord_application_id,
-            "guild_id": self.cfg.discord_guild_id,
-            "data": {"name": "roles-why", "options": [{"name": "member", "value": self.edvn_id}]},
-            "member": {"user": {"id": self.mod_id}, "permissions": str(1 << 13)},
-        }
-        resp_mod = handle_interaction(self.cfg, self.store, mod_payload)
-        self.assertEqual(resp_mod["data"]["flags"], 64)
-        content = resp_mod["data"]["content"]
-        self.assertIn("wrong-author", content)
-        self.assertIn("pr_link_poster", content)
-        self.assertIn("0.92", content)
-        self.assertIn("pr_link_poster:2_prs", content)
-        self.assertIn("Contributor", content)
-        self.assertIn("OSS Champion", content)
-        self.assertIn("Agent Builder", content)
-        self.assertIn("Provider Wizard", content)
-        self.assertIn("#5001", content)
-
-    def test_roles_revoke_removes_roles_deletes_grants_and_blocks_rematch(self):
-        non_mod_payload = {
-            "type": 2,
-            "application_id": self.cfg.discord_application_id,
-            "guild_id": self.cfg.discord_guild_id,
-            "data": {"name": "roles-revoke", "options": [{"name": "member", "value": self.edvn_id}]},
-            "member": {"user": {"id": "730000000000000050"}, "permissions": "0"},
-        }
-        resp_denied = handle_interaction(self.cfg, self.store, non_mod_payload)
-        self.assertIn("only mods can run this", resp_denied["data"]["content"])
-
-        mod_payload = {
-            "type": 2,
-            "application_id": self.cfg.discord_application_id,
-            "guild_id": self.cfg.discord_guild_id,
-            "data": {"name": "roles-revoke", "options": [{"name": "member", "value": self.edvn_id}]},
-            "member": {"user": {"id": self.mod_id}, "permissions": str(1 << 13)},
-        }
-        removed_calls = []
-        with patch(
-            "contributor_bot.rewards.remove_member_role",
-            side_effect=lambda gid, uid, rid, tok: removed_calls.append((gid, uid, rid)),
-        ):
-            resp = handle_interaction(self.cfg, self.store, mod_payload)
-
-        self.assertEqual(resp["data"]["flags"], 64)
-        self.assertIn("wrong-author", resp["data"]["content"])
-        # All 4 contributor roles removed in Discord.
-        self.assertEqual(len(removed_calls), 4)
-        self.assertEqual(
-            {rid for _, _, rid in removed_calls},
-            set(self.cfg.role_ids.values()),
-        )
-        # All role_grants and github_discord_matches deleted; rejection recorded.
-        self.assertEqual(self.store.grants_for_discord(self.edvn_id), [])
-        self.assertIsNone(self.store.get_confirmed_match("wrong-author"))
-        self.assertTrue(self.store.is_match_rejected("wrong-author", self.edvn_id))
-
-        # Even if member later matches wrong-author by exact_login or pr_link_poster, rejection blocks rematch!
-        members = [DiscordMemberInfo(self.edvn_id, username="wrong-author", global_name="wrong-author")]
-        groups = [{"login": "wrong-author", "user_id": 901, "first_time": False, "pulls": [{"number": 5001, "title": "x", "url": "u"}]}]
-        matched, skipped, _details, _diag = match_community_contributors_with_diagnostics(
-            groups,
-            self.cfg,
-            self.store,
-            members=members,
-            now=self.now,
-            skip_github_enrichment=True,
-        )
-        self.assertEqual(matched, [])
-        self.assertEqual(skipped, 1)
-
-    def test_roles_revoke_with_optional_login_sets_mod_override_and_checks_conflict(self):
-        with patch("contributor_bot.rewards.remove_member_role"):
-            msg = execute_roles_revoke(
-                self.cfg,
+        members = [_member("600000000000000001", "quiet-dev", "Quiet Dev")]
+        with mock.patch("contributor_bot.rewards.add_member_role") as add_role, \
+             mock.patch("contributor_bot.rewards.post_message") as post_msg, \
+             self.assertLogs(level="INFO") as logs:
+            res = poll_merged_prs_for_roles(
+                self.config,
                 self.store,
-                self.edvn_id,
-                moderator_id=self.mod_id,
-                replacement_login="real-edvn-gh",
                 now=self.now,
-            )
-        self.assertIn("Replacement mapping saved", msg)
-        row = self.store.get_confirmed_match("real-edvn-gh")
-        self.assertIsNotNone(row)
-        self.assertEqual(row["discord_id"], self.edvn_id)
-        self.assertEqual(row["method"], "mod_override")
-        self.assertTrue(self.store.is_match_rejected("wrong-author", self.edvn_id))
-
-        # Attempting to assign real-edvn-gh to a second Discord member must be blocked (1-to-1 conflict).
-        other_id = "730000000000000002"
-        with patch("contributor_bot.rewards.remove_member_role"):
-            msg_conflict = execute_roles_revoke(
-                self.cfg,
-                self.store,
-                other_id,
-                moderator_id=self.mod_id,
-                replacement_login="real-edvn-gh",
-                now=self.now,
-            )
-        self.assertIn("Override skipped", msg_conflict)
-        self.assertIn("1-to-1 conflict", msg_conflict)
-        self.assertEqual(self.store.get_confirmed_match("real-edvn-gh")["discord_id"], self.edvn_id)
-
-
-class TestBootRevalidationAndGrantLogging(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
-        self.addCleanup(self.store.close)
-        self.cfg = _make_config()
-        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
-
-    def test_boot_revalidation_revokes_bad_pr_link_poster_keeps_valid_and_runs_once(self):
-        repo = self.cfg.github_repository
-        # 1) Bad match A: reviewer who posted links for 2 different authors (edvn scenario).
-        edvn_id = "740000000000000001"
-        _seed_pull(self.store, repo, 101, 1, "author-a", "2026-11-20T00:00:00+00:00")
-        _seed_pull(self.store, repo, 102, 1, "author-a", "2026-11-21T00:00:00+00:00")
-        _seed_pull(self.store, repo, 103, 2, "author-b", "2026-11-22T00:00:00+00:00")
-        self.store.record_pr_link_poster(repo, 101, edvn_id, "800000000000000031", "2026-11-20T01:00:00+00:00", message_text="my pr")
-        self.store.record_pr_link_poster(repo, 102, edvn_id, "800000000000000032", "2026-11-21T01:00:00+00:00", message_text="link")
-        self.store.record_pr_link_poster(repo, 103, edvn_id, "800000000000000033", "2026-11-22T01:00:00+00:00", message_text="reviewing")
-        self.store.save_confirmed_match(
-            "author-a", edvn_id, method="pr_link_poster", confidence=0.92, matched_at="2026-11-22T02:00:00+00:00", github_user_id=1,
-        )
-        self.store.record_grant(edvn_id, "contributor", "Contributor", "2026-11-22T02:00:00+00:00")
-
-        # 2) Bad match B: posted 2 links by one author but NO ownership text and NO name similarity.
-        triager_id = "740000000000000002"
-        _seed_pull(self.store, repo, 201, 3, "author-c", "2026-11-20T00:00:00+00:00")
-        _seed_pull(self.store, repo, 202, 3, "author-c", "2026-11-21T00:00:00+00:00")
-        self.store.record_pr_link_poster(repo, 201, triager_id, "800000000000000034", "2026-11-20T01:00:00+00:00", message_text="please review")
-        self.store.record_pr_link_poster(repo, 202, triager_id, "800000000000000035", "2026-11-21T01:00:00+00:00", message_text="bump")
-        self.store.save_confirmed_match(
-            "author-c", triager_id, method="pr_link_poster", confidence=0.92, matched_at="2026-11-22T02:00:00+00:00", github_user_id=3,
-        )
-        self.store.record_grant(triager_id, "contributor", "Contributor", "2026-11-22T02:00:00+00:00")
-
-        # 3) Good match C: sole poster of 1 author's PR with explicit ownership phrase.
-        real_id = "740000000000000003"
-        _seed_pull(self.store, repo, 301, 4, "author-good", "2026-11-20T00:00:00+00:00")
-        self.store.record_pr_link_poster(repo, 301, real_id, "800000000000000036", "2026-11-20T01:00:00+00:00", message_text="Hey, I opened this PR!")
-        self.store.save_confirmed_match(
-            "author-good", real_id, method="pr_link_poster", confidence=0.92, matched_at="2026-11-22T02:00:00+00:00", github_user_id=4,
-        )
-        self.store.record_grant(real_id, "contributor", "Contributor", "2026-11-22T02:00:00+00:00")
-
-        # 4) Unrelated exact_login match: must not be touched.
-        exact_id = "740000000000000004"
-        self.store.save_confirmed_match(
-            "exact-dev", exact_id, method="exact_login", confidence=0.98, matched_at="2026-11-22T02:00:00+00:00",
-        )
-        self.store.record_grant(exact_id, "contributor", "Contributor", "2026-11-22T02:00:00+00:00")
-
-        members = [
-            DiscordMemberInfo(edvn_id, username="edvn", global_name="Edvn"),
-            DiscordMemberInfo(triager_id, username="helpful-triager", global_name="Triager"),
-            DiscordMemberInfo(real_id, username="some-handle", global_name="Some Handle"),
-            DiscordMemberInfo(exact_id, username="exact-dev", global_name="Exact Dev"),
-        ]
-
-        self.assertTrue(should_run_pr_link_poster_revalidation(self.cfg, self.store))
-
-        removed = []
-        with patch(
-            "contributor_bot.rewards.remove_member_role",
-            side_effect=lambda gid, uid, rid, tok: removed.append((uid, rid)),
-        ), patch("contributor_bot.rewards.post_message") as mock_announce, self.assertLogs(level="INFO") as logs:
-            res = revalidate_pr_link_poster_matches_on_boot(
-                self.cfg,
-                self.store,
+                search_merged_fn=lambda r, s, e, t: set(),
+                count_fetcher=lambda r, l, t: 1,
+                org_members_fetcher=lambda o, t: frozenset(),
                 members=members,
+                graphql_caller=_stub_gql_from_nodes({"quiet-dev": _gql_user_node("quiet-dev", name="Quiet Dev")}),
+            )
+        self.assertEqual(res.roles_granted, 1)
+        add_role.assert_called_once()
+        post_msg.assert_not_called()
+        self.assertEqual(self.store.all_unannounced_grants(), [])
+        self.assertTrue(
+            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in l for l in logs.output)
+        )
+
+        # Turning ROLES_ANNOUNCE_ENABLED=true later must NOT post any backlog!
+        cfg_on = get_config(_roles_env(self.temp.name, ROLES_ANNOUNCE_ENABLED="true"))
+        with mock.patch("contributor_bot.rewards.post_message") as post_later:
+            chunks = announce_pending_role_grants(cfg_on, self.store, now=self.now)
+        self.assertEqual(chunks, 0)
+        post_later.assert_not_called()
+
+    def test_db_lease_lock_blocks_concurrent_instance_and_allows_expired_takeover(self):
+        store2 = Store(self.config.roles_db_path)
+        self.addCleanup(store2.close)
+
+        self.assertTrue(self.store.acquire_lease("roles_poll:berriai/litellm", "inst-1", 300.0, now=self.now))
+        self.assertFalse(store2.acquire_lease("roles_poll:berriai/litellm", "inst-2", 300.0, now=self.now + timedelta(seconds=10)))
+
+        # Second instance calling poll_merged_prs_for_roles skips while lease is held!
+        res_skipped = poll_merged_prs_for_roles(self.config, store2, now=self.now + timedelta(seconds=10))
+        self.assertIsNone(res_skipped)
+
+        # Once expired, inst-2 acquires the lease cleanly.
+        self.assertTrue(store2.acquire_lease("roles_poll:berriai/litellm", "inst-2", 300.0, now=self.now + timedelta(seconds=301)))
+        store2.release_lease("roles_poll:berriai/litellm", "inst-2")
+
+    def test_boot_all_grants_revalidation_catches_edvn_and_checks_1155909469373468692(self):
+        # Set up realistic production-like grants:
+        # 1) edvn (1466417354824224830): bad old LLM/pr_link_poster grant that does NOT pass new rules -> REVOKED!
+        # 2) 1155909469373468692: real contributor with exact_login + merged PR -> KEPT!
+        # 3) 700000000000000003: old single-signal exact_name match (no 2nd signal) -> REVOKED!
+        # 4) 700000000000000004: orphan role_grant with NO GitHub mapping -> REVOKED!
+        # 5) 700000000000000005: member who left the Discord guild -> REVOKED!
+        # 6) 700000000000000006: exact_login match but 0 GitHub merged PRs -> REVOKED!
+        now_iso = iso(self.now)
+
+        # PRs
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=901, github_user_id=901,
+            github_login="edvn-unrelated-author", merged_at=now_iso, title="fix", labels=[], files=[],
+        )
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=902, github_user_id=902,
+            github_login="real-contrib-115", merged_at=now_iso, title="feat", labels=[], files=[],
+        )
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=903, github_user_id=903,
+            github_login="gh-single-name", merged_at=now_iso, title="chore", labels=[], files=[],
+        )
+        self.store.upsert_pull(
+            repository="BerriAI/litellm", number=905, github_user_id=905,
+            github_login="departed-contrib", merged_at=now_iso, title="docs", labels=[], files=[],
+        )
+
+        # Existing grants & confirmed matches
+        self.store.save_confirmed_match(
+            "edvn-unrelated-author", "1466417354824224830", method="llm", confidence=0.81,
+            matched_at=now_iso, github_user_id=901, evidence="weak name guess",
+        )
+        self.store.record_grant("1466417354824224830", "contributor", "Contributor", now_iso)
+
+        self.store.save_confirmed_match(
+            "real-contrib-115", "1155909469373468692", method="exact_login", confidence=0.96,
+            matched_at=now_iso, github_user_id=902, evidence="exact_identity:real-contrib-115",
+        )
+        self.store.record_grant("1155909469373468692", "contributor", "Contributor", now_iso)
+
+        self.store.save_confirmed_match(
+            "gh-single-name", "700000000000000003", method="exact_name", confidence=0.93,
+            matched_at=now_iso, github_user_id=903, evidence="exact_name:Sam",
+        )
+        self.store.record_grant("700000000000000003", "contributor", "Contributor", now_iso)
+
+        self.store.record_grant("700000000000000004", "contributor", "Contributor", now_iso)
+
+        self.store.save_confirmed_match(
+            "departed-contrib", "700000000000000005", method="exact_login", confidence=0.96,
+            matched_at=now_iso, github_user_id=905, evidence="exact_identity:departed-contrib",
+        )
+        self.store.record_grant("700000000000000005", "contributor", "Contributor", now_iso)
+
+        self.store.save_confirmed_match(
+            "zero-pr-user", "700000000000000006", method="exact_login", confidence=0.96,
+            matched_at=now_iso, github_user_id=906, evidence="exact_identity:zero-pr-user",
+        )
+        self.store.record_grant("700000000000000006", "contributor", "Contributor", now_iso)
+
+        guild_members = [
+            _member("1466417354824224830", "edvn", "Edvn"),
+            _member("1155909469373468692", "real_contrib_115", "Real Contrib"),
+            _member("700000000000000003", "totally_other", "Sam"),
+            _member("700000000000000004", "orphan_member", "Orphan"),
+            _member("700000000000000006", "zero_pr_user", "Zero PR"),
+            # Note: 700000000000000005 is NOT in guild_members (departed)!
+        ]
+        gql = _stub_gql_from_nodes({
+            "edvn-unrelated-author": _gql_user_node("edvn-unrelated-author", name="Completely Different"),
+            "real-contrib-115": _gql_user_node("real-contrib-115", name="Real Contrib"),
+            "gh-single-name": _gql_user_node("gh-single-name", name="Sam"),
+            "zero-pr-user": _gql_user_node("zero-pr-user", name="Zero PR"),
+        })
+
+        self.assertTrue(should_run_grants_revalidation(self.config, self.store))
+        cleared_env = {
+            k: ""
+            for k in ("TYPESAFE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "LITELLM_API_KEY")
+        }
+        removed_calls: list[tuple] = []
+        with mock.patch.dict("os.environ", cleared_env, clear=False), \
+             mock.patch("contributor_bot.rewards.remove_member_role", side_effect=lambda *a: removed_calls.append(a)), \
+             mock.patch("contributor_bot.rewards.post_message") as post_msg:
+            res = revalidate_all_grants_on_boot(
+                self.config,
+                self.store,
+                members=guild_members,
                 now=self.now,
-                org_members_fetcher=lambda _o, _t: [],
+                org_members_fetcher=lambda o, t: frozenset(),
+                graphql_caller=gql,
+                count_fetcher=lambda repo, login, tok: 0 if login == "zero-pr-user" else 1,
             )
 
         self.assertIsNotNone(res)
-        self.assertEqual(res.checked, 3)
-        self.assertEqual(res.kept, 1)
-        self.assertEqual(res.revoked, 2)
-        # No announcements posted!
-        mock_announce.assert_not_called()
+        self.assertEqual(res.checked, 6)
+        self.assertEqual(res.kept, 1)      # Only 1155909469373468692 kept!
+        self.assertEqual(res.revoked, 5)   # edvn + single-name + orphan + departed + zero-pr all revoked!
+        self.assertFalse(res.rate_limited)
+        post_msg.assert_not_called()       # Completely silent!
 
-        # edvn and triager revoked + rejected; good and exact kept.
-        self.assertIsNone(self.store.get_confirmed_match("author-a"))
-        self.assertIsNone(self.store.get_confirmed_match("author-c"))
-        self.assertEqual(self.store.grants_for_discord(edvn_id), [])
-        self.assertEqual(self.store.grants_for_discord(triager_id), [])
-        self.assertTrue(self.store.is_match_rejected("author-a", edvn_id))
-        self.assertTrue(self.store.is_match_rejected("author-c", triager_id))
-        self.assertIn(edvn_id, {uid for uid, _ in removed})
-        self.assertIn(triager_id, {uid for uid, _ in removed})
-        self.assertNotIn(real_id, {uid for uid, _ in removed})
-        self.assertNotIn(exact_id, {uid for uid, _ in removed})
+        # edvn (1466417354824224830) revoked, match deleted, and rejected so never rematched!
+        self.assertEqual(self.store.grants_for_discord("1466417354824224830"), [])
+        self.assertIsNone(self.store.get_confirmed_match("edvn-unrelated-author"))
+        self.assertTrue(self.store.is_match_rejected("edvn-unrelated-author", "1466417354824224830"))
 
-        self.assertIsNotNone(self.store.get_confirmed_match("author-good"))
-        self.assertEqual(len(self.store.grants_for_discord(real_id)), 1)
-        self.assertIsNotNone(self.store.get_confirmed_match("exact-dev"))
-        self.assertEqual(len(self.store.grants_for_discord(exact_id)), 1)
+        # 1155909469373468692 kept intact!
+        self.assertEqual(self.store.grant_keys("1155909469373468692"), {"contributor"})
+        self.assertIsNotNone(self.store.get_confirmed_match("real-contrib-115"))
 
-        # Each revocation logged.
-        self.assertTrue(any("REVOKED discord_id=740000000000000001 github_login=author-a" in m for m in logs.output))
-        self.assertTrue(any("REVOKED discord_id=740000000000000002 github_login=author-c" in m for m in logs.output))
+        # Others all revoked cleanly!
+        for bad_uid in (
+            "700000000000000003",
+            "700000000000000004",
+            "700000000000000005",
+            "700000000000000006",
+        ):
+            self.assertEqual(self.store.grants_for_discord(bad_uid), [])
 
-        # One-time marker set: second run is a no-op!
-        self.assertFalse(should_run_pr_link_poster_revalidation(self.cfg, self.store))
-        res2 = revalidate_pr_link_poster_matches_on_boot(
-            self.cfg, self.store, members=members, now=self.now, org_members_fetcher=lambda _o, _t: [],
-        )
-        self.assertIsNone(res2)
-
-    def test_role_grant_logs_discord_id_login_method_confidence(self):
-        uid = "750000000000000001"
-        _seed_pull(self.store, self.cfg.github_repository, 901, 55, "dev-alice", "2026-11-27T00:00:00+00:00")
-        self.store.save_confirmed_match(
-            "dev-alice", uid, method="exact_login", confidence=0.98, matched_at="2026-11-27T00:00:00+00:00", github_user_id=55,
-        )
-        with patch("contributor_bot.rewards.add_member_role"), self.assertLogs(level="INFO") as logs:
-            granted = apply_roles(
-                self.cfg,
-                self.store,
-                uid,
-                55,
-                shoutout=False,
-                announce=False,
-                github_login="dev-alice",
-                match_method="exact_login",
-                match_confidence=0.98,
-            )
-        self.assertEqual(granted, ["contributor"])
-        self.assertTrue(
-            any(
-                "Granted Discord role Contributor" in m
-                and f"discord_id={uid}" in m
-                and "github_login=dev-alice" in m
-                and "method=exact_login" in m
-                and "confidence=0.98" in m
-                for m in logs.output
-            ),
-            f"Expected structured role grant log, got: {logs.output}",
-        )
-
-
-class TestRolesAnnounceDisabledByDefault(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
-        self.addCleanup(self.store.close)
-        self.now = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
-
-    def test_config_defaults_roles_announce_enabled_to_false(self):
-        cfg = get_config({
-            "DISCORD_BOT_TOKEN": "tok",
-            "OSS_CONTRIBUTIONS_CHANNEL_ID": "123",
-            "ANNOUNCEMENTS_CHANNEL_ID": "456",
-            "CONTRIBUTOR_ROLES_ENABLED": "true",
-            "DISCORD_GUILD_ID": "333333333333333333",
-            "ROLE_CONTRIBUTOR_ID": "900000000000000001",
-            "ROLE_OSS_CHAMPION_ID": "900000000000000002",
-            "ROLE_AGENT_BUILDER_ID": "900000000000000003",
-            "ROLE_PROVIDER_WIZARD_ID": "900000000000000004",
-            "ROLE_ANNOUNCEMENTS_CHANNEL_ID": "800000000000000001",
-            "ROLES_DB_PATH": str(Path(self.tmp.name) / "cfg.db"),
-        })
-        self.assertFalse(cfg.roles_announce_enabled)
-
-    def test_apply_roles_silent_no_shoutout_and_no_backlog_when_enabled_later(self):
-        cfg_off = _make_config(roles_announce_enabled=False)
-        uid = "760000000000000001"
-        _seed_pull(
-            self.store, cfg_off.github_repository, 701, 601, "silent-dev", "2026-11-27T10:00:00+00:00",
-            labels=["agents"],
-        )
-        with patch("contributor_bot.rewards.add_member_role"), patch(
-            "contributor_bot.rewards.post_message"
-        ) as mock_post, self.assertLogs(level="INFO") as logs:
-            granted = apply_roles(
-                cfg_off,
-                self.store,
-                uid,
-                601,
-                pr_number=701,
-                shoutout=True,
-                announce=True,
-                github_login="silent-dev",
-                match_method="exact_login",
-                match_confidence=0.98,
-            )
-        self.assertEqual(set(granted), {"contributor", "agent_builder"})
-        mock_post.assert_not_called()
-        # Marked announced_at + shoutout_at silently so turning it on later never backlogs!
-        self.assertEqual(self.store.all_unannounced_grants(), [])
-        self.assertIsNotNone(self.store.get_pull(cfg_off.github_repository, 701)["shoutout_at"])
-        self.assertTrue(
-            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 2 roles silently" in m for m in logs.output),
-            f"Expected silent grant log, got: {logs.output}",
-        )
-
-        # Turning ROLES_ANNOUNCE_ENABLED=true later must post ZERO backlog!
-        cfg_on = _make_config(roles_announce_enabled=True)
-        with patch("contributor_bot.rewards.post_message") as mock_post_later:
-            posted_chunks = announce_pending_role_grants(cfg_on, self.store, now=self.now)
-        self.assertEqual(posted_chunks, 0)
-        mock_post_later.assert_not_called()
-
-    def test_daily_poll_and_backfill_post_nothing_and_log_silent_when_disabled(self):
-        cfg_off = _make_config(roles_announce_enabled=False, backfill_since="2026-11-01T00:00:00+00:00")
-        uid = "760000000000000002"
-        members = [DiscordMemberInfo(uid, username="quiet-dev", global_name="Quiet Dev")]
-
-        def fake_pull(_repo, num, _tok):
-            return {
-                "number": num,
-                "merged": True,
-                "merged_at": "2026-11-26T10:00:00Z",
-                "title": "feat: quiet",
-                "author_association": "CONTRIBUTOR",
-                "user": {"login": "quiet-dev", "id": 602, "type": "User"},
-                "labels": [],
-            }
-
-        with patch("contributor_bot.rewards.add_member_role"), patch(
-            "contributor_bot.rewards.post_message"
-        ) as mock_rewards_post, patch(
-            "contributor_bot.roles_sync.post_message"
-        ) as mock_sync_post, self.assertLogs(level="INFO") as logs:
-            poll_res = poll_merged_prs_for_roles(
-                cfg_off,
-                self.store,
-                now=self.now,
-                members=members,
-                search_merged_fn=lambda _r, _s, _e, _t: {801},
-                pull_fetcher=fake_pull,
-                files_fetcher=lambda _r, _n, _t: ["litellm/router.py"],
-                count_fetcher=lambda _r, _l, _t: 1,
-                org_members_fetcher=lambda _o, _t: [],
-            )
-        self.assertIsNotNone(poll_res)
-        self.assertEqual(poll_res.roles_granted, 1)
-        mock_rewards_post.assert_not_called()
-        mock_sync_post.assert_not_called()
-        self.assertEqual(self.store.all_unannounced_grants(), [])
-        self.assertTrue(
-            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in m for m in logs.output),
-            f"Expected silent grant log in poll, got: {logs.output}",
-        )
-
-        # Backfill summary is also silenced when ROLES_ANNOUNCE_ENABLED=false.
-        uid2 = "760000000000000003"
-        members2 = members + [DiscordMemberInfo(uid2, username="backfill-quiet", global_name="Backfill Quiet")]
-
-        def fake_pull_bf(_repo, num, _tok):
-            return {
-                "number": num,
-                "merged": True,
-                "merged_at": "2026-11-10T10:00:00Z",
-                "title": "feat: bf",
-                "author_association": "CONTRIBUTOR",
-                "user": {"login": "backfill-quiet", "id": 603, "type": "User"},
-                "labels": [],
-            }
-
-        with patch("contributor_bot.rewards.add_member_role"), patch(
-            "contributor_bot.rewards.post_message"
-        ) as mock_rewards_post2, patch(
-            "contributor_bot.roles_sync.post_message"
-        ) as mock_sync_post2, self.assertLogs(level="INFO") as logs_bf:
-            bf_res = run_roles_backfill(
-                cfg_off,
-                self.store,
-                now=self.now,
-                members=members2,
-                search_merged_fn=lambda _r, _s, _e, _t: [802],
-                pull_fetcher=fake_pull_bf,
-                files_fetcher=lambda _r, _n, _t: ["litellm/router.py"],
-                count_fetcher=lambda _r, _l, _t: 1,
-                org_members_fetcher=lambda _o, _t: [],
-                announce_summary=True,
-            )
-        self.assertIsNotNone(bf_res)
-        self.assertEqual(bf_res.roles_granted, 1)
-        self.assertFalse(bf_res.summary_announced)
-        mock_rewards_post2.assert_not_called()
-        mock_sync_post2.assert_not_called()
-        self.assertEqual(self.store.all_unannounced_grants(), [])
-        self.assertTrue(
-            any("Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted 1 roles silently" in m for m in logs_bf.output),
-            f"Expected silent grant log in backfill, got: {logs_bf.output}",
-        )
-
-
-class TestLLMEnrichmentDeferredGuard(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.store = Store(str(Path(self.tmp.name) / "roles.db"))
-        self.addCleanup(self.store.close)
-        self.cfg = _make_config(github_token="gh-tok")
-        self.now = datetime(2026, 11, 28, 4, 13, tzinfo=timezone.utc)
-
-    def test_llm_never_accepts_when_enrichment_deferred_and_retries_next_run(self):
-        """Repro 04:13 UTC prod bug: enrichment_deferred > 0 must block LLM and treat as llm_unavailable."""
-        edvn_id = "1466417354824224830"
-        members = [DiscordMemberInfo(edvn_id, username="edvn", global_name="edvn")]
-        groups = [
-            {
-                "login": "edvn-unrelated-dev",
-                "user_id": 777,
-                "first_time": False,
-                "pulls": [{"number": 4201, "title": "feat", "url": "https://github.com/BerriAI/litellm/pull/4201"}],
-            }
-        ]
-        llm_calls = []
-
-        def aggressive_llm(model, messages):
-            llm_calls.append(messages)
-            return json.dumps({
-                "discord_id": edvn_id,
-                "confidence": 0.96,
-                "reason": "similar handle prefix",
-                "evidence": ["handle prefix", "handle"],
-            })
-
-        # Simulate GraphQL rate-limit deferral (enrichment_deferred=1, zero profile data).
-        def rate_limited_gql(_query, _vars, _tok, **_kw):
-            raise RuntimeError("api.github.com returned HTTP 403 rate limit exceeded")
-
-        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
-            groups,
-            self.cfg,
-            self.store,
-            members=members,
-            now=self.now,
-            graphql_caller=rate_limited_gql,
-            llm_complete=aggressive_llm,
-        )
-        self.assertEqual(matched, [])
-        self.assertEqual(skipped, 1)
-        self.assertEqual(diag.enrichment_deferred, 1)
-        self.assertEqual(dict(diag.skip_reasons), {"llm_unavailable": 1})
-        self.assertEqual(llm_calls, [])
-        self.assertIsNone(self.store.get_confirmed_match("edvn-unrelated-dev"))
-        # Must NOT write 7-day negative cache so next run retries!
-        self.assertIsNone(self.store.get_match_attempt("edvn-unrelated-dev"))
-
-    def test_llm_never_accepts_when_enrichment_returns_empty_profile(self):
-        """Even without rate limit, an author with zero profile/commit fields must not be LLM-accepted."""
-        edvn_id = "1466417354824224830"
-        members = [DiscordMemberInfo(edvn_id, username="edvn", global_name="edvn")]
-        groups = [
-            {
-                "login": "edvn-empty-gh",
-                "user_id": 778,
-                "first_time": False,
-                "pulls": [],
-            }
-        ]
-        llm_calls = []
-
-        def aggressive_llm(model, messages):
-            llm_calls.append(messages)
-            return json.dumps({
-                "discord_id": edvn_id,
-                "confidence": 0.95,
-                "reason": "handle overlap",
-                "evidence": ["handle prefix", "handle"],
-            })
-
-        # GraphQL returns a user object with ALL enrichment fields empty.
-        def empty_profile_gql(_query, _vars, _tok, **_kw):
-            return {
-                "data": {
-                    "u0": {
-                        "login": "edvn-empty-gh",
-                        "name": None,
-                        "bio": None,
-                        "company": None,
-                        "email": None,
-                        "twitterUsername": None,
-                        "websiteUrl": None,
-                        "socialAccounts": {"nodes": []},
-                        "readme": None,
-                    }
-                }
-            }
-
-        matched, skipped, _details, diag = match_community_contributors_with_diagnostics(
-            groups,
-            self.cfg,
-            self.store,
-            members=members,
-            now=self.now,
-            graphql_caller=empty_profile_gql,
-            llm_complete=aggressive_llm,
-        )
-        self.assertEqual(matched, [])
-        self.assertEqual(skipped, 1)
-        self.assertEqual(dict(diag.skip_reasons), {"llm_unavailable": 1})
-        self.assertEqual(llm_calls, [])
-        self.assertIsNone(self.store.get_match_attempt("edvn-empty-gh"))
-
-
-class TestDBBackedRunLeaseLock(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.db_path = str(Path(self.tmp.name) / "shared.db")
-        self.store_a = Store(self.db_path)
-        self.store_b = Store(self.db_path)
-        self.addCleanup(self.store_a.close)
-        self.addCleanup(self.store_b.close)
-        self.now = datetime(2026, 11, 28, 16, 0, tzinfo=timezone.utc)
-
-    def test_two_instances_cannot_hold_lease_simultaneously_and_expired_lease_recovers(self):
-        # Instance A acquires lease.
-        self.assertTrue(self.store_a.acquire_lease("roles_daily:berriai/litellm", "inst-a", 300, now=self.now))
-        # Instance B (separate connection to the same SQLite DB) is blocked while lease is active.
-        self.assertFalse(self.store_b.acquire_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=60)))
-        # Non-owner cannot renew or release Instance A's lease.
-        self.assertFalse(self.store_b.renew_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=60)))
-        self.store_b.release_lease("roles_daily:berriai/litellm", "inst-b")
-        self.assertEqual(self.store_a.get_lease("roles_daily:berriai/litellm")["owner_id"], "inst-a")
-
-        # Owner can renew lease.
-        self.assertTrue(self.store_a.renew_lease("roles_daily:berriai/litellm", "inst-a", 300, now=self.now + timedelta(seconds=100)))
-        self.assertFalse(self.store_b.acquire_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=350)))
-
-        # Once lease expires (e.g. Instance A crashed during deploy), Instance B takes over cleanly.
-        self.assertTrue(self.store_b.acquire_lease("roles_daily:berriai/litellm", "inst-b", 300, now=self.now + timedelta(seconds=401)))
-        self.assertEqual(self.store_b.get_lease("roles_daily:berriai/litellm")["owner_id"], "inst-b")
-
-        # Release lets Instance A acquire immediately.
-        self.store_b.release_lease("roles_daily:berriai/litellm", "inst-b")
-        self.assertIsNone(self.store_a.get_lease("roles_daily:berriai/litellm"))
-        self.assertTrue(self.store_a.acquire_lease("roles_daily:berriai/litellm", "inst-a", 300, now=self.now + timedelta(seconds=402)))
-
-    def test_daily_roles_skips_when_other_instance_holds_db_lease(self):
-        cfg = _make_config(roles_daily_time="10:00", merged_timezone="America/Toronto")
-        # Simulate another Render instance holding the DB lease for roles_daily.
-        self.assertTrue(self.store_a.acquire_lease("roles_daily:berriai/litellm", "other-instance", 600, now=self.now))
-
-        poll_called = []
-
-        def fake_poll(*_args, **_kwargs):
-            poll_called.append(True)
-            return None
-
-        res = run_daily_roles_if_due(
-            cfg,
-            self.store_b,
-            now=self.now,
-            force=True,
-            poll_fn=fake_poll,
-        )
-        self.assertIsNone(res)
-        self.assertEqual(poll_called, [])
-
+        # Runs only once!
+        self.assertFalse(should_run_grants_revalidation(self.config, self.store))
+        self.assertIsNone(revalidate_all_grants_on_boot(self.config, self.store, members=guild_members, now=self.now))
 
 
 if __name__ == "__main__":

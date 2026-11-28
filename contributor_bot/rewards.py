@@ -57,6 +57,7 @@ def assign_role(
     github_login: str | None = None,
     match_method: str | None = None,
     match_confidence: float | None = None,
+    match_evidence: str | None = None,
 ) -> bool:
     """Give one role. Missing permissions and role hierarchy are logged, not raised."""
     role_id = config.role_ids.get(role_key, "")
@@ -78,14 +79,16 @@ def assign_role(
             return False
         raise
     conf_str = f"{match_confidence:.2f}" if isinstance(match_confidence, (int, float)) else "unknown"
+    ev_str = (match_evidence or "").strip() or "none"
     logging.info(
-        "Granted Discord role %s (%s) to discord_id=%s github_login=%s method=%s confidence=%s",
+        "Granted Discord role %s (%s) to discord_id=%s github_login=%s method=%s confidence=%s evidence=%s",
         role_name,
         role_id,
         discord_id,
         github_login or "unknown",
         match_method or "unknown",
         conf_str,
+        ev_str,
     )
     return True
 
@@ -142,13 +145,15 @@ def _resolve_grant_log_meta(
     github_login: str | None = None,
     match_method: str | None = None,
     match_confidence: float | None = None,
-) -> tuple[str, str, float | None]:
+    match_evidence: str | None = None,
+) -> tuple[str, str, float | None, str]:
     login = (github_login or "").strip()
     method = (match_method or "").strip()
     confidence = match_confidence
+    evidence = (match_evidence or "").strip()
     if not login and rows:
         login = str(rows[-1].get("github_login") or "").strip()
-    if not method or confidence is None or not login:
+    if not method or confidence is None or not login or not evidence:
         if hasattr(store, "link_for_discord"):
             link = store.link_for_discord(discord_id)
             if link:
@@ -156,7 +161,8 @@ def _resolve_grant_log_meta(
                 method = method or "link_store"
                 if confidence is None:
                     confidence = 1.0
-    if not method or confidence is None or not login:
+                evidence = evidence or f"oauth_link:{login}"
+    if not method or confidence is None or not login or not evidence:
         if hasattr(store, "confirmed_match_for_discord"):
             match = store.confirmed_match_for_discord(discord_id)
             if match:
@@ -164,16 +170,18 @@ def _resolve_grant_log_meta(
                 method = method or str(match.get("method") or "")
                 if confidence is None and match.get("confidence") is not None:
                     confidence = float(match["confidence"])
-    if not method:
+                evidence = evidence or str(match.get("evidence") or "").strip()
+    if not method or not evidence:
         manual = getattr(config, "github_discord_map", None) or {}
         for map_login, map_uid in manual.items():
             if str(map_uid) == str(discord_id):
                 login = login or str(map_login)
-                method = "config_map"
+                method = method or "config_map"
                 if confidence is None:
                     confidence = 1.0
+                evidence = evidence or f"config_map:{map_login}"
                 break
-    return login or "unknown", method or "unknown", confidence
+    return login or "unknown", method or "unknown", confidence, evidence or "none"
 
 
 def apply_roles(
@@ -190,12 +198,21 @@ def apply_roles(
     github_login: str | None = None,
     match_method: str | None = None,
     match_confidence: float | None = None,
+    match_evidence: str | None = None,
+    present_member_ids: frozenset[str] | set[str] | None = None,
 ) -> list[str]:
     """Grant any newly earned roles and optionally post one announcement when something is new.
 
     Returns the list of role keys newly granted during this call.
     """
     if not config.contributor_roles_enabled:
+        return []
+    if present_member_ids is not None and discord_id not in present_member_ids:
+        logging.warning(
+            "Skipping role grant for discord_id=%s github_login=%s: member is not currently in the guild",
+            discord_id,
+            github_login or "unknown",
+        )
         return []
     rows = store.pulls_for_author(config.github_repository, github_user_id)
     effective_count = lifetime_merged_count
@@ -206,7 +223,7 @@ def apply_roles(
     earned = earned_role_keys(_models(rows), lifetime_merged_count=effective_count)
     already = store.grant_keys(discord_id)
     now = iso(datetime.now(UTC))
-    log_login, log_method, log_confidence = _resolve_grant_log_meta(
+    log_login, log_method, log_confidence, log_evidence = _resolve_grant_log_meta(
         config,
         store,
         discord_id,
@@ -214,6 +231,7 @@ def apply_roles(
         github_login=github_login,
         match_method=match_method,
         match_confidence=match_confidence,
+        match_evidence=match_evidence,
     )
     # A role Discord refused to add is left unannounced. Skipping the merge
     # shoutout too lets the next attempt post one combined message.
@@ -229,6 +247,7 @@ def apply_roles(
             github_login=log_login,
             match_method=log_method,
             match_confidence=log_confidence,
+            match_evidence=log_evidence,
         ):
             assignment_blocked = True
             continue

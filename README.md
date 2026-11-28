@@ -177,49 +177,54 @@ the same automatic matcher as the weekly summary:
 
 - **Complete per-day PR fetch**: merged PR searches split into per-day UTC
   `merged:D..D` windows (up to 10 pages / 1,000 rows per day, deduplicated by
-  PR number, logging a warning if any single day reaches 1,000).
-- **GraphQL batch enrichment**: fetches GitHub profiles 50 logins per query
-  (`name`, `bio`, `company`, `email`, `twitterUsername`, `websiteUrl`,
-  `socialAccounts`, and profile `HEAD:README.md` capped at 4 KB) plus commit
-  author names/emails, cached in SQLite (`github_users_cache`) for 7 days.
-- **Deterministic + PR-link poster matching**: checks Discord IDs/handles in
-  bio/blog/README/socials, exact normalized login (against Discord `username` /
-  `global_name` only, never server `nick`), exact Twitter/name, and a
-  `pr_link_poster` tier (`pr_link_posters` table populated live in
-  `on_message`, from `review_threads`, and via mod-only `/links-backfill`).
-  Staff, BerriAI org members, and multi-author posters (reviewers/triagers who
-  linked PRs by 2+ different GitHub authors) are excluded from PR-link
-  attribution. `pr_link_poster` never auto-accepts on link count alone: a sole
-  non-staff poster is accepted at `0.92` only when their message includes
-  explicit ownership text (`my pr`, `I opened/made/raised/submitted`) or their
-  Discord handle/name has similarity `>= 0.50` to the GitHub login/name;
-  otherwise it is only an LLM signal. Strict 1-to-1 bijection is enforced
-  between Discord members and GitHub logins (conflicts grant nothing and log a
-  warning).
-- **Priority pool + list-wise LLM selection**: checks a priority pool of
-  members who joined or posted in the past 7 days first, then falls back to the
-  full member list for unmatched authors. Ambiguous/fuzzy authors get a
-  list-wise LLM call (`MATCH_MODEL`, falling back to `REVIEW_MODEL` or
-  `anthropic/claude-sonnet-4-5`) over up to 5 candidates plus explicit
-  `"none of these"`, accepting `>= 0.80` with `>= 2` corroborating signals or
-  `>= 0.90` alone. Confirmed matches are cached in SQLite for 30 days, and
-  definitive non-matches are negatively cached in `match_attempts` for 7 days
-  (skipping unchanged profiles/candidates unless new `pr_link_posters` evidence
-  or a signature change appears).
+  PR number, logging a warning if any single day reaches 1,000). GitHub is the
+  sole source of truth for contributions — Discord-side signals never create
+  contributions.
+- **No-skip GraphQL batch enrichment**: every merged-PR author in the window is
+  fully enriched before matching (50 logins per GraphQL query: `name`, `login`,
+  `socialAccounts` incl. Discord/X, `bio`, `company`, `websiteUrl`, profile
+  `HEAD:README.md` capped at 4 KB, and public email domain, plus commit author
+  names/emails), persisted per batch in SQLite (`github_users_cache`) for 7 days.
+  Rate limits are handled with exponential backoff/retry and resume rather than
+  deferring; if enrichment ultimately fails for an author, matching is skipped
+  for that author this run and retried next run (never guessed).
+- **Ordered 4-tier matching (each producing concrete evidence)**:
+  1. **Direct link**: Discord user ID or handle listed in GitHub
+     `socialAccounts` / `bio` / `blog` / `README` matched to a present guild
+     member (`username` / `global_name`, never `nick`).
+  2. **Exact identity**: GitHub `login` == Discord `username` or `global_name`
+     (case/separator-insensitive, never `nick`).
+  3. **PR-link poster**: sole eligible non-staff guild member who posted a link
+     to that author's PR in Discord AND has at least one corroborating signal
+     (name similarity `>= 0.50` to GitHub name/login, ownership language like
+     `my PR` / `I opened`, or same X/website). Posters who linked PRs by 2+
+     different GitHub authors are rejected.
+  4. **List-wise LLM** (`MATCH_MODEL`, falling back to `REVIEW_MODEL` or
+     `anthropic/claude-sonnet-4-5`): only when full enrichment is present, over
+     the top-5 guild candidates plus explicit `"none of these"`, requiring
+     `>= 2` independent signals AND confidence `>= 0.85` (no single-signal
+     accepts).
+  Strict 1-to-1 bijection is enforced between Discord members and GitHub logins
+  (conflicts grant nothing and log a warning). Confirmed matches are cached in
+  SQLite for 30 days, and definitive non-matches are negatively cached in
+  `match_attempts` for 7 days (expiring so new evidence is picked up).
 
-It then grants newly earned roles. By default, **`ROLES_ANNOUNCE_ENABLED=false`**
-so roles are granted silently and marked `announced_at` immediately (turning it
-on later never posts a backlog), logging `Role announcements disabled
-(ROLES_ANNOUNCE_ENABLED=false); granted N roles silently`. When
-`ROLES_ANNOUNCE_ENABLED=true`, newly earned roles are **batched into a single
-message** (chunked only if needed, posting nothing when there are zero new
-grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each completed local date is
-recorded in `roles_daily_runs` and concurrent runs across instances are guarded
-by a DB-backed lease lock (`job_locks`), so restarts and redeploys never overlap
-or run twice on the same day, while catching up automatically if the bot was
-offline at `10:00`. Roles are sticky: the bot adds them and never removes them
-automatically (mods can use `/roles-revoke`). Docs Hero is no longer granted;
-anyone who already has that Discord role keeps it.
+It verifies the matched Discord member is currently in the guild before
+granting newly earned roles, logging `discord_id`, `github_login`, `method`,
+`confidence`, and `evidence` on every grant. By default,
+**`ROLES_ANNOUNCE_ENABLED=false`** so roles are granted silently and marked
+`announced_at` immediately (turning it on later never posts a backlog), logging
+`Role announcements disabled (ROLES_ANNOUNCE_ENABLED=false); granted N roles
+silently`. When `ROLES_ANNOUNCE_ENABLED=true`, newly earned roles are **batched
+into a single message** (chunked only if needed, posting nothing when there are
+zero new grants) to `ROLE_ANNOUNCEMENTS_CHANNEL_ID`. Each completed local date
+is recorded in `roles_daily_runs` and concurrent runs across instances are
+guarded by a DB-backed lease lock (`job_locks`), so restarts and redeploys
+never overlap or run twice on the same day, while catching up automatically if
+the bot was offline at `10:00`. A one-time boot re-validation job re-checks all
+existing grants under these rules and silently revokes roles that no longer
+pass. Docs Hero is no longer granted; anyone who already has that Discord role
+keeps it.
 
 ### Minimal setup (no GitHub OAuth or webhook required)
 
@@ -256,14 +261,7 @@ anyone who already has that Discord role keeps it.
 `DISCORD_PUBLIC_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_*`, and the
 Interactions Endpoint URL are all **optional** and not required. `/link-github`
 and `/unlink-github` stay hidden unless GitHub OAuth is configured. `/my-prs` shows an ephemeral PR snapshot for any auto-matched (or manually
-mapped) contributor, `/roles-backfill` is mod-only (`Manage Messages`),
-`/roles-why member:<user>` (ephemeral, mod-only) inspects the matched GitHub
-login, method, confidence, evidence, and per-role PR counts, `/roles-revoke
-member:<user> [login:<github_login>]` (ephemeral, mod-only) removes bot-granted
-contributor roles, deletes `role_grants`, and records rejected pairs in
-`match_rejections` so they are never rematched (optionally setting a
-`mod_override` login), and `/links-backfill` is mod-only (`Manage Messages`) to
-backfill `pr_link_posters`
+mapped) contributor, `/roles-backfill` is mod-only (`Manage Messages`), and `/links-backfill` is mod-only (`Manage Messages`) to backfill `pr_link_posters`
 from stored `review_threads` and Discord guild message search (paging up to
 offset 9975 with HTTP 202 retry handling).
 

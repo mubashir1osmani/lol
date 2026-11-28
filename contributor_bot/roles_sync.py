@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import socket
 import threading
 import time
@@ -28,19 +27,26 @@ from .api import (
     fetch_merged_numbers,
     fetch_pull_files,
     fetch_pull_request,
-    github_get_json,
     post_message,
 )
 from .config import Config, is_discord_id
 from .matcher import (
+    LLM_CONFIDENCE_THRESHOLD,
+    LLM_MIN_SIGNALS,
     GitHubAuthorProfile,
+    _MemberIndex,
     _cached_github_profile,
+    _enrich_profiles_batch,
     _excluded_staff_discord_ids,
+    _has_llm_credentials,
+    _llm_selection_accepted,
     _pr_link_evidence_from_rows,
+    _profile_has_enrichment_data,
+    _select_with_llm,
     load_guild_members_with_source,
     match_community_contributors_with_diagnostics,
     multi_author_poster_ids,
-    validate_pr_link_poster_match,
+    score_author_against_members,
 )
 from .rewards import (
     ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
@@ -51,10 +57,7 @@ from .rewards import (
     revoke_contributor_roles,
 )
 from .roles import (
-    DEFAULT_ROLE_NAMES,
-    PROVIDER_WIZARD_PREFIX,
     _agent_label,
-    _agent_path,
     qualifies_agent_builder,
     qualifies_provider_wizard,
 )
@@ -89,8 +92,7 @@ _roles_daily_state_lock = threading.Lock()
 _roles_daily_retry_after: dict[tuple[str, str], float] = {}
 _roles_daily_last_skip_log: dict[tuple[str, str], str] = {}
 _roles_backfill_lock = threading.Lock()
-_pr_link_revalidation_lock = threading.Lock()
-_GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_grants_revalidation_lock = threading.Lock()
 ROLES_JOB_LEASE_TTL_SECONDS = 600.0
 
 
@@ -145,7 +147,7 @@ def _try_release_lease(store: Store | None, lock_name: str, owner_id: str) -> No
 
 
 @dataclass(frozen=True)
-class PrLinkRevalidationResult:
+class GrantsRevalidationResult:
     checked: int
     kept: int
     revoked: int
@@ -474,6 +476,29 @@ def _resolve_stored_discord_id(
     return candidate
 
 
+def _load_present_members(
+    config: Config,
+    *,
+    guild=None,
+    loop=None,
+    members=None,
+    rest_fetcher=None,
+) -> tuple[list, frozenset[str]]:
+    """Return ``(guild_members, present_member_ids)`` for verifying current guild membership."""
+    if members is not None:
+        member_list = list(members)
+        return member_list, frozenset(m.discord_id for m in member_list if getattr(m, "discord_id", None))
+    guild_id = config.discord_guild_id or (str(getattr(guild, "id", "")) if guild is not None else None)
+    member_list, _source = load_guild_members_with_source(
+        guild,
+        loop=loop,
+        guild_id=guild_id,
+        discord_token=config.discord_token,
+        rest_fetcher=rest_fetcher,
+    )
+    return member_list, frozenset(m.discord_id for m in member_list if getattr(m, "discord_id", None))
+
+
 def _match_authors(
     authors: list[dict[str, Any]],
     config: Config,
@@ -484,12 +509,14 @@ def _match_authors(
     now: datetime,
     members=None,
     github_getter=None,
+    graphql_caller=None,
     jev_transport=None,
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
     deadline: float | None = None,
     org_members: frozenset[str] = frozenset(),
+    sleep_fn=time.sleep,
 ) -> tuple[dict[int, str], int, int]:
     """Resolve ``[{"user_id": int, "login": str, "pulls": [...]}]`` to ``(resolved, matched_count, enrichment_deferred)``.
 
@@ -541,13 +568,15 @@ def _match_authors(
             loop=loop,
             now=now,
             members=members,
-            github_getter=github_getter or github_get_json,
+            github_getter=github_getter,
+            graphql_caller=graphql_caller,
             jev_transport=jev_transport,
             haiku_complete=haiku_complete,
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
             deadline=deadline,
             org_members=org_members,
+            sleep_fn=sleep_fn,
         )
         for group in matched_groups:
             uid = group.get("user_id")
@@ -611,11 +640,28 @@ def _grant_roles_for_stored_matches(
     matched_since: str | None = None,
     count_fetcher=None,
     deadline: float | None = None,
+    present_member_ids: frozenset[str] | set[str] | None = None,
+    guild=None,
+    loop=None,
+    members=None,
+    rest_fetcher=None,
 ) -> tuple[int, bool]:
-    """Ensure confirmed matches in ``github_discord_matches`` (incl. weekly shoutouts) get earned roles."""
+    """Ensure confirmed matches in ``github_discord_matches`` get earned roles (only if in guild with real GitHub PRs)."""
     repo = config.github_repository
     stored_matches = store.all_confirmed_matches(matched_since=matched_since)
     if not stored_matches:
+        return 0, False
+
+    if present_member_ids is None:
+        _loaded, present_member_ids = _load_present_members(
+            config,
+            guild=guild,
+            loop=loop,
+            members=members,
+            rest_fetcher=rest_fetcher,
+        )
+    if not present_member_ids:
+        logging.warning("Skipping stored-match role grants for %s: guild member list unavailable", repo)
         return 0, False
 
     conflicting_discords, conflicting_logins, d2l, _l2d = _detect_mapping_conflicts(config, store)
@@ -630,6 +676,13 @@ def _grant_roles_for_stored_matches(
         login_key = login.lower()
         discord_id = str(match.get("discord_id") or "").strip()
         if not login or not discord_id:
+            continue
+        if discord_id not in present_member_ids:
+            logging.warning(
+                "Skipping stored-match role grant for discord_id=%s github_login=%s: member not in guild",
+                discord_id,
+                login,
+            )
             continue
         if (login_key, discord_id) in rejected:
             logging.info("Skipping rejected stored match discord_id=%s github_login=%s", discord_id, login)
@@ -670,9 +723,14 @@ def _grant_roles_for_stored_matches(
                 now=now,
                 count_fetcher=count_fetcher,
             )
-            if lifetime_count is None and "contributor" not in already:
-                # Confirmed weekly-summary match has at least 1 merged PR even if GitHub count lookup fails.
-                lifetime_count = max(1, len(pulls))
+        # GitHub is the ONLY source of truth: never fabricate PR counts when no GitHub PR evidence exists.
+        if not pulls and (lifetime_count is None or lifetime_count <= 0):
+            logging.info(
+                "Skipping stored-match role grant for discord_id=%s github_login=%s: no GitHub merged PR evidence",
+                discord_id,
+                login,
+            )
+            continue
         try:
             granted = apply_roles(
                 config,
@@ -686,6 +744,8 @@ def _grant_roles_for_stored_matches(
                 github_login=login,
                 match_method=str(match.get("method") or ""),
                 match_confidence=float(match["confidence"]) if match.get("confidence") is not None else None,
+                match_evidence=str(match.get("evidence") or ""),
+                present_member_ids=present_member_ids,
             )
             roles_granted += len(granted)
         except TransientAPIError as error:
@@ -736,11 +796,13 @@ def poll_merged_prs_for_roles(
     org_members_fetcher=None,
     members=None,
     github_getter=None,
+    graphql_caller=None,
     jev_transport=None,
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
     announcement_chunk_limit: int = ROLE_ANNOUNCEMENT_CHUNK_LIMIT,
+    sleep_fn=time.sleep,
 ) -> RolesPollResult | None:
     """Check PRs merged in the rolling past 7 days and auto-assign newly earned roles."""
     if not config.contributor_roles_enabled or store is None:
@@ -773,17 +835,39 @@ def poll_merged_prs_for_roles(
         else:
             org_members = fetch_org_public_members(org, token) if org else frozenset()
 
-        # Grant roles for recent confirmed matches (such as Friday's weekly summary shoutouts) first.
-        stored_roles_granted, stored_rate_limited = _grant_roles_for_stored_matches(
-            config,
-            store,
-            now=moment,
-            org=org,
-            org_members=org_members,
-            matched_since=window_start_iso,
-            count_fetcher=count_fetcher,
-            deadline=(deadline - 30.0) if deadline is not None else None,
-        )
+        guild_members_loaded = False
+        guild_members: list = []
+        present_member_ids: frozenset[str] = frozenset()
+
+        def _ensure_guild_members() -> tuple[list, frozenset[str]]:
+            nonlocal guild_members_loaded, guild_members, present_member_ids
+            if not guild_members_loaded:
+                guild_members, present_member_ids = _load_present_members(
+                    config,
+                    guild=guild,
+                    loop=loop,
+                    members=members,
+                    rest_fetcher=rest_fetcher,
+                )
+                guild_members_loaded = True
+            return guild_members, present_member_ids
+
+        # Grant roles for recent confirmed matches first (verifying current guild presence + GitHub PRs).
+        stored_roles_granted = 0
+        stored_rate_limited = False
+        if store.all_confirmed_matches(matched_since=window_start_iso):
+            _gm, present_ids = _ensure_guild_members()
+            stored_roles_granted, stored_rate_limited = _grant_roles_for_stored_matches(
+                config,
+                store,
+                now=moment,
+                org=org,
+                org_members=org_members,
+                matched_since=window_start_iso,
+                count_fetcher=count_fetcher,
+                deadline=(deadline - 30.0) if deadline is not None else None,
+                present_member_ids=present_ids,
+            )
 
         try:
             numbers = search_fn(repo, window_start, moment, token)
@@ -893,6 +977,10 @@ def poll_merged_prs_for_roles(
         store.set_roles_meta(f"last_roles_poll_at:{repo.lower()}", moment_iso, moment_iso)
 
         author_list = list(affected_authors.values())
+        if author_list:
+            gm, present_ids = _ensure_guild_members()
+        else:
+            gm, present_ids = guild_members, present_member_ids
         resolved_map, matched_count, _enrichment_deferred = _match_authors(
             author_list,
             config,
@@ -900,14 +988,16 @@ def poll_merged_prs_for_roles(
             guild=guild,
             loop=loop,
             now=moment,
-            members=members,
+            members=gm if guild_members_loaded else members,
             github_getter=github_getter,
+            graphql_caller=graphql_caller,
             jev_transport=jev_transport,
             haiku_complete=haiku_complete,
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
             deadline=deadline,
             org_members=org_members,
+            sleep_fn=sleep_fn,
         )
 
         roles_granted = stored_roles_granted
@@ -932,6 +1022,7 @@ def poll_merged_prs_for_roles(
                     mark_announced=False,
                     lifetime_merged_count=lifetime_count,
                     github_login=login,
+                    present_member_ids=present_ids,
                 )
                 roles_granted += len(granted)
             except TransientAPIError as error:
@@ -1229,11 +1320,13 @@ def run_roles_backfill(
     org_members_fetcher=None,
     members=None,
     github_getter=None,
+    graphql_caller=None,
     jev_transport=None,
     haiku_complete=None,
     rest_fetcher=None,
     rest_searcher=None,
     announce_summary: bool = True,
+    sleep_fn=time.sleep,
 ) -> BackfillResult | None:
     """Rate-limit-aware, time-bounded historical backfill with auto-matching.
 
@@ -1411,6 +1504,17 @@ def run_roles_backfill(
             )
         ]
 
+        if eligible_authors:
+            bf_members, bf_present_ids = _load_present_members(
+                config,
+                guild=guild,
+                loop=loop,
+                members=members,
+                rest_fetcher=rest_fetcher,
+            )
+        else:
+            bf_members, bf_present_ids = [], frozenset()
+
         resolved_map, matched_count, enrichment_deferred = _match_authors(
             eligible_authors,
             config,
@@ -1418,14 +1522,16 @@ def run_roles_backfill(
             guild=guild,
             loop=loop,
             now=moment,
-            members=members,
+            members=bf_members,
             github_getter=github_getter,
+            graphql_caller=graphql_caller,
             jev_transport=jev_transport,
             haiku_complete=haiku_complete,
             rest_fetcher=rest_fetcher,
             rest_searcher=rest_searcher,
             deadline=deadline,
             org_members=org_members,
+            sleep_fn=sleep_fn,
         )
         if enrichment_deferred > 0:
             timed_out = True
@@ -1455,6 +1561,7 @@ def run_roles_backfill(
                     announce=False,
                     lifetime_merged_count=lifetime_count,
                     github_login=login_by_uid[uid],
+                    present_member_ids=bf_present_ids,
                 )
             except TransientAPIError as error:
                 logging.warning("Backfill role assignment hit rate limit for %s: %s", discord_id, error)
@@ -1573,18 +1680,34 @@ def format_backfill_result(result: BackfillResult | None) -> str:
     return "\n".join(lines)
 
 
-def _pr_link_revalidation_key(repository: str) -> str:
-    return f"pr_link_poster_revalidated_v1:{repository.lower()}"
+def _grants_revalidation_key(repository: str) -> str:
+    return f"grants_revalidated_v2:{repository.lower()}"
 
 
-def should_run_pr_link_poster_revalidation(config: Config, store: Store | None) -> bool:
-    """True when the one-time boot re-validation of pr_link_poster matches has not yet completed."""
+def should_run_grants_revalidation(config: Config, store: Store | None) -> bool:
+    """True when the one-time boot re-validation of all existing grants has not yet completed."""
     if not config.contributor_roles_enabled or store is None:
         return False
-    return not store.get_roles_meta(_pr_link_revalidation_key(config.github_repository))
+    return not store.get_roles_meta(_grants_revalidation_key(config.github_repository))
 
 
-def revalidate_pr_link_poster_matches_on_boot(
+def _stored_evidence_signals(raw_evidence: str) -> list[str]:
+    text = (raw_evidence or "").strip()
+    if not text:
+        return []
+    items: list[str] = []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            items = [str(item).strip() for item in parsed if str(item).strip()]
+        else:
+            items = [text]
+    except ValueError:
+        items = [part.strip() for part in text.split(";") if part.strip()]
+    return [item for item in items if not item.lower().startswith("reason:")]
+
+
+def revalidate_all_grants_on_boot(
     config: Config,
     store: Store | None,
     *,
@@ -1594,59 +1717,70 @@ def revalidate_pr_link_poster_matches_on_boot(
     now: datetime | None = None,
     org_members_fetcher=None,
     rest_fetcher=None,
-) -> PrLinkRevalidationResult | None:
-    """One-time boot job: re-validate existing ``pr_link_poster`` matches under strict rules.
+    github_getter=None,
+    graphql_caller=None,
+    count_fetcher=None,
+    llm_complete=None,
+    skip_github_enrichment: bool = False,
+    sleep_fn=time.sleep,
+) -> GrantsRevalidationResult | None:
+    """One-time boot job: re-validate ALL existing grants under the new matching & GitHub-truth rules.
 
-    Revokes contributor roles and deletes ``role_grants`` / ``github_discord_matches``
-    rows for pairs that no longer pass (recording them in ``match_rejections``), logs
-    each revocation, and posts no announcements.
+    Silently removes Discord contributor roles and deletes ``role_grants`` / ``github_discord_matches``
+    rows for any grant that no longer passes (recording rejected pairs in ``match_rejections``),
+    logs every check and revocation, and posts NO announcements.
     """
     if not config.contributor_roles_enabled or store is None:
         return None
     repo = config.github_repository
-    marker_key = _pr_link_revalidation_key(repo)
+    marker_key = _grants_revalidation_key(repo)
     if store.get_roles_meta(marker_key):
         return None
     moment = now or datetime.now(UTC)
-    lease_key = _lease_name("roles_pr_link_revalidation", repo)
-    lease_owner = _lease_owner("roles_pr_link_revalidation")
-    if not _pr_link_revalidation_lock.acquire(blocking=False):
+    lease_key = _lease_name("roles_grants_revalidation", repo)
+    lease_owner = _lease_owner("roles_grants_revalidation")
+    if not _grants_revalidation_lock.acquire(blocking=False):
         return None
     if not _try_acquire_lease(store, lease_key, lease_owner, ROLES_JOB_LEASE_TTL_SECONDS, now=moment):
-        _pr_link_revalidation_lock.release()
-        logging.info("Boot pr_link_poster re-validation skipped: another instance holds DB lease %s", lease_key)
+        _grants_revalidation_lock.release()
+        logging.info("Boot all-grants re-validation skipped: another instance holds DB lease %s", lease_key)
         return None
 
     moment_iso = iso(moment)
     try:
         if store.get_roles_meta(marker_key):
             return None
-        matches = store.confirmed_matches_by_method("pr_link_poster")
-        if not matches:
+
+        all_confirmed = store.all_confirmed_matches()
+        granted_ids = set(store.all_granted_discord_ids()) if hasattr(store, "all_granted_discord_ids") else set()
+        confirmed_by_discord: dict[str, list[dict]] = {}
+        for row in all_confirmed:
+            uid_s = str(row.get("discord_id") or "").strip()
+            if uid_s:
+                confirmed_by_discord.setdefault(uid_s, []).append(row)
+        target_discord_ids = sorted(granted_ids | set(confirmed_by_discord.keys()))
+        if not target_discord_ids:
             store.set_roles_meta(marker_key, moment_iso, moment_iso)
-            logging.info("Boot pr_link_poster re-validation for %s: 0 rows to check", repo)
-            return PrLinkRevalidationResult(checked=0, kept=0, revoked=0, roles_removed=0)
+            logging.info("Boot all-grants re-validation for %s: 0 grants/matches to check", repo)
+            return GrantsRevalidationResult(checked=0, kept=0, revoked=0, roles_removed=0)
 
-        if members is not None:
-            guild_members = list(members)
-        else:
-            guild_id = config.discord_guild_id or (str(getattr(guild, "id", "")) if guild is not None else None)
-            guild_members, _src = load_guild_members_with_source(
-                guild,
-                loop=loop,
-                guild_id=guild_id,
-                discord_token=config.discord_token,
-                rest_fetcher=rest_fetcher,
+        guild_members, _present_ids = _load_present_members(
+            config,
+            guild=guild,
+            loop=loop,
+            members=members,
+            rest_fetcher=rest_fetcher,
+        )
+        if not guild_members:
+            logging.warning(
+                "Boot all-grants re-validation deferred for %s: guild members unavailable",
+                repo,
             )
-            if not guild_members:
-                logging.warning(
-                    "Boot pr_link_poster re-validation deferred for %s: guild members unavailable",
-                    repo,
-                )
-                return None
+            return None
 
-        member_by_id = {m.discord_id: m for m in guild_members}
-        token = config.github_token or getattr(config, "github_actor_token", None)
+        member_index = _MemberIndex(guild_members)
+        member_by_id = member_index.by_id
+        token = config.effective_github_token
         org = repo.split("/", 1)[0] if "/" in repo else ""
         if org_members_fetcher is not None:
             org_members = frozenset(m.lower() for m in org_members_fetcher(org, token))
@@ -1666,43 +1800,138 @@ def revalidate_pr_link_poster_matches_on_boot(
         multi_author_ids = multi_author_poster_ids(all_repo_links, pr_number_to_author)
         rejected_pairs = store.all_match_rejections()
         conflicting_discords, conflicting_logins, _d2l, _l2d = _detect_mapping_conflicts(config, store)
+        manual_map = getattr(config, "github_discord_map", None) or {}
+        manual_by_discord: dict[str, list[str]] = {}
+        for map_login, map_uid in manual_map.items():
+            uid_s = str(map_uid or "").strip()
+            low = str(map_login or "").strip().lower()
+            if uid_s and low:
+                manual_by_discord.setdefault(uid_s, []).append(low)
+
+        # Pre-enrich all auto-matched GitHub logins in batch (never skipping lookups).
+        enrich_groups: list[dict[str, Any]] = []
+        seen_enrich_logins: set[str] = set()
+        for row in all_confirmed:
+            login = str(row.get("github_login") or "").strip()
+            login_key = login.lower()
+            method = str(row.get("method") or "").strip()
+            discord_id = str(row.get("discord_id") or "").strip()
+            if not login_key or method == "mod_override" or discord_id not in member_by_id:
+                continue
+            if login_key in seen_enrich_logins:
+                continue
+            seen_enrich_logins.add(login_key)
+            raw_uid = row.get("github_user_id")
+            uid = int(raw_uid) if isinstance(raw_uid, int) and raw_uid > 0 else 0
+            pulls = store.pulls_for_author(repo, uid) if uid > 0 else store.pulls_for_author_login(repo, login)
+            enrich_groups.append({
+                "login": login,
+                "user_id": uid or None,
+                "pulls": [{"number": int(p["number"])} for p in pulls if isinstance(p.get("number"), int)],
+            })
+
+        profiles_by_login, failed_enrichment_logins = _enrich_profiles_batch(
+            enrich_groups,
+            repo,
+            token,
+            store=store,
+            moment=moment,
+            github_getter=github_getter,
+            graphql_caller=graphql_caller,
+            skip_github_enrichment=skip_github_enrichment,
+            sleep_fn=sleep_fn,
+        )
 
         kept = 0
         revoked = 0
         roles_removed_total = 0
-        rate_limited = False
+        rate_limited = bool(failed_enrichment_logins)
 
-        for match in matches:
-            login = str(match.get("github_login") or "").strip()
+        for discord_id in target_discord_ids:
+            link_row = store.link_for_discord(discord_id)
+            manual_logins = manual_by_discord.get(discord_id, [])
+            confirmed_rows = confirmed_by_discord.get(discord_id, [])
+
+            explicit_login = ""
+            explicit_uid = 0
+            explicit_source = ""
+            if link_row and link_row.get("github_login"):
+                explicit_login = str(link_row["github_login"]).strip()
+                explicit_uid = int(link_row.get("github_user_id") or 0)
+                explicit_source = "github_links"
+            elif manual_logins:
+                explicit_login = manual_logins[0]
+                explicit_source = "config_map"
+            else:
+                for row in confirmed_rows:
+                    if str(row.get("method") or "").strip() == "mod_override":
+                        explicit_login = str(row.get("github_login") or "").strip()
+                        explicit_uid = int(row.get("github_user_id") or 0)
+                        explicit_source = "mod_override"
+                        break
+
+            primary_row = confirmed_rows[0] if confirmed_rows else None
+            login = explicit_login or (str(primary_row.get("github_login") or "").strip() if primary_row else "")
             login_key = login.lower()
-            discord_id = str(match.get("discord_id") or "").strip()
-            raw_uid = match.get("github_user_id")
+            raw_uid = explicit_uid or (primary_row.get("github_user_id") if primary_row else 0)
             uid = int(raw_uid) if isinstance(raw_uid, int) and raw_uid > 0 else 0
+            old_method = explicit_source or (str(primary_row.get("method") or "").strip() if primary_row else "none")
 
             passed = False
-            fail_reason = "unknown"
+            deferred = False
+            reason = "unknown"
 
-            if (login_key, discord_id) in rejected_pairs:
-                fail_reason = "already_rejected"
+            if discord_id not in member_by_id:
+                reason = "member_not_in_guild"
+            elif not login_key:
+                reason = "no_github_mapping"
             elif discord_id in conflicting_discords or login_key in conflicting_logins:
-                fail_reason = "mapping_conflict"
-            elif discord_id in excluded_staff_ids:
-                fail_reason = "staff_or_org_member"
-            elif discord_id in multi_author_ids:
-                fail_reason = "multi_author_poster"
+                reason = "mapping_conflict"
+            elif (login_key, discord_id) in rejected_pairs:
+                reason = "already_rejected"
+            elif _is_excluded_author(login, "User", "", config.maintainer_logins, org_members=org_members, org=org):
+                reason = "staff_or_bot_author"
             else:
-                member = member_by_id.get(discord_id)
-                if member is None:
-                    fail_reason = "member_not_in_guild"
-                else:
-                    cached_prof = _cached_github_profile(store, login, moment, user_id=uid or None)
-                    if cached_prof is not None:
-                        profile = cached_prof
+                # Verify real GitHub merged-PR contribution evidence (GitHub is the ONLY source of truth).
+                pulls = store.pulls_for_author(repo, uid) if uid > 0 else store.pulls_for_author_login(repo, login)
+                if uid == 0 and pulls:
+                    uid = int(pulls[-1]["github_user_id"])
+                has_pr_evidence = len(pulls) > 0
+                if not has_pr_evidence:
+                    cached_count = store.get_author_merged_count(repo, login)
+                    if cached_count is not None and _count_is_fresh(cached_count.get("fetched_at"), moment):
+                        lifetime_count: int | None = int(cached_count["total_count"])
                     else:
-                        raw_cached = store.get_cached_github_user(login)
-                        cached_name = str(raw_cached.get("name") or "") if isinstance(raw_cached, dict) else ""
-                        profile = GitHubAuthorProfile(login=login, user_id=uid or None, name=cached_name)
-                    pulls = store.pulls_for_author(repo, uid) if uid > 0 else store.pulls_for_author_login(repo, login)
+                        lifetime_count = ensure_author_merged_count(
+                            config,
+                            store,
+                            login,
+                            uid,
+                            now=moment,
+                            count_fetcher=count_fetcher,
+                        )
+                    if lifetime_count is None:
+                        deferred = True
+                        rate_limited = True
+                        reason = "github_count_lookup_deferred"
+                    elif lifetime_count > 0:
+                        has_pr_evidence = True
+
+                if deferred:
+                    pass
+                elif not has_pr_evidence:
+                    reason = "no_github_contributions"
+                elif explicit_source:
+                    passed = True
+                    reason = f"verified:{explicit_source}"
+                elif login_key in failed_enrichment_logins:
+                    deferred = True
+                    rate_limited = True
+                    reason = "enrichment_failed_deferred"
+                else:
+                    profile = profiles_by_login.get(login_key) or _cached_github_profile(
+                        store, login, moment, user_id=uid or None
+                    ) or GitHubAuthorProfile(login=login, user_id=uid or None)
                     author_pr_nums = [int(p["number"]) for p in pulls if isinstance(p.get("number"), int)]
                     if author_pr_nums:
                         pr_rows = store.pr_link_posters_for_pulls(repo, author_pr_nums)
@@ -1712,35 +1941,82 @@ def revalidate_pr_link_poster_matches_on_boot(
                             if pr_number_to_author.get(int(row["pr_number"])) in (None, login_key)
                         ]
                     ev_list = _pr_link_evidence_from_rows(pr_rows)
-                    eligible = [
-                        ev for ev in ev_list
-                        if ev.discord_id in member_by_id
-                        and ev.discord_id not in excluded_staff_ids
-                        and ev.discord_id not in multi_author_ids
-                        and (login_key, ev.discord_id) not in rejected_pairs
-                        and ev.pr_numbers
-                    ]
-                    target_ev = next((ev for ev in eligible if ev.discord_id == discord_id), None)
-                    if target_ev is None:
-                        fail_reason = "no_eligible_pr_link_evidence"
+                    rejected_for_login = {r_uid for r_log, r_uid in rejected_pairs if r_log == login_key}
+                    strong, candidates = score_author_against_members(
+                        profile,
+                        guild_members,
+                        member_index=member_index,
+                        pr_link_posters=ev_list,
+                        excluded_discord_ids=excluded_staff_ids,
+                        multi_author_ids=multi_author_ids,
+                        rejected_discord_ids=rejected_for_login,
+                    )
+                    if strong is not None:
+                        if strong[0].discord_id == discord_id:
+                            passed = True
+                            reason = f"tier_verified:{strong[1]}"
+                        else:
+                            reason = f"strong_matched_other_member:{strong[0].discord_id}"
+                    elif not skip_github_enrichment and not _profile_has_enrichment_data(profile):
+                        reason = "no_enrichment_for_llm"
+                    elif discord_id not in {c.member.discord_id for c in candidates}:
+                        reason = "not_in_top5_candidates"
+                    elif llm_complete is not None or _has_llm_credentials():
+                        try:
+                            llm_res = _select_with_llm(
+                                config,
+                                profile,
+                                candidates,
+                                llm_complete=llm_complete,
+                            )
+                            if _llm_selection_accepted(llm_res) and llm_res.discord_id == discord_id:
+                                passed = True
+                                reason = f"llm_verified:conf={llm_res.confidence:.2f},signals={len(llm_res.evidence)}"
+                            else:
+                                reason = (
+                                    f"llm_rejected:selected={llm_res.discord_id},"
+                                    f"conf={llm_res.confidence:.2f},signals={len(llm_res.evidence)}"
+                                )
+                        except Exception as error:
+                            logging.warning(
+                                "Boot all-grants re-validation LLM error for discord_id=%s github_login=%s: %s",
+                                discord_id,
+                                login,
+                                error,
+                            )
+                            deferred = True
+                            rate_limited = True
+                            reason = "llm_unavailable_deferred"
                     else:
-                        passed, fail_reason = validate_pr_link_poster_match(
-                            profile,
-                            member,
-                            target_ev,
-                            eligible_posters=eligible,
-                            excluded_discord_ids=excluded_staff_ids,
-                            multi_author_ids=multi_author_ids,
-                            rejected_discord_ids={r_uid for r_log, r_uid in rejected_pairs if r_log == login_key},
-                        )
+                        stored_conf = float(primary_row.get("confidence") or 0.0) if primary_row else 0.0
+                        stored_signals = _stored_evidence_signals(str(primary_row.get("evidence") or "")) if primary_row else []
+                        if (
+                            old_method == "llm"
+                            and stored_conf >= LLM_CONFIDENCE_THRESHOLD
+                            and len(stored_signals) >= LLM_MIN_SIGNALS
+                        ):
+                            passed = True
+                            reason = f"stored_llm_verified:conf={stored_conf:.2f},signals={len(stored_signals)}"
+                        else:
+                            reason = f"failed_new_rules:old_method={old_method},conf={stored_conf:.2f},signals={len(stored_signals)}"
+
+            if deferred:
+                logging.info(
+                    "Boot all-grants re-validation deferred discord_id=%s github_login=%s (%s)",
+                    discord_id,
+                    login or "unknown",
+                    reason,
+                )
+                continue
 
             if passed:
                 kept += 1
                 logging.info(
-                    "Boot pr_link_poster re-validation kept discord_id=%s github_login=%s (%s)",
+                    "Boot all-grants re-validation KEPT discord_id=%s github_login=%s old_method=%s (%s)",
                     discord_id,
                     login,
-                    fail_reason,
+                    old_method,
+                    reason,
                 )
                 continue
 
@@ -1748,29 +2024,45 @@ def revalidate_pr_link_poster_matches_on_boot(
                 removed_roles, deleted_grants = revoke_contributor_roles(config, store, discord_id)
             except TransientAPIError as error:
                 logging.warning(
-                    "Boot pr_link_poster re-validation hit Discord rate limit revoking discord_id=%s: %s",
+                    "Boot all-grants re-validation hit Discord rate limit revoking discord_id=%s: %s",
                     discord_id,
                     error,
                 )
                 rate_limited = True
                 break
 
-            store.delete_confirmed_match(login)
-            store.add_match_rejection(
-                login,
-                discord_id,
-                moment_iso,
-                rejected_by="boot_revalidation",
-                reason=f"pr_link_poster_revalidation_failed:{fail_reason}",
-            )
+            deleted_matches = store.delete_confirmed_matches_for_discord(discord_id)
+            rejected_logins: list[str] = []
+            for row in deleted_matches:
+                bad_login = str(row.get("github_login") or "").strip().lower()
+                if bad_login:
+                    store.add_match_rejection(
+                        bad_login,
+                        discord_id,
+                        moment_iso,
+                        rejected_by="boot_revalidation",
+                        reason=f"grants_revalidation_failed:{reason}",
+                    )
+                    rejected_logins.append(bad_login)
+            if login_key and login_key not in rejected_logins and not explicit_source:
+                store.delete_confirmed_match(login)
+                store.add_match_rejection(
+                    login_key,
+                    discord_id,
+                    moment_iso,
+                    rejected_by="boot_revalidation",
+                    reason=f"grants_revalidation_failed:{reason}",
+                )
+
             revoked += 1
             roles_removed_total += len(removed_roles)
             logging.warning(
-                "Boot pr_link_poster re-validation REVOKED discord_id=%s github_login=%s "
-                "reason=%s roles_removed=%s grants_deleted=%s",
+                "Boot all-grants re-validation REVOKED discord_id=%s github_login=%s "
+                "old_method=%s reason=%s roles_removed=%s grants_deleted=%s",
                 discord_id,
-                login,
-                fail_reason,
+                login or "none",
+                old_method,
+                reason,
                 removed_roles,
                 deleted_grants,
             )
@@ -1778,17 +2070,17 @@ def revalidate_pr_link_poster_matches_on_boot(
         if not rate_limited:
             store.set_roles_meta(marker_key, moment_iso, moment_iso)
         logging.info(
-            "Boot pr_link_poster re-validation for %s finished: checked=%d kept=%d revoked=%d "
+            "Boot all-grants re-validation for %s finished: checked=%d kept=%d revoked=%d "
             "roles_removed=%d rate_limited=%s",
             repo,
-            len(matches),
+            len(target_discord_ids),
             kept,
             revoked,
             roles_removed_total,
             rate_limited,
         )
-        return PrLinkRevalidationResult(
-            checked=len(matches),
+        return GrantsRevalidationResult(
+            checked=len(target_discord_ids),
             kept=kept,
             revoked=revoked,
             roles_removed=roles_removed_total,
@@ -1796,243 +2088,4 @@ def revalidate_pr_link_poster_matches_on_boot(
         )
     finally:
         _try_release_lease(store, lease_key, lease_owner)
-        _pr_link_revalidation_lock.release()
-
-
-def _format_evidence_text(raw: str) -> str:
-    text = (raw or "").strip()
-    if not text:
-        return "(none recorded)"
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            cleaned = [str(item).strip() for item in parsed if str(item).strip()]
-            return "; ".join(cleaned) if cleaned else "(none recorded)"
-    except ValueError:
-        pass
-    return text
-
-
-def format_roles_why(config: Config, store: Store, discord_id: str) -> str:
-    """Ephemeral moderator explanation of why a Discord member matched and earned roles."""
-    if not is_discord_id(discord_id):
-        return "invalid Discord member ID."
-
-    repo = config.github_repository
-    link = store.link_for_discord(discord_id)
-    confirmed_rows = store.confirmed_matches_for_discord(discord_id)
-    manual_logins = [
-        login for login, uid in (getattr(config, "github_discord_map", None) or {}).items()
-        if str(uid) == discord_id
-    ]
-    rejections = store.match_rejections_for_discord(discord_id)
-    grants = store.grants_for_discord(discord_id)
-    conflicting_discords, _conf_logins, d2l, _l2d = _detect_mapping_conflicts(config, store)
-
-    lines = [f"**Contributor roles audit for <@{discord_id}> (`{discord_id}`)**"]
-    if discord_id in conflicting_discords:
-        lines.append(
-            f"- **CONFLICT DETECTED**: mapped to multiple GitHub logins `{', '.join(sorted(d2l.get(discord_id, set())))}` (role grants blocked)"
-        )
-
-    primary_login = ""
-    primary_uid: int | None = None
-    any_match_shown = False
-    if link:
-        primary_login = str(link["github_login"])
-        primary_uid = int(link["github_user_id"])
-        any_match_shown = True
-        lines.append(
-            f"- **Match**: `{primary_login}` via `github_links` (confidence `1.00`, linked `{link['linked_at']}`)"
-        )
-    if manual_logins:
-        for m_login in manual_logins:
-            if not primary_login:
-                primary_login = m_login
-            any_match_shown = True
-            lines.append(f"- **Match**: `{m_login}` via `GITHUB_DISCORD_MAP` (confidence `1.00`)")
-    if confirmed_rows:
-        for row in confirmed_rows:
-            if not primary_login:
-                primary_login = str(row["github_login"])
-                primary_uid = row.get("github_user_id")
-            any_match_shown = True
-            ev_text = _format_evidence_text(str(row.get("evidence") or ""))
-            lines.append(
-                f"- **Match**: `{row['github_login']}` via `{row['method']}` "
-                f"(confidence `{float(row['confidence']):.2f}`, matched `{row['matched_at']}`)"
-            )
-            lines.append(f"  - Evidence: {ev_text}")
-    if not any_match_shown:
-        lines.append("- **Match**: none (`github_links`, `GITHUB_DISCORD_MAP`, and `github_discord_matches` have no mapping)")
-
-    if grants:
-        grant_summary = ", ".join(f"{g['role_name']} (`{g['role_key']}`)" for g in grants)
-        lines.append(f"- **Bot-granted roles**: {grant_summary}")
-    else:
-        lines.append("- **Bot-granted roles**: none")
-
-    if primary_login:
-        pulls = (
-            store.pulls_for_author(repo, primary_uid)
-            if isinstance(primary_uid, int) and primary_uid > 0
-            else store.pulls_for_author_login(repo, primary_login)
-        )
-        models = _models(pulls)
-        cached_count = store.get_author_merged_count(repo, primary_login)
-        lifetime = int(cached_count["total_count"]) if cached_count else None
-        months: dict[str, int] = {}
-        for m in models:
-            ym = f"{m.merged_at.year:04d}-{m.merged_at.month:02d}"
-            months[ym] = months.get(ym, 0) + 1
-        best_month = max(months.items(), key=lambda item: item[1]) if months else None
-        agent_prs = [m.number for m in models if _agent_label(m.labels) or any(_agent_path(p) for p in m.files)]
-        provider_prs = [m.number for m in models if any(p.startswith(PROVIDER_WIZARD_PREFIX) for p in m.files)]
-        effective_total = max(len(models), lifetime or 0)
-        lines.append(f"- **PR counts for `{primary_login}` in `{repo}`**:")
-        lines.append(
-            f"  - {DEFAULT_ROLE_NAMES['contributor']} (>=1 merged): **{effective_total}** "
-            f"(stored={len(models)}, cached_lifetime={lifetime if lifetime is not None else 'n/a'})"
-        )
-        best_month_str = f"{best_month[1]} in {best_month[0]}" if best_month else "0"
-        lines.append(
-            f"  - {DEFAULT_ROLE_NAMES['oss_champion']} (>=10 total or >=3/mo): total=**{effective_total}**, best_month=**{best_month_str}**"
-        )
-        agent_sample = ", ".join(f"#{n}" for n in agent_prs[:5])
-        lines.append(
-            f"  - {DEFAULT_ROLE_NAMES['agent_builder']} (mcp/agent/a2a path or `agents` label): **{len(agent_prs)}**"
-            + (f" ({agent_sample})" if agent_sample else "")
-        )
-        prov_sample = ", ".join(f"#{n}" for n in provider_prs[:5])
-        lines.append(
-            f"  - {DEFAULT_ROLE_NAMES['provider_wizard']} (>=3 touching `{PROVIDER_WIZARD_PREFIX}`): **{len(provider_prs)}**"
-            + (f" ({prov_sample})" if prov_sample else "")
-        )
-
-    posted_links = store.pr_link_posters_for_discord(repo, discord_id)
-    if posted_links:
-        linked_nums = sorted({int(r["pr_number"]) for r in posted_links})
-        authors_map = store.pr_authors_for_numbers(repo, linked_nums)
-        distinct_authors = sorted({a for a in authors_map.values() if a})
-        lines.append(
-            f"- **PR links posted by member**: **{len(linked_nums)}** PRs "
-            f"(known authors: {', '.join(f'`{a}`' for a in distinct_authors[:6]) or 'unknown'})"
-        )
-
-    if rejections:
-        rej_str = ", ".join(f"`{r['github_login']}` ({r['reason'] or 'rejected'})" for r in rejections[:5])
-        lines.append(f"- **Rejected pairs**: {rej_str}")
-
-    return "\n".join(lines)[:1950]
-
-
-def execute_roles_revoke(
-    config: Config,
-    store: Store,
-    discord_id: str,
-    *,
-    moderator_id: str,
-    replacement_login: str | None = None,
-    now: datetime | None = None,
-) -> str:
-    """Revoke all bot-granted contributor roles, delete role_grants, reject bad pair(s), optionally set login."""
-    if not is_discord_id(discord_id):
-        return "invalid Discord member ID."
-
-    moment = now or datetime.now(UTC)
-    moment_iso = iso(moment)
-    cleaned_replacement = (replacement_login or "").strip().lstrip("@").lower()
-    if cleaned_replacement and not _GITHUB_LOGIN_RE.fullmatch(cleaned_replacement):
-        return f"invalid GitHub login `{replacement_login}` (only letters, digits, and hyphens are allowed)."
-
-    try:
-        removed_roles, deleted_grants = revoke_contributor_roles(config, store, discord_id)
-    except TransientAPIError as error:
-        return f"Discord rate-limited role removal ({error}). Try `/roles-revoke` again shortly."
-
-    deleted_matches = store.delete_confirmed_matches_for_discord(discord_id)
-    rejected_logins: list[str] = []
-    for row in deleted_matches:
-        bad_login = str(row["github_login"]).strip().lower()
-        if bad_login and bad_login != cleaned_replacement:
-            store.add_match_rejection(
-                bad_login,
-                discord_id,
-                moment_iso,
-                rejected_by=moderator_id,
-                reason="mod_revoke",
-            )
-            rejected_logins.append(bad_login)
-
-    link = store.link_for_discord(discord_id)
-    if link:
-        linked_login = str(link["github_login"]).strip().lower()
-        store.unlink_discord(discord_id)
-        if linked_login and linked_login != cleaned_replacement:
-            store.add_match_rejection(
-                linked_login,
-                discord_id,
-                moment_iso,
-                rejected_by=moderator_id,
-                reason="mod_revoke",
-            )
-            if linked_login not in rejected_logins:
-                rejected_logins.append(linked_login)
-
-    override_note = ""
-    if cleaned_replacement:
-        conflict_uid: str | None = None
-        existing_for_login = store.get_confirmed_match(cleaned_replacement)
-        if existing_for_login and str(existing_for_login["discord_id"]) != discord_id:
-            conflict_uid = str(existing_for_login["discord_id"])
-        if conflict_uid is None:
-            for row in store.all_links():
-                if str(row.get("github_login") or "").strip().lower() == cleaned_replacement:
-                    r_uid = str(row.get("discord_id") or "").strip()
-                    if r_uid and r_uid != discord_id:
-                        conflict_uid = r_uid
-                        break
-        if conflict_uid is None:
-            for m_login, m_uid in (getattr(config, "github_discord_map", None) or {}).items():
-                if str(m_login or "").strip().lower() == cleaned_replacement and str(m_uid) != discord_id:
-                    conflict_uid = str(m_uid)
-                    break
-
-        if conflict_uid is not None:
-            override_note = (
-                f"- **Override skipped**: GitHub login `{cleaned_replacement}` is already mapped to "
-                f"<@{conflict_uid}> (1-to-1 conflict). Revoke that member first."
-            )
-        else:
-            store.remove_match_rejection(cleaned_replacement, discord_id)
-            store.save_confirmed_match(
-                cleaned_replacement,
-                discord_id,
-                method="mod_override",
-                confidence=1.0,
-                matched_at=moment_iso,
-                evidence=f"set via /roles-revoke by {moderator_id}",
-            )
-            store.delete_match_attempt(cleaned_replacement)
-            override_note = f"- **Replacement mapping saved**: `{cleaned_replacement}` -> <@{discord_id}> (`mod_override`, confidence `1.00`)"
-
-    logging.warning(
-        "Moderator %s ran /roles-revoke on discord_id=%s: roles_removed=%s grants_deleted=%s "
-        "rejected_logins=%s replacement_login=%s",
-        moderator_id,
-        discord_id,
-        removed_roles,
-        deleted_grants,
-        rejected_logins,
-        cleaned_replacement or "(none)",
-    )
-
-    lines = [
-        f"**Revoked contributor roles for <@{discord_id}>**",
-        f"- Discord roles removed: {', '.join(f'`{k}`' for k in removed_roles) if removed_roles else 'none configured'}",
-        f"- `role_grants` rows deleted: **{len(deleted_grants)}**",
-        f"- Rejected GitHub pair(s) (never rematched): {', '.join(f'`{l}`' for l in rejected_logins) if rejected_logins else 'none found'}",
-    ]
-    if override_note:
-        lines.append(override_note)
-    return "\n".join(lines)
+        _grants_revalidation_lock.release()
